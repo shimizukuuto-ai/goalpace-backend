@@ -64,7 +64,23 @@ async function initDb() {
     );
   `);
 
-  console.log('DB initialized (users, usage_events, share_bonuses tables ready).');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS daily_category_scores (
+      client_user_id TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      category_name TEXT NOT NULL,
+      score_date DATE NOT NULL,
+      completion_percent SMALLINT NOT NULL CHECK (completion_percent BETWEEN 0 AND 100),
+      completed_count INTEGER NOT NULL DEFAULT 0 CHECK (completed_count >= 0),
+      target_count INTEGER NOT NULL DEFAULT 0 CHECK (target_count >= 0),
+      points INTEGER NOT NULL DEFAULT 0 CHECK (points >= 0),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (client_user_id, category_name, score_date)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_daily_category_scores_rank ON daily_category_scores (score_date, category_name, completion_percent DESC, points DESC);`);
+
+  console.log('DB initialized (users, usage_events, share_bonuses, leaderboard tables ready).');
 }
 
 // 過去24時間・過去30日の利用回数を数える。
@@ -160,6 +176,59 @@ async function grantShareBonus(userId, amount) {
   );
 }
 
+async function upsertDailyCategoryScores(clientUserId, displayName, scoreDate, categories) {
+  if (!DB_ENABLED) throw new Error('Leaderboard database is unavailable');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const category of categories) {
+      await client.query(
+        `INSERT INTO daily_category_scores
+          (client_user_id, display_name, category_name, score_date, completion_percent, completed_count, target_count, points, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())
+         ON CONFLICT (client_user_id, category_name, score_date) DO UPDATE SET
+          display_name = EXCLUDED.display_name,
+          completion_percent = EXCLUDED.completion_percent,
+          completed_count = EXCLUDED.completed_count,
+          target_count = EXCLUDED.target_count,
+          points = EXCLUDED.points,
+          updated_at = now()`,
+        [clientUserId, displayName, category.name, scoreDate, category.progress, category.completed, category.target, category.points]
+      );
+    }
+    const names = categories.map(category => category.name);
+    if (names.length) {
+      await client.query(
+        'DELETE FROM daily_category_scores WHERE client_user_id = $1 AND score_date = $2 AND NOT (category_name = ANY($3::text[]))',
+        [clientUserId, scoreDate, names]
+      );
+    } else {
+      await client.query('DELETE FROM daily_category_scores WHERE client_user_id = $1 AND score_date = $2', [clientUserId, scoreDate]);
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function getDailyCategoryLeaderboard(scoreDate, categoryName) {
+  if (!DB_ENABLED) throw new Error('Leaderboard database is unavailable');
+  const { rows } = await pool.query(
+    `SELECT display_name AS name, category_name AS category, completion_percent AS progress,
+            completed_count AS completed, target_count AS target, points,
+            row_number() OVER (ORDER BY completion_percent DESC, points DESC, updated_at ASC) AS rank
+     FROM daily_category_scores
+     WHERE score_date = $1 AND category_name = $2
+     ORDER BY completion_percent DESC, points DESC, updated_at ASC
+     LIMIT 50`,
+    [scoreDate, categoryName]
+  );
+  return rows;
+}
+
 module.exports = {
   DB_ENABLED,
   initDb,
@@ -173,4 +242,6 @@ module.exports = {
   getUserByOriginalTransactionId,
   getShareBonusToday,
   grantShareBonus,
+  upsertDailyCategoryScores,
+  getDailyCategoryLeaderboard,
 };

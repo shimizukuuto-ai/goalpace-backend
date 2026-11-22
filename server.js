@@ -11,12 +11,18 @@ app.use(express.json());
 app.use(express.static('public'));
 
 // ==========================================================================
-// 設定 & モデル設定 (Groq / Llama 3)
+// 設定 & モデル設定 (OpenRouter / Groq / Llama 3)
 // ==========================================================================
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-// デフォルトは高性能な Llama 3.3 70B。無料枠で利用可能
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
-const GROQ_API_BASE = 'https://api.groq.com/openai/v1/chat/completions';
+const API_KEY = process.env.OPENROUTER_API_KEY || process.env.GROQ_API_KEY;
+const IS_OPENROUTER = Boolean(process.env.OPENROUTER_API_KEY || (API_KEY && API_KEY.startsWith('sk-or-')));
+
+const API_BASE = IS_OPENROUTER
+  ? 'https://openrouter.ai/api/v1/chat/completions'
+  : 'https://api.groq.com/openai/v1/chat/completions';
+
+const DEFAULT_MODEL = IS_OPENROUTER
+  ? (process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3.5-lightning:free')
+  : (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile');
 
 // 認証を必須にするかどうか（開発中や個人利用では false 推奨）
 const REQUIRE_AUTH = process.env.REQUIRE_AUTH === 'true';
@@ -68,15 +74,15 @@ function localeSuffix(locale) {
 }
 
 // ==========================================================================
-// Groq (Llama 3) 呼び出し処理
+// AI (OpenRouter / Groq / Llama 3) 呼び出し処理
 // ==========================================================================
 async function callGroqLlama({ system, userText, locale, jsonMode = true }) {
-  if (!GROQ_API_KEY) {
+  if (!API_KEY) {
     if (MOCK_MODE) {
-      console.warn('[DEV] GROQ_API_KEY未設定のためモックを返します');
+      console.warn('[DEV] API_KEY未設定のためモックを返します');
       return null;
     }
-    throw new Error('GROQ_API_KEY is not set. Please set GROQ_API_KEY in your .env or Render Environment Variables.');
+    throw new Error('API_KEY is not set. Please set OPENROUTER_API_KEY or GROQ_API_KEY in your .env or Render Environment Variables.');
   }
 
   const messages = [
@@ -85,7 +91,7 @@ async function callGroqLlama({ system, userText, locale, jsonMode = true }) {
   ];
 
   const body = {
-    model: GROQ_MODEL,
+    model: DEFAULT_MODEL,
     messages,
     temperature: 0.2,
   };
@@ -94,36 +100,42 @@ async function callGroqLlama({ system, userText, locale, jsonMode = true }) {
     body.response_format = { type: 'json_object' };
   }
 
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${API_KEY}`,
+  };
+  if (IS_OPENROUTER) {
+    headers['HTTP-Referer'] = 'https://github.com/shimizusorashou/ControlCenter';
+    headers['X-Title'] = 'ControlCenter';
+  }
+
   const maxRetries = 3;
   let res, errText;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      res = await fetch(GROQ_API_BASE, {
+      res = await fetch(API_BASE, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${GROQ_API_KEY}`,
-        },
+        headers,
         body: JSON.stringify(body),
       });
 
       if (res.ok) break;
 
       errText = await res.text();
-      console.error(`Groq API ${res.status} body:`, errText);
+      console.error(`AI API ${res.status} body:`, errText);
 
       const isRateLimited = res.status === 429;
       const isRetryable = (res.status === 503 || res.status === 500 || isRateLimited);
 
       if (isRetryable && attempt < maxRetries) {
         const waitMs = 1500 * Math.pow(2, attempt);
-        console.log(`Groq API ${res.status}, retrying in ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})...`);
+        console.log(`AI API ${res.status}, retrying in ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})...`);
         await new Promise((resolve) => setTimeout(resolve, waitMs));
         continue;
       }
 
-      throw new Error(`Groq API error (${res.status}): ${errText}`);
+      throw new Error(`AI API error (${res.status}): ${errText}`);
     } catch (e) {
       if (attempt >= maxRetries) throw e;
       await new Promise((resolve) => setTimeout(resolve, 1500));
@@ -133,7 +145,7 @@ async function callGroqLlama({ system, userText, locale, jsonMode = true }) {
   const data = await res.json();
   const text = data.choices?.[0]?.message?.content;
   if (!text) {
-    throw new Error('Groq returned empty response: ' + JSON.stringify(data));
+    throw new Error('AI returned empty response: ' + JSON.stringify(data));
   }
   return text;
 }
@@ -366,6 +378,52 @@ app.post('/api/checkin', optionalAuth, optionalUsageLimit, async (req, res) => {
   }
 });
 
+// Daily category leaderboard. Only nickname and aggregate counts are stored; task text is never sent.
+app.post('/api/leaderboard/sync', async (req, res) => {
+  try {
+    const { userId, displayName, date, categories } = req.body || {};
+    if (typeof userId !== 'string' || userId.length < 1 || userId.length > 80) {
+      return res.status(400).json({ error: 'Invalid userId' });
+    }
+    if (typeof displayName !== 'string' || !displayName.trim() || displayName.length > 40) {
+      return res.status(400).json({ error: 'Invalid displayName' });
+    }
+    if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'Invalid date' });
+    }
+    if (!Array.isArray(categories) || categories.length > 30) {
+      return res.status(400).json({ error: 'Invalid categories' });
+    }
+    const normalized = categories.map(item => ({
+      name: String(item?.name || '').trim().slice(0, 40),
+      progress: Math.max(0, Math.min(100, Math.round(Number(item?.progress) || 0))),
+      completed: Math.max(0, Math.min(100000, Math.floor(Number(item?.completed) || 0))),
+      target: Math.max(0, Math.min(100000, Math.floor(Number(item?.target) || 0))),
+      points: Math.max(0, Math.min(1000000, Math.floor(Number(item?.points) || 0))),
+    })).filter(item => item.name && item.target > 0);
+    await db.upsertDailyCategoryScores(userId, displayName.trim().slice(0, 40), date, normalized);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('/api/leaderboard/sync error:', err);
+    res.status(503).json({ error: 'Leaderboard is unavailable' });
+  }
+});
+
+app.get('/api/leaderboard', async (req, res) => {
+  try {
+    const date = String(req.query.date || '');
+    const category = String(req.query.category || '').trim().slice(0, 40);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !category) {
+      return res.status(400).json({ error: 'date and category are required' });
+    }
+    const entries = await db.getDailyCategoryLeaderboard(date, category);
+    res.json({ entries });
+  } catch (err) {
+    console.error('/api/leaderboard error:', err);
+    res.status(503).json({ error: 'Leaderboard is unavailable' });
+  }
+});
+
 // 認証（必要時）
 app.post('/api/auth/apple', async (req, res) => {
   try {
@@ -382,8 +440,12 @@ app.post('/api/auth/apple', async (req, res) => {
 
 // ポート起動
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 GoalPace + ControlCenter Unified Server running on port ${PORT}`);
-  console.log(`🤖 AI Provider: Groq (Llama 3) [Model: ${GROQ_MODEL}]`);
-  console.log(`🔒 Require Auth: ${REQUIRE_AUTH}`);
-});
+db.initDb()
+  .catch(error => console.error('Database initialization failed:', error))
+  .finally(() => {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 GoalPace + ControlCenter Unified Server running on port ${PORT}`);
+      console.log(`🤖 AI Provider: ${API_KEY ? (IS_OPENROUTER ? 'OpenRouter' : 'Groq') : 'not configured'} [Model: ${DEFAULT_MODEL}]`);
+      console.log(`🔒 Require Auth: ${REQUIRE_AUTH}`);
+    });
+  });
