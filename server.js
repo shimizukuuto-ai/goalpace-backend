@@ -243,7 +243,7 @@ app.post('/api/questions', optionalAuth, optionalUsageLimit, async (req, res) =>
     const { goal, targetDate } = req.body;
     const locale = resolveLocale(req);
 
-    if (MOCK_MODE || !GROQ_API_KEY) {
+    if (MOCK_MODE || !API_KEY) {
       console.log('[MOCK] /api/questions');
       return res.json(MOCK_QUESTIONS);
     }
@@ -279,7 +279,7 @@ app.post('/api/plan', optionalAuth, optionalUsageLimit, async (req, res) => {
     const { goal, targetDate, baselineAnswers } = req.body;
     const locale = resolveLocale(req);
 
-    if (MOCK_MODE || !GROQ_API_KEY) {
+    if (MOCK_MODE || !API_KEY) {
       console.log('[MOCK] /api/plan');
       return res.json(MOCK_PLAN);
     }
@@ -322,7 +322,7 @@ app.post('/api/checkin', optionalAuth, optionalUsageLimit, async (req, res) => {
     const { project, todayEntry } = req.body;
     const locale = resolveLocale(req);
 
-    if (MOCK_MODE || !GROQ_API_KEY) {
+    if (MOCK_MODE || !API_KEY) {
       console.log('[MOCK] /api/checkin');
       return res.json(MOCK_CHECKIN);
     }
