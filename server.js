@@ -7,7 +7,7 @@ const iap = require('./iap');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 app.use(express.static('public'));
 
 // ==========================================================================
@@ -194,12 +194,17 @@ function optionalAuth(req, res, next) {
 }
 
 async function optionalUsageLimit(req, res, next) {
-  if (!db.DB_ENABLED || !REQUIRE_AUTH) return next();
+  if (!REQUIRE_AUTH) return next();
+  if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
   try {
     const user = await db.getUserById(req.userId);
     if (!user) return res.status(401).json({ error: 'User not found' });
 
-    const isPaid = user.is_subscribed || user.is_lifetime;
+    const subscriptionActive = Boolean(
+      user.is_subscribed && user.subscription_expires_at &&
+      new Date(user.subscription_expires_at).getTime() > Date.now()
+    );
+    const isPaid = user.is_lifetime || subscriptionActive;
     const { todayCount } = await db.getUsageCounts(user.id);
     const shareBonusToday = await db.getShareBonusToday(user.id);
     const dailyLimit = (isPaid ? SUBSCRIBED_DAILY_LIMIT : FREE_DAILY_LIMIT) + shareBonusToday;
@@ -210,7 +215,8 @@ async function optionalUsageLimit(req, res, next) {
     await db.recordUsageEvent(user.id, req.path);
     next();
   } catch (err) {
-    next();
+    console.error('AI usage limit check failed:', err);
+    res.status(503).json({ error: 'AI usage service is temporarily unavailable' });
   }
 }
 
@@ -382,10 +388,38 @@ app.post('/api/checkin', optionalAuth, optionalUsageLimit, async (req, res) => {
   }
 });
 
-// Daily category leaderboard. Only nickname and aggregate counts are stored; task text is never sent.
-app.post('/api/leaderboard/sync', async (req, res) => {
+app.post('/api/flashcards', optionalAuth, optionalUsageLimit, async (req, res) => {
   try {
-    const { userId, displayName, date, categories } = req.body || {};
+    const topic = typeof req.body?.topic === 'string' ? req.body.topic.trim() : '';
+    const count = Math.max(1, Math.min(10, Math.floor(Number(req.body?.count) || 5)));
+    const locale = resolveLocale(req);
+    if (!topic || topic.length > 300) {
+      return res.status(400).json({ error: 'Topic must contain 1–300 characters.' });
+    }
+    if (MOCK_MODE || !API_KEY) return res.json({ cards: [] });
+
+    const system = `Create concise, accurate study flashcards. Return only valid JSON in this exact shape: {"cards":[{"question":"...","answer":"..."}]}. Create exactly ${count} distinct cards. Do not include markdown.` + localeSuffix(locale);
+    const text = await callGroqLlama({ system, userText: `Topic: ${topic}\nCreate exactly ${count} useful question and answer cards.`, locale });
+    const parsed = parseJson(text);
+    const cards = (Array.isArray(parsed) ? parsed : parsed?.cards)
+      ?.map(card => ({ question: String(card?.question || '').trim(), answer: String(card?.answer || '').trim() }))
+      .filter(card => card.question && card.answer)
+      .slice(0, count);
+    if (!cards?.length) throw new Error('AI returned no usable flashcards');
+    res.json({ cards });
+  } catch (err) {
+    console.error('/api/flashcards error:', err);
+    res.status(500).json({ error: 'Could not generate flashcards right now.' });
+  }
+});
+
+// Daily category leaderboard. Only nickname and aggregate counts are stored; task text is never sent.
+app.post('/api/leaderboard/sync', optionalAuth, async (req, res) => {
+  try {
+    const { displayName, date, categories } = req.body || {};
+    // In production, the leaderboard identity comes from the signed-in session,
+    // never from a userId supplied by the app.
+    const userId = REQUIRE_AUTH ? String(req.userId) : req.body?.userId;
     if (typeof userId !== 'string' || userId.length < 1 || userId.length > 80) {
       return res.status(400).json({ error: 'Invalid userId' });
     }
@@ -413,7 +447,7 @@ app.post('/api/leaderboard/sync', async (req, res) => {
   }
 });
 
-app.get('/api/leaderboard', async (req, res) => {
+app.get('/api/leaderboard', optionalAuth, async (req, res) => {
   try {
     const date = String(req.query.date || '');
     const category = String(req.query.category || '').trim().slice(0, 40);
@@ -431,25 +465,118 @@ app.get('/api/leaderboard', async (req, res) => {
 // 認証（必要時）
 app.post('/api/auth/apple', async (req, res) => {
   try {
-    const { identityToken } = req.body;
+    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
+    const { identityToken, displayName } = req.body;
+    if (typeof identityToken !== 'string' || identityToken.length > 12000) {
+      return res.status(400).json({ error: 'A valid Apple identity token is required' });
+    }
+    if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 40)) {
+      return res.status(400).json({ error: 'displayName must be at most 40 characters' });
+    }
     const appleUserId = await auth.verifyAppleIdentityToken(identityToken);
-    let user = await db.getUserByAppleId(appleUserId);
-    if (!user) user = await db.createUser(appleUserId);
+    let user = await db.findOrCreateUser(appleUserId);
+    if (displayName?.trim()) {
+      user = { ...user, ...(await db.updateDisplayName(user.id, displayName.trim())) };
+    }
     const sessionToken = auth.issueSessionToken(user.id);
-    res.json({ sessionToken, isSubscribed: user.is_subscribed, isLifetime: user.is_lifetime });
+    res.json({
+      sessionToken,
+      user: { id: user.id, displayName: user.display_name || null, accountData: user.account_data || {} },
+      isSubscribed: user.is_subscribed,
+      isLifetime: user.is_lifetime,
+      expiresAt: user.subscription_expires_at || null,
+    });
   } catch (err) {
     res.status(401).json({ error: err.message });
   }
 });
 
+app.get('/api/account', auth.requireAuth, async (req, res) => {
+  try {
+    const user = await db.getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: 'Account not found' });
+    res.json({
+      user: { id: user.id, displayName: user.display_name || null, accountData: user.account_data || {} },
+      isSubscribed: Boolean(user.is_subscribed && user.subscription_expires_at && new Date(user.subscription_expires_at).getTime() > Date.now()),
+      isLifetime: user.is_lifetime,
+      expiresAt: user.subscription_expires_at || null,
+    });
+  } catch (err) {
+    console.error('/api/account error:', err);
+    res.status(503).json({ error: 'Account service is unavailable' });
+  }
+});
+
+app.put('/api/account/data', auth.requireAuth, async (req, res) => {
+  try {
+    const { accountData, displayName } = req.body || {};
+    if (!accountData || typeof accountData !== 'object' || Array.isArray(accountData)) {
+      return res.status(400).json({ error: 'accountData must be an object' });
+    }
+    if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 40)) {
+      return res.status(400).json({ error: 'displayName must be at most 40 characters' });
+    }
+    const user = await db.saveAccountData(req.userId, accountData, displayName?.trim());
+    if (!user) return res.status(404).json({ error: 'Account not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('/api/account/data error:', err);
+    res.status(503).json({ error: 'Account sync is unavailable' });
+  }
+});
+
+app.delete('/api/account', auth.requireAuth, async (req, res) => {
+  try {
+    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
+    await db.deleteAccount(req.userId);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE /api/account error:', err);
+    res.status(503).json({ error: 'Account deletion is unavailable' });
+  }
+});
+
+app.post('/api/iap/verify', auth.requireAuth, async (req, res) => {
+  try {
+    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Purchase verification is unavailable' });
+    const { signedTransactionInfo } = req.body || {};
+    if (typeof signedTransactionInfo !== 'string' || signedTransactionInfo.length > 30000) {
+      return res.status(400).json({ error: 'A valid signed transaction is required' });
+    }
+    const transaction = await iap.verifyTransaction(signedTransactionInfo);
+    if (transaction.bundleId !== process.env.APPLE_BUNDLE_ID) {
+      return res.status(400).json({ error: 'Transaction belongs to a different app' });
+    }
+    const currentOwner = await db.getUserByOriginalTransactionId(transaction.originalTransactionId);
+    if (currentOwner && String(currentOwner.id) !== String(req.userId)) {
+      return res.status(409).json({ error: 'This purchase is linked to another account' });
+    }
+    const entitlement = await iap.applyTransactionToUser(req.userId, transaction);
+    res.json(entitlement);
+  } catch (err) {
+    console.error('/api/iap/verify error:', err);
+    res.status(400).json({ error: 'Purchase could not be verified' });
+  }
+});
+
 // ポート起動
 const PORT = process.env.PORT || 3000;
+if (REQUIRE_AUTH && (!process.env.SESSION_JWT_SECRET || !process.env.APPLE_BUNDLE_ID || !db.DB_ENABLED)) {
+  throw new Error('Production auth requires SESSION_JWT_SECRET, APPLE_BUNDLE_ID, and DATABASE_URL.');
+}
+
 db.initDb()
-  .catch(error => console.error('Database initialization failed:', error))
-  .finally(() => {
+  .then(() => {
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 GoalPace + ControlCenter Unified Server running on port ${PORT}`);
       console.log(`🤖 AI Provider: ${API_KEY ? (IS_OPENROUTER ? 'OpenRouter' : 'Groq') : 'not configured'} [Model: ${DEFAULT_MODEL}]`);
       console.log(`🔒 Require Auth: ${REQUIRE_AUTH}`);
+    });
+  })
+  .catch(error => {
+    console.error('Database initialization failed:', error);
+    if (REQUIRE_AUTH) process.exit(1);
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 GoalPace + ControlCenter Unified Server running on port ${PORT} (database unavailable)`);
     });
   });

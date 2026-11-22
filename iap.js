@@ -130,6 +130,11 @@ async function applyTransactionToUser(userId, decodedTransaction) {
   const productId = decodedTransaction.productId;
   const originalTransactionId = decodedTransaction.originalTransactionId;
 
+  if (![...SUBSCRIPTION_PRODUCT_IDS, LIFETIME_PRODUCT_ID].includes(productId)) {
+    throw new Error('UNKNOWN_PRODUCT_ID: ' + productId);
+  }
+  if (!originalTransactionId) throw new Error('Transaction is missing originalTransactionId');
+
   await db.linkOriginalTransaction(userId, originalTransactionId);
 
   if (productId === LIFETIME_PRODUCT_ID) {
@@ -145,10 +150,14 @@ async function applyTransactionToUser(userId, decodedTransaction) {
   // 期間の長さに関係なく同一のため、productId自体はDBにlatest_product_idとして
   // 保存しつつ、isSubscribedの判定は共通化する。
   if (SUBSCRIPTION_PRODUCT_IDS.includes(productId)) {
+    const expirationMillis = Number(decodedTransaction.expiresDate);
+    if (!Number.isFinite(expirationMillis) || expirationMillis <= 0) {
+      throw new Error('Subscription transaction is missing a valid expiration date');
+    }
     const isActive =
       !decodedTransaction.revocationDate &&
-      (!decodedTransaction.expiresDate || decodedTransaction.expiresDate > Date.now());
-    const expiresAt = decodedTransaction.expiresDate ? new Date(decodedTransaction.expiresDate) : null;
+      expirationMillis > Date.now();
+    const expiresAt = new Date(expirationMillis);
     await db.setSubscriptionStatus(userId, isActive, expiresAt, productId);
     return { isSubscribed: isActive, isLifetime: false, expiresDate: expiresAt ? expiresAt.toISOString() : null };
   }

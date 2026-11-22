@@ -29,6 +29,8 @@ async function initDb() {
       is_lifetime BOOLEAN NOT NULL DEFAULT FALSE,
       original_transaction_id TEXT,
       latest_product_id TEXT,
+      display_name TEXT,
+      account_data JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
@@ -37,7 +39,10 @@ async function initDb() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_lifetime BOOLEAN NOT NULL DEFAULT FALSE;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS original_transaction_id TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS latest_product_id TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_data JSONB NOT NULL DEFAULT '{}'::jsonb;`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_original_transaction_id ON users (original_transaction_id);`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_original_transaction_id_unique ON users (original_transaction_id) WHERE original_transaction_id IS NOT NULL;`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS usage_events (
@@ -103,11 +108,10 @@ async function recordUsage(userId, endpoint) {
 }
 
 async function findOrCreateUser(appleUserId) {
-  const existing = await pool.query('SELECT * FROM users WHERE apple_user_id = $1', [appleUserId]);
-  if (existing.rows.length > 0) return existing.rows[0];
-
   const inserted = await pool.query(
-    'INSERT INTO users (apple_user_id) VALUES ($1) RETURNING *',
+    `INSERT INTO users (apple_user_id) VALUES ($1)
+     ON CONFLICT (apple_user_id) DO UPDATE SET apple_user_id = EXCLUDED.apple_user_id
+     RETURNING *`,
     [appleUserId]
   );
   return inserted.rows[0];
@@ -116,6 +120,43 @@ async function findOrCreateUser(appleUserId) {
 async function getUserById(userId) {
   const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
   return rows[0] || null;
+}
+
+async function saveAccountData(userId, accountData, displayName) {
+  const { rows } = await pool.query(
+    `UPDATE users SET account_data = $2::jsonb,
+       display_name = COALESCE($3, display_name)
+     WHERE id = $1
+     RETURNING id, display_name, account_data, is_subscribed, is_lifetime, subscription_expires_at`,
+    [userId, JSON.stringify(accountData), displayName || null]
+  );
+  return rows[0] || null;
+}
+
+async function updateDisplayName(userId, displayName) {
+  const { rows } = await pool.query(
+    'UPDATE users SET display_name = $2 WHERE id = $1 RETURNING id, display_name',
+    [userId, displayName || null]
+  );
+  return rows[0] || null;
+}
+
+async function deleteAccount(userId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const id = String(userId);
+    await client.query('DELETE FROM usage_events WHERE user_id = $1', [userId]);
+    await client.query('DELETE FROM share_bonuses WHERE user_id = $1', [userId]);
+    await client.query('DELETE FROM daily_category_scores WHERE client_user_id = $1', [id]);
+    await client.query('DELETE FROM users WHERE id = $1', [userId]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 // サブスクの状態を更新する（月額プラン用）。
@@ -236,6 +277,9 @@ module.exports = {
   recordUsage,
   findOrCreateUser,
   getUserById,
+  saveAccountData,
+  updateDisplayName,
+  deleteAccount,
   setSubscriptionStatus,
   setLifetimeStatus,
   linkOriginalTransaction,
