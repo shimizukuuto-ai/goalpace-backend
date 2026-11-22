@@ -415,6 +415,30 @@ app.post('/api/flashcards', optionalAuth, optionalUsageLimit, async (req, res) =
 });
 
 // Daily category leaderboard. Only nickname and aggregate counts are stored; task text is never sent.
+app.post('/api/routine/suggest', optionalAuth, optionalUsageLimit, async (req, res) => {
+  try {
+    const goal = typeof req.body?.goal === 'string' ? req.body.goal.trim() : '';
+    const locale = resolveLocale(req);
+    if (!goal || goal.length > 300) {
+      return res.status(400).json({ error: 'Goal must contain 1–300 characters.' });
+    }
+    if (MOCK_MODE || !API_KEY) return res.json({ blocks: [] });
+
+    const system = `Create a practical daily routine. Return only valid JSON in this exact shape: {"blocks":[{"title":"...","start":"HH:MM","end":"HH:MM"}]}. Use 24-hour times. Create 3 to 8 blocks. Blocks must not overlap and must be sorted by start time. Keep titles short (under 20 characters). Do not include markdown.` + localeSuffix(locale);
+    const text = await callGroqLlama({ system, userText: `Goal: ${goal}`, locale });
+    const parsed = parseJson(text);
+    const timeOk = (v) => typeof v === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(v);
+    const blocks = (Array.isArray(parsed) ? parsed : parsed?.blocks)
+      ?.map(b => ({ title: String(b?.title || '').trim().slice(0, 40), start: b?.start, end: b?.end }))
+      .filter(b => b.title && timeOk(b.start) && timeOk(b.end) && b.start !== b.end)
+      .slice(0, 8) || [];
+    res.json({ blocks });
+  } catch (err) {
+    console.error('/api/routine/suggest error:', err);
+    res.status(500).json({ error: 'Could not create a routine right now.' });
+  }
+});
+
 app.post('/api/leaderboard/sync', optionalAuth, async (req, res) => {
   try {
     const { displayName, date, categories } = req.body || {};
