@@ -496,9 +496,8 @@ app.post('/api/shared-decks', auth.requireAuth, async (req, res) => {
     if (await db.countOwnSharedDecks(String(req.userId)) >= 20) {
       return res.status(400).json({ error: '公開デッキは20個までです。' });
     }
-    const owner = await db.getUserById(req.userId);
-    const ownerName = owner?.display_name || 'ユーザー';
-    const deck = await db.createSharedDeck(String(req.userId), ownerName, { title, categoryName, description, cards });
+    // 公開者の名前は出さない（匿名）。ユーザーIDも公開しない
+    const deck = await db.createSharedDeck(String(req.userId), '匿名', { title, categoryName, description, cards });
     res.json({ deck });
   } catch (err) {
     console.error('POST /api/shared-decks error:', err);
@@ -552,6 +551,29 @@ app.post('/api/shared-decks/:id/import', auth.requireAuth, async (req, res) => {
 });
 
 // 公開を取り下げ（自分のデッキだけ）
+// 公開済みデッキの内容を更新（自動公開の同期用。持ち主だけが更新できる）
+app.put('/api/shared-decks/:id', auth.requireAuth, async (req, res) => {
+  try {
+    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    const title = cleanText(req.body?.title, 80);
+    const categoryName = cleanText(req.body?.categoryName, 40);
+    const description = cleanText(req.body?.description, 300);
+    const rawCards = Array.isArray(req.body?.cards) ? req.body.cards : [];
+    const cards = rawCards
+      .map(card => ({ question: cleanText(card?.question, 500), answer: cleanText(card?.answer, 1000) }))
+      .filter(card => card.question && card.answer);
+    if (!title) return res.status(400).json({ error: 'タイトルを入力してください。' });
+    if (!categoryName) return res.status(400).json({ error: 'カテゴリーを選んでください。' });
+    if (cards.length < 1 || cards.length > 300) return res.status(400).json({ error: 'カードは1〜300枚で公開してください。' });
+    const ok = await db.updateSharedDeck(req.params.id, String(req.userId), { title, categoryName, description, cards });
+    if (!ok) return res.status(404).json({ error: 'デッキが見つかりません。' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('PUT /api/shared-decks error:', err);
+    res.status(503).json({ error: '更新に失敗しました。時間をおいて再度お試しください。' });
+  }
+});
+
 app.delete('/api/shared-decks/:id', auth.requireAuth, async (req, res) => {
   try {
     if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });

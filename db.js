@@ -345,6 +345,15 @@ async function getCategoryLeaderboard(fromDate, toDate, categoryName, metric) {
 // ---- 公開デッキ ----
 const SHARED_DECK_REPORT_THRESHOLD = 3;
 
+async function updateSharedDeck(deckId, ownerUserId, { title, categoryName, description, cards }) {
+  const { rowCount } = await pool.query(
+    `UPDATE shared_decks SET title = $3, category_name = $4, description = $5, cards = $6::jsonb, card_count = $7
+     WHERE id = $1 AND owner_user_id = $2`,
+    [deckId, ownerUserId, title, categoryName, description, JSON.stringify(cards), cards.length]
+  );
+  return rowCount > 0;
+}
+
 async function createSharedDeck(ownerUserId, ownerName, { title, categoryName, description, cards }) {
   const { rows } = await pool.query(
     `INSERT INTO shared_decks (owner_user_id, owner_name, title, category_name, description, cards, card_count)
@@ -366,7 +375,7 @@ async function listSharedDecks({ categoryName, sort, query, limit, offset }) {
     : 'd.created_at DESC';
   const params = [categoryName || null, query ? `%${query}%` : null, limit, offset];
   const { rows } = await pool.query(
-    `SELECT d.id, d.title, d.category_name AS "categoryName", d.description, d.owner_name AS "ownerName",
+    `SELECT d.id, d.title, d.category_name AS "categoryName", d.description, '匿名'::text AS "ownerName",
             d.card_count AS "cardCount", d.created_at AS "createdAt",
             (SELECT COUNT(*)::int FROM shared_deck_imports i WHERE i.deck_id = d.id) AS "importCount"
      FROM shared_decks d
@@ -382,7 +391,7 @@ async function listSharedDecks({ categoryName, sort, query, limit, offset }) {
 
 async function getSharedDeck(deckId) {
   const { rows } = await pool.query(
-    `SELECT id, owner_user_id, title, category_name AS "categoryName", description, owner_name AS "ownerName",
+    `SELECT id, owner_user_id, title, category_name AS "categoryName", description, '匿名'::text AS "ownerName",
             card_count AS "cardCount", cards, created_at AS "createdAt"
      FROM shared_decks WHERE id = $1 AND hidden = FALSE`,
     [deckId]
@@ -438,6 +447,7 @@ module.exports = {
   upsertDailyCategoryScores,
   getCategoryLeaderboard,
   createSharedDeck,
+  updateSharedDeck,
   countOwnSharedDecks,
   listSharedDecks,
   getSharedDeck,
