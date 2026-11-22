@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: goalpace-controlcenter-api
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: REQUIRE_AUTH
+        value: false

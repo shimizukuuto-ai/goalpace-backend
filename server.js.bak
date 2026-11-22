@@ -1,0 +1,425 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const db = require('./db');
+const auth = require('./auth');
+const iap = require('./iap');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
+
+const API_KEY = process.env.GEMINI_API_KEY;
+const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+// 無料ユーザーと課金ユーザー(サブスク or 買い切り)の1日あたりの利用回数上限。
+const FREE_DAILY_LIMIT = 3;
+const SUBSCRIBED_DAILY_LIMIT = 50;
+
+const MODEL_LIGHT = 'gemini-2.5-flash';
+const MODEL_MAIN = 'gemini-2.5-flash';
+
+const MOCK_MODE = process.env.MOCK_MODE === 'true';
+
+const MOCK_QUESTIONS = {
+  questions: [
+    { id: 'q1', question: '現在の資産額はいくらですか？', type: 'number', unit: '万円' },
+    { id: 'q2', question: '毎月の貯蓄・投資に回せる金額は？', type: 'number', unit: '万円' },
+    { id: 'q3', question: '現在の主な収入源は？', type: 'text', unit: '' },
+  ],
+};
+
+const MOCK_PLAN = {
+  feasibility: 'やや厳しい',
+  reasoning: '（モック）現在のペースだと目標日までにやや不足していますが、投資利回りを見直せば到達可能です。',
+  achievableDate: '2033-03-01',
+  requiredPace: '（モック）毎月15万円の積立投資を継続する',
+  tasks: [
+    { week: 1, dailyTasks: ['家計簿アプリで支出を可視化する', '証券口座を開設する'] },
+    { week: 2, dailyTasks: ['積立NISA設定を行う', 'インデックスファンドを選定する'] },
+  ],
+};
+
+const MOCK_CHECKIN = {
+  onTrack: true,
+  updatedPace: '（モック）このペースを維持すればOK',
+  updatedTasks: ['明日も同じペースで積立を継続', '支出レビューを実施'],
+  message: '（モック）順調です！このペースを維持しましょう。',
+  // NEW: モックでもクライアント側のAI上書き挙動を確認できるようサンプル値を入れておく
+  achievementProbability: 0.72,
+  projectedFinishDate: '2033-04-15',
+  currentPacePercent: 38,
+};
+
+function resolveLocale(req) {
+  return req.body.locale === 'en' ? 'en' : 'ja';
+}
+
+function localeSuffix(locale) {
+  return locale === 'en'
+    ? '\n\n重要: JSON内のキー名以外のすべての値（feasibility, reasoning, requiredPace, dailyTasks, message, updatedPace, updatedTasks等、テキストを含むフィールド全て）を、一言一句すべて英語で書いてください。日本語を1文字も含めないでください。曜日や日付の表現も英語にしてください（例: Saturday, July 11 ではなく 7/11(土) のような形式は使わない）。'
+    : '';
+}
+
+async function callGemini({ model, system, userText, useWebSearch }) {
+  if (!API_KEY) {
+    throw new Error('GEMINI_API_KEY is not set. Add it to your .env file.');
+  }
+
+  const body = {
+    contents: [{ role: 'user', parts: [{ text: userText }] }],
+    systemInstruction: { parts: [{ text: system }] },
+  };
+
+  if (useWebSearch) {
+    body.tools = [{ googleSearch: {} }];
+  }
+
+  const maxRetries = 3;
+  let res, errText;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    res = await fetch(`${API_BASE}/${model}:generateContent`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': API_KEY,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) break;
+
+    errText = await res.text();
+    console.error(`Gemini API ${res.status} body:`, errText);
+
+    const isDailyQuotaExhausted = res.status === 429 && /PerDay|daily/i.test(errText);
+    const isRetryable = (res.status === 503 || res.status === 429) && !isDailyQuotaExhausted;
+
+    if (isRetryable && attempt < maxRetries) {
+      const waitMs = 1000 * Math.pow(2, attempt);
+      console.log(`Gemini API ${res.status}, retrying in ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})`);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      continue;
+    }
+
+    if (isDailyQuotaExhausted) {
+      throw new Error('QUOTA_EXCEEDED: Gemini APIの1日あたりの無料枠を使い切りました。時間を置くか課金設定をしてください。');
+    }
+    if (res.status === 503) {
+      throw new Error('MODEL_OVERLOADED: Geminiのサーバーが混雑しています。しばらくしてから再試行してください。');
+    }
+    throw new Error(`Gemini API error (${res.status}): ${errText}`);
+  }
+
+  const data = await res.json();
+  const candidate = data.candidates && data.candidates[0];
+  if (!candidate) {
+    throw new Error('Gemini API returned no candidates: ' + JSON.stringify(data));
+  }
+
+  const text = (candidate.content?.parts || [])
+    .filter((part) => typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('\n');
+
+  return text;
+}
+
+function parseJson(text) {
+  const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+  const start = cleaned.search(/[{\[]/);
+  if (start === -1) {
+    throw new Error('No JSON object/array found in model response: ' + cleaned.slice(0, 200));
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let end = -1;
+
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\') { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{' || ch === '[') depth++;
+    else if (ch === '}' || ch === ']') {
+      depth--;
+      if (depth === 0) { end = i; break; }
+    }
+  }
+
+  if (end === -1) {
+    throw new Error('Could not find matching closing bracket in model response: ' + cleaned.slice(0, 200));
+  }
+
+  const jsonSlice = cleaned.slice(start, end + 1);
+  return JSON.parse(jsonSlice);
+}
+
+// ==========================================================================
+// 認証
+// ==========================================================================
+
+app.post('/api/auth/apple', async (req, res) => {
+  try {
+    const { identityToken } = req.body;
+    if (!identityToken) {
+      return res.status(400).json({ error: 'identityToken is required' });
+    }
+
+    const appleUserId = await auth.verifyAppleIdentityToken(identityToken);
+
+    if (!db.DB_ENABLED) {
+      return res.json({ sessionToken: auth.issueSessionToken('dev-user'), isSubscribed: false, isLifetime: false });
+    }
+
+    const user = await db.findOrCreateUser(appleUserId);
+    const sessionToken = auth.issueSessionToken(user.id);
+    // FIX: 以前はここで sessionToken（実質パスワード相当のシークレット）と
+    // ユーザー行全体をそのままログに出力していた。Railway等のログ閲覧権限を持つ
+    // 誰でもセッションを乗っ取れてしまう情報漏洩リスクなので削除する。
+    const responseBody = { sessionToken, isSubscribed: user.is_subscribed, isLifetime: user.is_lifetime };
+    res.json(responseBody);
+  } catch (err) {
+    console.error('Apple auth error:', err.message);
+    res.status(401).json({ error: 'AUTH_FAILED: ' + err.message });
+  }
+});
+
+// 利用回数を確認し、上限超えなら429を返す。サブスク・買い切りどちらでも上限は同じ扱い。
+async function enforceUsageLimit(req, res, next) {
+  if (!db.DB_ENABLED) return next();
+
+  try {
+    const user = await db.getUserById(req.userId);
+    if (!user) return res.status(401).json({ error: 'AUTH_INVALID: ユーザーが見つかりません。' });
+
+    const isPaid = user.is_subscribed || user.is_lifetime;
+    const { todayCount } = await db.getUsageCounts(user.id);
+    const limit = isPaid ? SUBSCRIBED_DAILY_LIMIT : FREE_DAILY_LIMIT;
+
+    if (todayCount >= limit) {
+      return res.status(429).json({
+        error: isPaid
+          ? 'DAILY_LIMIT_REACHED: 本日の利用上限に達しました。明日また試してください。'
+          : 'DAILY_LIMIT_REACHED: 無料プランの本日の利用上限に達しました。課金プランで上限が増えます。',
+      });
+    }
+
+    await db.recordUsage(user.id, req.path);
+    next();
+  } catch (err) {
+    console.error('Usage limit check error:', err.message);
+    res.status(500).json({ error: 'USAGE_CHECK_FAILED: ' + err.message });
+  }
+}
+
+app.post('/api/questions', auth.requireAuth, enforceUsageLimit, async (req, res) => {
+  try {
+    const { goal, targetDate } = req.body;
+    const locale = resolveLocale(req);
+
+    if (MOCK_MODE) {
+      console.log('[MOCK] /api/questions - Gemini APIは呼びません');
+      return res.json(MOCK_QUESTIONS);
+    }
+
+    const system = `あなたは目標達成コーチです。ユーザーの目標と目標日から、
+達成可能性を判断するために必要な「現状把握の質問」を最大5個、JSON配列のみで出力してください。
+説明文や前置きは一切不要です。出力形式: [{"id":"q1","question":"...","type":"number"|"text","unit":"任意"}]` + localeSuffix(locale);
+
+    const userText = `目標: ${goal}\n目標日: ${targetDate}`;
+    const text = await callGemini({ model: MODEL_LIGHT, system, userText, useWebSearch: false });
+    res.json({ questions: parseJson(text) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/plan', auth.requireAuth, enforceUsageLimit, async (req, res) => {
+  try {
+    const { goal, targetDate, baselineAnswers } = req.body;
+    const locale = resolveLocale(req);
+
+    if (MOCK_MODE) {
+      console.log('[MOCK] /api/plan - Gemini APIは呼びません');
+      return res.json(MOCK_PLAN);
+    }
+
+    const system = `あなたは目標達成コーチです。必要であればウェブ検索で
+「この種の目標に一般的にどれくらいの努力・期間が必要か」の実例や統計を調べたうえで、
+以下をJSON形式のみで出力してください（説明文・前置き不要、Markdown記法も不要）。
+出力形式:
+{
+  "feasibility": "現実的" | "やや厳しい" | "非現実的",
+  "reasoning": "判断根拠を1〜2文で",
+  "achievableDate": "YYYY-MM-DD",
+  "requiredPace": "1日あたり何をどれだけやるべきかの短い説明",
+  "tasks": [
+    {"week": 1, "dailyTasks": ["...", "..."]}
+  ]
+}
+tasksは目標日までの期間に応じて妥当な週数分（最大8週）を出してください。` + localeSuffix(locale);
+
+    const userText = `目標: ${goal}\n目標日: ${targetDate}\n現状把握の回答: ${JSON.stringify(baselineAnswers)}`;
+    const text = await callGemini({ model: MODEL_MAIN, system, userText, useWebSearch: true });
+    res.json(parseJson(text));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/checkin', auth.requireAuth, enforceUsageLimit, async (req, res) => {
+  try {
+    const { project, todayEntry } = req.body;
+    const locale = resolveLocale(req);
+
+    if (MOCK_MODE) {
+      console.log('[MOCK] /api/checkin - Gemini APIは呼びません');
+      return res.json(MOCK_CHECKIN);
+    }
+
+    // 経過日数の目安をこちらで計算して渡す。Gemini任せにすると
+    // 「目標までの残り日数が短いプロジェクト」で極端な%を出しがちなので、
+    // 参考値として与えることで暴れにくくする。
+    let scheduleElapsedPercent = null;
+    try {
+      const start = new Date(project.createdAt);
+      const end = new Date(project.targetDate + 'T00:00:00');
+      const now = new Date();
+      const totalMs = end.getTime() - start.getTime();
+      if (totalMs > 0) {
+        const elapsedMs = Math.min(Math.max(now.getTime() - start.getTime(), 0), totalMs);
+        scheduleElapsedPercent = Math.round((elapsedMs / totalMs) * 100);
+      }
+    } catch (e) {
+      // 日付パース失敗時は null のままGeminiには渡さない
+    }
+
+    const previousCurrentPacePercent = typeof project.aiCurrentPacePercent === 'number'
+      ? project.aiCurrentPacePercent
+      : null;
+
+    const system = `あなたは目標達成コーチです。プロジェクト全体の情報(これまでの進捗ログのnote・feel全件を含む)と
+今日の進捗から、以下をJSON形式のみで出力してください（説明文・前置き不要）。
+
+出力形式:
+{
+  "onTrack": true | false,
+  "updatedPace": "明日以降の1日あたりの目安",
+  "updatedTasks": ["...", "..."],
+  "message": "本人への一言（率直かつ前向きに、根拠も添えて）",
+  "achievementProbability": 0.0〜1.0の数値,
+  "projectedFinishDate": "YYYY-MM-DD",
+  "currentPacePercent": 0〜130くらいの数値
+}
+
+各フィールドの意味:
+- achievementProbability: 目標日までに達成できる確率。progressLogsのnote・feelの推移、
+  今日の進捗すべてを踏まえて判断すること。単に「予定通りか」だけでなく、
+  noteに書かれた具体的な内容（「今週は全然できなかった」「思ったより順調」等）を重視する。
+- projectedFinishDate: このペースが続いた場合の着地予測日。
+- currentPacePercent: 目標達成までの道のりを100としたとき、今日時点で実際どれくらい
+  進んでいるか。予定通りなら経過日数の割合(参考値: scheduleElapsedPercent)に近い値、
+  遅れていればそれより低い値、前倒しならそれより高い値になる。progressLogsのnote全文を
+  読み、定性的な遅れ・前倒しの手がかりも数値に反映すること。
+
+重要な制約（暴れた値を避けるため）:
+- scheduleElapsedPercent（経過日数の目安、参考として渡す）から極端に乖離した値
+  （例: 経過5%しか経っていないのに100%超など）を出さないこと。前倒し・遅れは
+  scheduleElapsedPercentの±30ポイント程度を目安とし、それを大きく超える場合は
+  noteの内容に本当にそれだけの根拠があるか慎重に判断すること。
+- previousCurrentPacePercent（前回チェックイン時のこの値、あれば渡す）がある場合は
+  そこからの連続性を意識し、1回のチェックインで極端に飛ばないようにすること
+  （progressLogsに書かれた「今日1日分」の進み具合として妥当な範囲で増減させる）。` + localeSuffix(locale);
+
+    const userText = `プロジェクト情報: ${JSON.stringify(project)}
+今日の進捗: ${JSON.stringify(todayEntry)}
+scheduleElapsedPercent（経過日数の目安、参考値）: ${scheduleElapsedPercent === null ? '不明' : scheduleElapsedPercent}
+previousCurrentPacePercent（前回のAI推定値、あれば連続性の基準に）: ${previousCurrentPacePercent === null ? 'なし（初回）' : previousCurrentPacePercent}`;
+
+    const text = await callGemini({ model: MODEL_MAIN, system, userText, useWebSearch: false });
+    const parsed = parseJson(text);
+
+    // Geminiが範囲外の値を返してもクライアント側のグラフが壊れないようクランプする
+    if (typeof parsed.achievementProbability === 'number') {
+      parsed.achievementProbability = Math.min(Math.max(parsed.achievementProbability, 0), 1);
+    }
+    if (typeof parsed.currentPacePercent === 'number') {
+      parsed.currentPacePercent = Math.min(Math.max(parsed.currentPacePercent, 0), 130);
+    }
+
+    console.log('[/api/checkin] scheduleElapsedPercent:', scheduleElapsedPercent,
+      'previousCurrentPacePercent:', previousCurrentPacePercent,
+      '-> achievementProbability:', parsed.achievementProbability,
+      'currentPacePercent:', parsed.currentPacePercent,
+      'projectedFinishDate:', parsed.projectedFinishDate);
+
+    res.json(parsed);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================================================
+// 課金 (StoreKit 2 / App Store Server API)
+// ==========================================================================
+
+// クライアントがStoreKit 2で購入完了したときに呼ぶ。
+// signedTransactionInfo は Transaction.jwsRepresentation をそのまま送ってもらう。
+app.post('/api/iap/verify', auth.requireAuth, async (req, res) => {
+  try {
+    const { signedTransactionInfo } = req.body;
+    if (!signedTransactionInfo) {
+      return res.status(400).json({ error: 'signedTransactionInfo is required' });
+    }
+
+    const decoded = await iap.verifyTransaction(signedTransactionInfo);
+    const result = await iap.applyTransactionToUser(req.userId, decoded);
+    res.json(result);
+  } catch (err) {
+    console.error('IAP verify error:', err.message);
+    res.status(400).json({ error: 'IAP_VERIFY_FAILED: ' + err.message });
+  }
+});
+
+// App Store Server Notifications V2 用Webhook。
+// App Store Connect > アプリ情報 > App Store Server 通知 にこのURLを登録する。
+// (例: https://goal-pace-app-production.up.railway.app/api/iap/notifications)
+// アプリを開いていなくても更新・解約・返金・支払い失敗が自動反映される。
+app.post('/api/iap/notifications', async (req, res) => {
+  try {
+    const { signedPayload } = req.body;
+    const decodedNotification = await iap.verifyNotification(signedPayload);
+    const signedTransactionInfo = decodedNotification?.data?.signedTransactionInfo;
+
+    if (signedTransactionInfo) {
+      const decodedTransaction = await iap.verifyTransaction(signedTransactionInfo);
+      const user = await db.getUserByOriginalTransactionId(decodedTransaction.originalTransactionId);
+      if (user) {
+        await iap.applyTransactionToUser(user.id, decodedTransaction);
+      } else {
+        console.warn('IAP notification for unknown originalTransactionId:', decodedTransaction.originalTransactionId);
+      }
+    }
+    // Appleは200以外を返すとリトライしてくるので、処理自体が失敗した場合以外は200を返す。
+    res.status(200).send();
+  } catch (err) {
+    console.error('IAP notification error:', err.message);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`Goal pace app running at http://localhost:${PORT}`);
+  console.log(MOCK_MODE ? '🧪 MOCK_MODE: ON（Gemini APIは呼びません）' : 'MOCK_MODE: OFF（実際にGemini APIを呼びます）');
+  if (!API_KEY) {
+    console.warn('WARNING: GEMINI_API_KEY is not set. Copy .env.example to .env and add your key.');
+  }
+  await db.initDb();
+});

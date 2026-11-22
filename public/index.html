@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pace — 目標達成プランナー</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="app-header">
+  <div class="brand">
+    <span class="brand-mark">◐</span>
+    <span class="brand-name">Pace</span>
+  </div>
+  <button id="btnNewGoal" class="btn btn-primary btn-small">＋ 新しい目標</button>
+</header>
+
+<main id="app">
+
+  <!-- ================= LIST VIEW ================= -->
+  <section id="view-list" class="view">
+    <div id="listEmpty" class="empty-state hidden">
+      <p class="empty-title">まだ目標がありません</p>
+      <p class="empty-body">達成したいことと期限を決めるところから始めましょう。</p>
+      <button id="btnEmptyNewGoal" class="btn btn-primary">最初の目標を追加</button>
+    </div>
+    <div id="listGrid" class="goal-grid"></div>
+  </section>
+
+  <!-- ================= WIZARD VIEW ================= -->
+  <section id="view-wizard" class="view hidden">
+    <button class="btn-back" id="btnWizardBack">← 戻る</button>
+
+    <div id="wz-step-goal" class="panel wz-step">
+      <p class="eyebrow">STEP 1 — 目標</p>
+      <label for="goal">何を達成しますか</label>
+      <input id="goal" type="text" placeholder="例: TOEIC 800点">
+      <label for="targetDate">目標日</label>
+      <input id="targetDate" type="date">
+      <p id="setupError" class="field-error hidden"></p>
+      <button id="btnStart" class="btn btn-primary">現状把握を始める</button>
+    </div>
+
+    <div id="wz-step-questions" class="panel wz-step hidden">
+      <p class="eyebrow">STEP 2 — 現状把握</p>
+      <div id="questionsLoading" class="loading-row">
+        <span class="spinner"></span> AIが質問を考えています…
+      </div>
+      <div id="questionsForm"></div>
+      <p id="questionsError" class="field-error hidden"></p>
+      <button id="btnPlan" class="btn btn-primary hidden">計画を生成</button>
+    </div>
+
+    <div id="wz-step-plan" class="panel wz-step hidden">
+      <p class="eyebrow">STEP 3 — AIが出した計画</p>
+      <div id="planLoading" class="loading-row">
+        <span class="spinner"></span> Web検索で根拠を調べながら計画中…
+      </div>
+      <div id="planResult" class="hidden"></div>
+      <button id="btnSaveProject" class="btn btn-primary hidden">この計画で始める</button>
+    </div>
+  </section>
+
+  <!-- ================= DETAIL VIEW ================= -->
+  <section id="view-detail" class="view hidden">
+    <button class="btn-back" id="btnDetailBack">← すべての目標</button>
+
+    <div class="panel">
+      <div class="detail-head">
+        <div>
+          <p class="goal-title" id="dtGoalTitle"></p>
+          <p class="goal-sub" id="dtGoalSub"></p>
+        </div>
+        <span id="dtBadge" class="badge"></span>
+      </div>
+
+      <div class="ribbon" id="dtRibbon"></div>
+
+      <div class="stat-row">
+        <div class="stat">
+          <p class="stat-label">達成可能日</p>
+          <p class="stat-value mono" id="dtAchDate"></p>
+        </div>
+        <div class="stat">
+          <p class="stat-label">今のペース</p>
+          <p class="stat-value" id="dtPace"></p>
+        </div>
+        <div class="stat">
+          <p class="stat-label">残り日数</p>
+          <p class="stat-value mono" id="dtDaysLeft"></p>
+        </div>
+      </div>
+
+      <p class="section-label">今週のタスク</p>
+      <div id="dtTasks" class="task-list"></div>
+
+      <button id="btnOpenCheckin" class="btn btn-primary">今日の進捗を記録する</button>
+      <button id="btnDeleteGoal" class="btn btn-ghost btn-danger-text">この目標を削除</button>
+    </div>
+
+    <div class="panel">
+      <p class="section-label">記録履歴</p>
+      <div id="dtLogHistory" class="log-list"></div>
+    </div>
+  </section>
+
+  <!-- ================= CHECK-IN MODAL ================= -->
+  <div id="checkinOverlay" class="overlay hidden">
+    <div class="modal">
+      <p class="eyebrow">今日の進捗</p>
+      <label for="progressNote">今日やったこと・実績</label>
+      <textarea id="progressNote" rows="2" placeholder="例: 単語30個、模試1回"></textarea>
+      <label for="feel">確認テスト・手応え</label>
+      <select id="feel">
+        <option>順調</option>
+        <option>ちょっと苦戦</option>
+        <option>かなり厳しい</option>
+      </select>
+      <div id="checkinLoading" class="loading-row hidden">
+        <span class="spinner"></span> AIが再評価しています…
+      </div>
+      <div id="checkinResult" class="hidden"></div>
+      <div class="modal-actions">
+        <button id="btnCancelCheckin" class="btn btn-ghost">キャンセル</button>
+        <button id="btnCheckin" class="btn btn-primary">AIに再評価してもらう</button>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
