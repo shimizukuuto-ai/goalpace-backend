@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -442,7 +443,9 @@ app.post('/api/leaderboard/sync', optionalAuth, async (req, res) => {
       minutes: Math.max(0, Math.min(1000000, Math.floor(Number(item?.minutes) || 0))),
       memorized: Math.max(0, Math.min(100000, Math.floor(Number(item?.memorized) || 0))),
     })).filter(item => item.name && (item.target + item.completed + item.pomodoro + item.minutes + item.memorized) > 0);
-    await db.upsertDailyCategoryScores(userId, displayName.trim().slice(0, 40), date, normalized);
+    // ランキングの名前は匿名（プレイヤー-＋IDから作る4文字）。端末から送られた名前は使わない
+    const anonName = 'プレイヤー-' + crypto.createHash('sha256').update(userId).digest('hex').slice(0, 4);
+    await db.upsertDailyCategoryScores(userId, anonName, date, normalized);
     res.json({ ok: true });
   } catch (err) {
     console.error('/api/leaderboard/sync error:', err);
