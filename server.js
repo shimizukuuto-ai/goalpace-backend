@@ -220,15 +220,19 @@ async function optionalUsageLimit(req, res, next) {
 
 // ヘルスチェック（Renderが利用）
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'healthy', provider: 'groq', model: GROQ_MODEL });
+  res.status(200).json({
+    status: 'healthy',
+    provider: IS_OPENROUTER ? 'openrouter' : (API_KEY ? 'groq' : 'unconfigured'),
+    model: DEFAULT_MODEL,
+  });
 });
 
 app.get('/', (req, res) => {
   res.json({
     app: 'GoalPace & ControlCenter Unified Backend',
     status: 'running',
-    aiProvider: 'Groq (Llama 3)',
-    model: GROQ_MODEL,
+    aiProvider: IS_OPENROUTER ? 'OpenRouter' : (API_KEY ? 'Groq (Llama 3)' : 'unconfigured'),
+    model: DEFAULT_MODEL,
     endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/health']
   });
 });
