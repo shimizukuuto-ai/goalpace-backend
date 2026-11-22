@@ -438,7 +438,10 @@ app.post('/api/leaderboard/sync', optionalAuth, async (req, res) => {
       completed: Math.max(0, Math.min(100000, Math.floor(Number(item?.completed) || 0))),
       target: Math.max(0, Math.min(100000, Math.floor(Number(item?.target) || 0))),
       points: Math.max(0, Math.min(1000000, Math.floor(Number(item?.points) || 0))),
-    })).filter(item => item.name && item.target > 0);
+      pomodoro: Math.max(0, Math.min(100000, Math.floor(Number(item?.pomodoro) || 0))),
+      minutes: Math.max(0, Math.min(1000000, Math.floor(Number(item?.minutes) || 0))),
+      memorized: Math.max(0, Math.min(100000, Math.floor(Number(item?.memorized) || 0))),
+    })).filter(item => item.name && (item.target + item.completed + item.pomodoro + item.minutes + item.memorized) > 0);
     await db.upsertDailyCategoryScores(userId, displayName.trim().slice(0, 40), date, normalized);
     res.json({ ok: true });
   } catch (err) {
@@ -447,18 +450,132 @@ app.post('/api/leaderboard/sync', optionalAuth, async (req, res) => {
   }
 });
 
+// 週次ランキング: from/to（YYYY-MM-DD, 最大7日間）, category, metric で取得
+const LEADERBOARD_METRICS = Object.keys(db.LEADERBOARD_METRIC_COLUMNS);
 app.get('/api/leaderboard', optionalAuth, async (req, res) => {
   try {
-    const date = String(req.query.date || '');
+    const to = String(req.query.to || req.query.date || '');
+    const from = String(req.query.from || req.query.date || '');
     const category = String(req.query.category || '').trim().slice(0, 40);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !category) {
-      return res.status(400).json({ error: 'date and category are required' });
+    const metric = LEADERBOARD_METRICS.includes(req.query.metric) ? req.query.metric : 'tasks';
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to) || !category) {
+      return res.status(400).json({ error: 'from, to and category are required' });
     }
-    const entries = await db.getDailyCategoryLeaderboard(date, category);
-    res.json({ entries });
+    const days = (Date.parse(to) - Date.parse(from)) / 86400000;
+    if (!(days >= 0 && days <= 6)) {
+      return res.status(400).json({ error: 'Range must be 1 to 7 days' });
+    }
+    const entries = await db.getCategoryLeaderboard(from, to, category, metric);
+    res.json({ metric, entries });
   } catch (err) {
     console.error('/api/leaderboard error:', err);
     res.status(503).json({ error: 'Leaderboard is unavailable' });
+  }
+});
+
+// ---- 公開デッキ（ユーザーが明示的に公開したものだけ。カードは公開者が選んだ内容のみ） ----
+function cleanText(value, max) {
+  return typeof value === 'string' ? value.trim().slice(0, max) : '';
+}
+function isDeckId(value) {
+  return /^\d{1,18}$/.test(String(value));
+}
+
+app.post('/api/shared-decks', auth.requireAuth, async (req, res) => {
+  try {
+    const title = cleanText(req.body?.title, 80);
+    const categoryName = cleanText(req.body?.categoryName, 40);
+    const description = cleanText(req.body?.description, 300);
+    const rawCards = Array.isArray(req.body?.cards) ? req.body.cards : [];
+    const cards = rawCards
+      .map(card => ({ question: cleanText(card?.question, 500), answer: cleanText(card?.answer, 1000) }))
+      .filter(card => card.question && card.answer);
+    if (!title) return res.status(400).json({ error: 'タイトルを入力してください。' });
+    if (!categoryName) return res.status(400).json({ error: 'カテゴリーを選んでください。' });
+    if (cards.length < 1 || cards.length > 300) return res.status(400).json({ error: 'カードは1〜300枚で公開してください。' });
+    if (await db.countOwnSharedDecks(String(req.userId)) >= 20) {
+      return res.status(400).json({ error: '公開デッキは20個までです。' });
+    }
+    const owner = await db.getUserById(req.userId);
+    const ownerName = owner?.display_name || 'ユーザー';
+    const deck = await db.createSharedDeck(String(req.userId), ownerName, { title, categoryName, description, cards });
+    res.json({ deck });
+  } catch (err) {
+    console.error('POST /api/shared-decks error:', err);
+    res.status(503).json({ error: '公開に失敗しました。時間をおいて再度お試しください。' });
+  }
+});
+
+app.get('/api/shared-decks', optionalAuth, async (req, res) => {
+  try {
+    const categoryName = cleanText(req.query.category, 40);
+    const query = cleanText(req.query.q, 60);
+    const sort = req.query.sort === 'popular' ? 'popular' : 'new';
+    const limit = Math.max(1, Math.min(50, Math.floor(Number(req.query.limit) || 30)));
+    const offset = Math.max(0, Math.floor(Number(req.query.offset) || 0));
+    const decks = await db.listSharedDecks({ categoryName, sort, query, limit, offset });
+    res.json({ decks });
+  } catch (err) {
+    console.error('GET /api/shared-decks error:', err);
+    res.status(503).json({ error: '公開デッキを読み込めませんでした。' });
+  }
+});
+
+app.get('/api/shared-decks/:id', optionalAuth, async (req, res) => {
+  try {
+    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    const deck = await db.getSharedDeck(req.params.id);
+    if (!deck) return res.status(404).json({ error: 'デッキが見つかりません。' });
+    const { owner_user_id, ...publicDeck } = deck; // 公開者の内部IDは返さない
+    res.json({ deck: publicDeck });
+  } catch (err) {
+    console.error('GET /api/shared-decks/:id error:', err);
+    res.status(503).json({ error: '公開デッキを読み込めませんでした。' });
+  }
+});
+
+// 取り込み: カード本文を返す。クライアント側で自分のデッキに追加する
+app.post('/api/shared-decks/:id/import', auth.requireAuth, async (req, res) => {
+  try {
+    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    const deck = await db.getSharedDeck(req.params.id);
+    if (!deck) return res.status(404).json({ error: 'デッキが見つかりません。' });
+    if (deck.owner_user_id === String(req.userId)) {
+      return res.status(400).json({ error: '自分のデッキは取り込めません。' });
+    }
+    await db.recordSharedDeckImport(req.params.id, String(req.userId));
+    res.json({ title: deck.title, categoryName: deck.categoryName, cards: deck.cards });
+  } catch (err) {
+    console.error('POST /api/shared-decks/:id/import error:', err);
+    res.status(503).json({ error: '取り込みに失敗しました。' });
+  }
+});
+
+// 公開を取り下げ（自分のデッキだけ）
+app.delete('/api/shared-decks/:id', auth.requireAuth, async (req, res) => {
+  try {
+    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    const ok = await db.deleteSharedDeck(req.params.id, String(req.userId));
+    if (!ok) return res.status(404).json({ error: 'デッキが見つかりません。' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE /api/shared-decks/:id error:', err);
+    res.status(503).json({ error: '取り下げに失敗しました。' });
+  }
+});
+
+// 通報（App Store審査のための報告機能）
+app.post('/api/shared-decks/:id/report', auth.requireAuth, async (req, res) => {
+  try {
+    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    const reason = cleanText(req.body?.reason, 200) || '不適切な内容';
+    const deck = await db.getSharedDeck(req.params.id);
+    if (!deck) return res.status(404).json({ error: 'デッキが見つかりません。' });
+    await db.reportSharedDeck(req.params.id, String(req.userId), reason);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /api/shared-decks/:id/report error:', err);
+    res.status(503).json({ error: '通報を受け付けられませんでした。' });
   }
 });
 

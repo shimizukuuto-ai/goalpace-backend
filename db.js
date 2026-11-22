@@ -84,6 +84,46 @@ async function initDb() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_daily_category_scores_rank ON daily_category_scores (score_date, category_name, completion_percent DESC, points DESC);`);
+  // ランキング指標の追加（既存DBにも安全に追記）
+  await pool.query(`ALTER TABLE daily_category_scores ADD COLUMN IF NOT EXISTS pomodoro_count INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE daily_category_scores ADD COLUMN IF NOT EXISTS work_minutes INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE daily_category_scores ADD COLUMN IF NOT EXISTS memorized_count INTEGER NOT NULL DEFAULT 0;`);
+
+  // 公開デッキ（ユーザーが明示的に公開したものだけ）
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shared_decks (
+      id BIGSERIAL PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      owner_name TEXT NOT NULL,
+      title TEXT NOT NULL,
+      category_name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      cards JSONB NOT NULL,
+      card_count INTEGER NOT NULL DEFAULT 0,
+      report_count INTEGER NOT NULL DEFAULT 0,
+      hidden BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_shared_decks_list ON shared_decks (hidden, category_name, created_at DESC);`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shared_deck_imports (
+      deck_id BIGINT NOT NULL REFERENCES shared_decks(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL,
+      imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (deck_id, user_id)
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shared_deck_reports (
+      deck_id BIGINT NOT NULL REFERENCES shared_decks(id) ON DELETE CASCADE,
+      reporter_user_id TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (deck_id, reporter_user_id)
+    );
+  `);
 
   console.log('DB initialized (users, usage_events, share_bonuses, leaderboard tables ready).');
 }
@@ -225,16 +265,21 @@ async function upsertDailyCategoryScores(clientUserId, displayName, scoreDate, c
     for (const category of categories) {
       await client.query(
         `INSERT INTO daily_category_scores
-          (client_user_id, display_name, category_name, score_date, completion_percent, completed_count, target_count, points, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())
+          (client_user_id, display_name, category_name, score_date, completion_percent, completed_count, target_count, points,
+           pomodoro_count, work_minutes, memorized_count, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())
          ON CONFLICT (client_user_id, category_name, score_date) DO UPDATE SET
           display_name = EXCLUDED.display_name,
           completion_percent = EXCLUDED.completion_percent,
           completed_count = EXCLUDED.completed_count,
           target_count = EXCLUDED.target_count,
           points = EXCLUDED.points,
+          pomodoro_count = EXCLUDED.pomodoro_count,
+          work_minutes = EXCLUDED.work_minutes,
+          memorized_count = EXCLUDED.memorized_count,
           updated_at = now()`,
-        [clientUserId, displayName, category.name, scoreDate, category.progress, category.completed, category.target, category.points]
+        [clientUserId, displayName, category.name, scoreDate, category.progress, category.completed, category.target, category.points,
+         category.pomodoro, category.minutes, category.memorized]
       );
     }
     const names = categories.map(category => category.name);
@@ -255,19 +300,123 @@ async function upsertDailyCategoryScores(clientUserId, displayName, scoreDate, c
   }
 }
 
-async function getDailyCategoryLeaderboard(scoreDate, categoryName) {
+// 指標ごとに「列名」を固定（ユーザー入力をSQLに直接入れないためのホワイトリスト）
+const LEADERBOARD_METRIC_COLUMNS = {
+  tasks: 'completed',
+  pomodoro: 'pomodoro',
+  minutes: 'minutes',
+  memorized: 'memorized',
+  rate: 'progress',
+};
+
+// 期間（from〜to）内のユーザー別合計で順位を出す
+async function getCategoryLeaderboard(fromDate, toDate, categoryName, metric) {
   if (!DB_ENABLED) throw new Error('Leaderboard database is unavailable');
+  const column = LEADERBOARD_METRIC_COLUMNS[metric] || LEADERBOARD_METRIC_COLUMNS.tasks;
   const { rows } = await pool.query(
-    `SELECT display_name AS name, category_name AS category, completion_percent AS progress,
-            completed_count AS completed, target_count AS target, points,
-            row_number() OVER (ORDER BY completion_percent DESC, points DESC, updated_at ASC) AS rank
-     FROM daily_category_scores
-     WHERE score_date = $1 AND category_name = $2
-     ORDER BY completion_percent DESC, points DESC, updated_at ASC
+    `WITH agg AS (
+       SELECT client_user_id,
+              MAX(display_name) AS name,
+              SUM(completed_count)::int AS completed,
+              SUM(target_count)::int AS target,
+              SUM(points)::int AS points,
+              SUM(pomodoro_count)::int AS pomodoro,
+              SUM(work_minutes)::int AS minutes,
+              SUM(memorized_count)::int AS memorized,
+              CASE WHEN SUM(target_count) = 0 THEN 0
+                   ELSE ROUND(100.0 * SUM(completed_count) / SUM(target_count))::int END AS progress
+       FROM daily_category_scores
+       WHERE score_date BETWEEN $1 AND $2 AND category_name = $3
+       GROUP BY client_user_id
+     )
+     SELECT name, $3::text AS category, progress, completed, target, points, pomodoro, minutes, memorized,
+            ${column} AS value,
+            row_number() OVER (ORDER BY ${column} DESC, points DESC, name ASC) AS rank
+     FROM agg
+     WHERE ${column} > 0
+     ORDER BY rank
      LIMIT 50`,
-    [scoreDate, categoryName]
+    [fromDate, toDate, categoryName]
   );
   return rows;
+}
+
+
+// ---- 公開デッキ ----
+const SHARED_DECK_REPORT_THRESHOLD = 3;
+
+async function createSharedDeck(ownerUserId, ownerName, { title, categoryName, description, cards }) {
+  const { rows } = await pool.query(
+    `INSERT INTO shared_decks (owner_user_id, owner_name, title, category_name, description, cards, card_count)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7) RETURNING id, title, category_name, card_count, created_at`,
+    [ownerUserId, ownerName, title, categoryName, description, JSON.stringify(cards), cards.length]
+  );
+  return rows[0];
+}
+
+async function countOwnSharedDecks(ownerUserId) {
+  const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM shared_decks WHERE owner_user_id = $1', [ownerUserId]);
+  return rows[0].n;
+}
+
+// 一覧（カード本文は含めない）。sort: new | popular
+async function listSharedDecks({ categoryName, sort, query, limit, offset }) {
+  const orderBy = sort === 'popular'
+    ? '(SELECT COUNT(*) FROM shared_deck_imports i WHERE i.deck_id = d.id) DESC, d.created_at DESC'
+    : 'd.created_at DESC';
+  const params = [categoryName || null, query ? `%${query}%` : null, limit, offset];
+  const { rows } = await pool.query(
+    `SELECT d.id, d.title, d.category_name AS "categoryName", d.description, d.owner_name AS "ownerName",
+            d.card_count AS "cardCount", d.created_at AS "createdAt",
+            (SELECT COUNT(*)::int FROM shared_deck_imports i WHERE i.deck_id = d.id) AS "importCount"
+     FROM shared_decks d
+     WHERE d.hidden = FALSE
+       AND ($1::text IS NULL OR d.category_name = $1)
+       AND ($2::text IS NULL OR d.title ILIKE $2)
+     ORDER BY ${orderBy}
+     LIMIT $3 OFFSET $4`,
+    params
+  );
+  return rows;
+}
+
+async function getSharedDeck(deckId) {
+  const { rows } = await pool.query(
+    `SELECT id, owner_user_id, title, category_name AS "categoryName", description, owner_name AS "ownerName",
+            card_count AS "cardCount", cards, created_at AS "createdAt"
+     FROM shared_decks WHERE id = $1 AND hidden = FALSE`,
+    [deckId]
+  );
+  return rows[0] || null;
+}
+
+async function recordSharedDeckImport(deckId, userId) {
+  await pool.query(
+    'INSERT INTO shared_deck_imports (deck_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+    [deckId, userId]
+  );
+}
+
+async function deleteSharedDeck(deckId, ownerUserId) {
+  const { rowCount } = await pool.query(
+    'DELETE FROM shared_decks WHERE id = $1 AND owner_user_id = $2',
+    [deckId, ownerUserId]
+  );
+  return rowCount > 0;
+}
+
+// 通報。閾値に達したら自動で非表示
+async function reportSharedDeck(deckId, reporterUserId, reason) {
+  await pool.query(
+    'INSERT INTO shared_deck_reports (deck_id, reporter_user_id, reason) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',
+    [deckId, reporterUserId, reason]
+  );
+  await pool.query(
+    `UPDATE shared_decks SET report_count = (SELECT COUNT(*)::int FROM shared_deck_reports r WHERE r.deck_id = $1),
+            hidden = (SELECT COUNT(*) FROM shared_deck_reports r WHERE r.deck_id = $1) >= $2
+     WHERE id = $1`,
+    [deckId, SHARED_DECK_REPORT_THRESHOLD]
+  );
 }
 
 module.exports = {
@@ -287,5 +436,13 @@ module.exports = {
   getShareBonusToday,
   grantShareBonus,
   upsertDailyCategoryScores,
-  getDailyCategoryLeaderboard,
+  getCategoryLeaderboard,
+  createSharedDeck,
+  countOwnSharedDecks,
+  listSharedDecks,
+  getSharedDeck,
+  recordSharedDeckImport,
+  deleteSharedDeck,
+  reportSharedDeck,
+  LEADERBOARD_METRIC_COLUMNS,
 };
