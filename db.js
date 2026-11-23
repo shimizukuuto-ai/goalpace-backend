@@ -155,6 +155,46 @@ async function initDb() {
     );
   `);
 
+  // ---- V11: オンラインプロフィール（表示名・アイコンドット・リーグ参加・公開設定） ----
+  // user_id は認証オン時は users.id（数値を文字列化）、認証オフ時は
+  // クライアントが送る userId（匿名デバイスID由来）。1行＝1人。
+  // display_name が NULL/空＝未設定（従来のプレイヤー-xxxx 表示のまま）。
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS online_profiles (
+      user_id TEXT PRIMARY KEY,
+      display_name TEXT,
+      avatar_color TEXT,
+      league_opt_in BOOLEAN NOT NULL DEFAULT TRUE,
+      activity_public BOOLEAN NOT NULL DEFAULT TRUE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  // ---- V11: 期限ベースの真のペース%（週次リーグ用） ----
+  // 1行＝1人×1週（week_date は月曜）。raw_pace はキャップなしの生値
+  // （実績÷今日までの計画量×100）。表示はクライアントが 100% で
+  // キャップし、先行分を別バッジで出す。順位は raw_pace で決める。
+  // achievement_percent は目標達成度%（実績÷目標量×100、上限100）。
+  // pomodoro / memorized / tasks_done はその週の回数・枚数・件数
+  // （クライアントが端末データから集計して送る。順位には使わない）。
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pace_scores (
+      user_id TEXT NOT NULL,
+      week_date DATE NOT NULL,
+      display_name TEXT NOT NULL,
+      avatar_color TEXT,
+      raw_pace INTEGER NOT NULL DEFAULT 0,
+      achievement_percent INTEGER NOT NULL DEFAULT 0,
+      pomodoro INTEGER NOT NULL DEFAULT 0,
+      memorized INTEGER NOT NULL DEFAULT 0,
+      tasks_done INTEGER NOT NULL DEFAULT 0,
+      league_opt_in BOOLEAN NOT NULL DEFAULT TRUE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_id, week_date)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_pace_scores_week ON pace_scores (week_date, raw_pace DESC);`);
+
   console.log('DB initialized (users, usage_events, share_bonuses, leaderboard tables ready).');
 }
 
@@ -573,13 +613,19 @@ const LEADERBOARD_METRIC_COLUMNS = {
 };
 
 // 期間（from〜to）内のユーザー別合計で順位を出す
+// V11: 表示名は online_profiles に保存されたユーザー設定名を優先する
+// （未設定なら daily_category_scores に保存された匿名名のまま）。
+// 順位は metric 列の値の降順。metric=rate の progress は日次タスクの
+// 7日間ペース%（0〜100）で、期限ベースの真のペース%ではない。
+// 期限ベースの順位は pace_scores（GET /api/league/weekly）を使うこと。
 async function getCategoryLeaderboard(fromDate, toDate, categoryName, metric) {
   if (!DB_ENABLED) throw new Error('Leaderboard database is unavailable');
   const column = LEADERBOARD_METRIC_COLUMNS[metric] || LEADERBOARD_METRIC_COLUMNS.tasks;
   const { rows } = await pool.query(
     `WITH agg AS (
        SELECT client_user_id,
-              MAX(display_name) AS name,
+              MAX(COALESCE(op.display_name, display_name)) AS name,
+              MAX(op.avatar_color) AS avatar_color,
               SUM(completed_count)::int AS completed,
               SUM(target_count)::int AS target,
               SUM(points)::int AS points,
@@ -588,11 +634,12 @@ async function getCategoryLeaderboard(fromDate, toDate, categoryName, metric) {
               SUM(memorized_count)::int AS memorized,
               CASE WHEN SUM(target_count) = 0 THEN 0
                    ELSE ROUND(100.0 * SUM(completed_count) / SUM(target_count))::int END AS progress
-       FROM daily_category_scores
+       FROM daily_category_scores dcs
+       LEFT JOIN online_profiles op ON op.user_id = dcs.client_user_id
        WHERE score_date BETWEEN $1 AND $2 AND category_name = $3
        GROUP BY client_user_id
      )
-     SELECT name, $3::text AS category, progress, completed, target, points, pomodoro, minutes, memorized,
+     SELECT name, avatar_color, $3::text AS category, progress, completed, target, points, pomodoro, minutes, memorized,
             ${column} AS value,
             row_number() OVER (ORDER BY ${column} DESC, points DESC, name ASC) AS rank
      FROM agg
@@ -602,6 +649,175 @@ async function getCategoryLeaderboard(fromDate, toDate, categoryName, metric) {
     [fromDate, toDate, categoryName]
   );
   return rows;
+}
+
+// ==========================================================================
+// V11: オンラインプロフィール & 期限ベースのペースリーグ
+// ==========================================================================
+
+const AVATAR_COLORS = ['#9AA0A6', '#2DFFB4', '#FF7AD9', '#60A5FA', '#FBBF24', '#FB7185'];
+
+/** 表示名の正規化。空文字は「未設定」(null)。20文字まで。 */
+function cleanDisplayName(value) {
+  if (typeof value !== 'string') return null;
+  const name = value.trim().replace(/\s+/g, ' ').slice(0, 20);
+  return name || null;
+}
+
+function cleanAvatarColor(value) {
+  return AVATAR_COLORS.includes(value) ? value : null;
+}
+
+async function getOnlineProfile(userId) {
+  const { rows } = await pool.query(
+    'SELECT user_id, display_name, avatar_color, league_opt_in, activity_public FROM online_profiles WHERE user_id = $1',
+    [String(userId)]
+  );
+  if (!rows[0]) return null;
+  return {
+    userId: rows[0].user_id,
+    displayName: rows[0].display_name || null,
+    avatarColor: rows[0].avatar_color || null,
+    leagueOptIn: rows[0].league_opt_in !== false,
+    activityPublic: rows[0].activity_public !== false,
+  };
+}
+
+/**
+ * プロフィールを部分更新する（渡された項目だけ）。行が無ければ作る。
+ * displayName に null を渡すと未設定に戻す（avatarColor も同じ）。
+ * 戻り値は更新後のプロフィール。
+ */
+async function upsertOnlineProfile(userId, patch) {
+  const id = String(userId);
+  const displayName = patch.displayName !== undefined ? cleanDisplayName(patch.displayName) : undefined;
+  const avatarColor = patch.avatarColor !== undefined ? cleanAvatarColor(patch.avatarColor) : undefined;
+  const leagueOptIn = patch.leagueOptIn !== undefined ? Boolean(patch.leagueOptIn) : undefined;
+  const activityPublic = patch.activityPublic !== undefined ? Boolean(patch.activityPublic) : undefined;
+  const { rows } = await pool.query(
+    `INSERT INTO online_profiles (user_id, display_name, avatar_color, league_opt_in, activity_public)
+     VALUES ($1, $2, $3, COALESCE($4, TRUE), COALESCE($5, TRUE))
+     ON CONFLICT (user_id) DO UPDATE SET
+       display_name = CASE WHEN $2 IS NULL AND $6::boolean THEN NULL ELSE COALESCE($2, online_profiles.display_name) END,
+       avatar_color = CASE WHEN $3 IS NULL AND $7::boolean THEN NULL ELSE COALESCE($3, online_profiles.avatar_color) END,
+       league_opt_in = COALESCE($4, online_profiles.league_opt_in),
+       activity_public = COALESCE($5, online_profiles.activity_public),
+       updated_at = now()
+     RETURNING user_id, display_name, avatar_color, league_opt_in, activity_public`,
+    [
+      id,
+      displayName === undefined ? null : displayName,
+      avatarColor === undefined ? null : avatarColor,
+      leagueOptIn === undefined ? null : leagueOptIn,
+      activityPublic === undefined ? null : activityPublic,
+      patch.displayName !== undefined,
+      patch.avatarColor !== undefined,
+    ]
+  );
+  const r = rows[0];
+  return {
+    userId: r.user_id,
+    displayName: r.display_name || null,
+    avatarColor: r.avatar_color || null,
+    leagueOptIn: r.league_opt_in !== false,
+    activityPublic: r.activity_public !== false,
+  };
+}
+
+/**
+ * 表示名を「共有目標のメンバー名」と「今週のひとこと」の表示にも反映する。
+ * daily_category_scores / pace_scores の表示名は読み取り時に
+ * online_profiles を優先する（getCategoryLeaderboard / getWeeklyLeague）
+ * ため、ここで書き換える必要はない。
+ */
+async function applyDisplayName(userId, displayName) {
+  const id = String(userId);
+  const name = cleanDisplayName(displayName);
+  if (!name) return;
+  await pool.query('UPDATE shared_goal_members SET display_name = $2 WHERE user_id = $1', [id, name]);
+  const monday = await pool.query(
+    `SELECT to_char(date_trunc('week', now() AT TIME ZONE 'Asia/Tokyo'), 'YYYY-MM-DD') AS d`
+  );
+  await pool.query(
+    'UPDATE rank_comments SET author_name = $2 WHERE owner_user_id = $1 AND week_start = $3',
+    [id, name, monday.rows[0].d]
+  ).catch(() => {});
+}
+
+/** 期限ベースの真のペース%を今週分として保存する（1人×1週で上書き）。 */
+async function upsertPaceScore(userId, weekDate, score) {
+  const { rows } = await pool.query(
+    `INSERT INTO pace_scores
+       (user_id, week_date, display_name, avatar_color, raw_pace, achievement_percent,
+        pomodoro, memorized, tasks_done, league_opt_in)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+     ON CONFLICT (user_id, week_date) DO UPDATE SET
+       display_name = EXCLUDED.display_name,
+       avatar_color = EXCLUDED.avatar_color,
+       raw_pace = EXCLUDED.raw_pace,
+       achievement_percent = EXCLUDED.achievement_percent,
+       pomodoro = EXCLUDED.pomodoro,
+       memorized = EXCLUDED.memorized,
+       tasks_done = EXCLUDED.tasks_done,
+       league_opt_in = EXCLUDED.league_opt_in,
+       updated_at = now()
+     RETURNING *`,
+    [
+      String(userId),
+      weekDate,
+      score.displayName,
+      score.avatarColor || null,
+      Math.max(0, Math.round(score.rawPace || 0)),
+      Math.max(0, Math.min(100, Math.round(score.achievementPercent || 0))),
+      Math.max(0, Math.floor(score.pomodoro || 0)),
+      Math.max(0, Math.floor(score.memorized || 0)),
+      Math.max(0, Math.floor(score.tasksDone || 0)),
+      score.leagueOptIn !== false,
+    ]
+  );
+  return rows[0];
+}
+
+/**
+ * 今週のペースリーグ：参加中の人だけを生のペース%（raw_pace）順に返す。
+ * 表示名は保存時の名前（プロフィール更新時は次回同期で反映される）。
+ * requesterId がリーグ不参加なら optedOut=true を返す（自分の行は出さない）。
+ */
+async function getWeeklyLeague(weekDate, requesterId) {
+  let optedOut = false;
+  if (requesterId) {
+    const mine = await getOnlineProfile(requesterId);
+    if (mine && mine.leagueOptIn === false) optedOut = true;
+  }
+  const { rows } = await pool.query(
+    `SELECT user_id, display_name AS name, avatar_color,
+            raw_pace, achievement_percent, pomodoro, memorized, tasks_done,
+            row_number() OVER (ORDER BY raw_pace DESC, achievement_percent DESC, display_name ASC) AS rank
+     FROM pace_scores
+     WHERE week_date = $1 AND league_opt_in = TRUE
+     ORDER BY rank
+     LIMIT 50`,
+    [weekDate]
+  );
+  return {
+    optedOut,
+    entries: rows.map((r) => ({
+      name: r.name,
+      avatarColor: r.avatar_color || null,
+      category: 'overall',
+      rank: Number(r.rank),
+      progress: Number(r.raw_pace),
+      pacePercent: Number(r.raw_pace),
+      achievementPercent: Number(r.achievement_percent),
+      pomodoro: Number(r.pomodoro),
+      memorized: Number(r.memorized),
+      tasksDone: Number(r.tasks_done),
+      completed: Number(r.tasks_done),
+      target: 0,
+      points: 0,
+      isMe: requesterId ? String(r.user_id) === String(requesterId) : false,
+    })),
+  };
 }
 
 
@@ -719,6 +935,14 @@ module.exports = {
   grantShareBonusThisWeek,
   upsertDailyCategoryScores,
   getCategoryLeaderboard,
+  getOnlineProfile,
+  upsertOnlineProfile,
+  applyDisplayName,
+  upsertPaceScore,
+  getWeeklyLeague,
+  AVATAR_COLORS,
+  cleanDisplayName,
+  cleanAvatarColor,
   createSharedDeck,
   updateSharedDeck,
   countOwnSharedDecks,

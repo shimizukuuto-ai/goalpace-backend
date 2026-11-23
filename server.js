@@ -11,6 +11,10 @@ app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 require('./community').register({ app, db, auth });
 require('./sharedGoals').register({ app, db, auth }); // Iteration 3: 共有目標（UNVERIFIED — auth.js/iap.js が無いため Render で確認すること）
+require('./activity').register({ app, db, auth }); // V11: 最近のアクティビティフィード
+// V11: 期限ベースの真のペース%（plannedByToday は pace.ts と同じ定義）。
+const { plannedByToday } = require('./sharedGoals');
+const { screenText } = require('./community');
 app.use(express.static('public'));
 
 // ==========================================================================
@@ -469,8 +473,8 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '6.0.0',
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true },
+    version: '7.0.0',
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true },
   });
 });
 
@@ -480,7 +484,7 @@ app.get('/', (req, res) => {
     status: 'running',
     aiProvider: IS_OPENROUTER ? 'OpenRouter' : (API_KEY ? 'Groq (Llama 3)' : 'unconfigured'),
     model: DEFAULT_MODEL,
-    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/health']
+    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/activity', '/api/activity/feed', '/health']
   });
 });
 
@@ -702,6 +706,185 @@ app.post('/api/routine/suggest', optionalAuth, quotaStd, async (req, res) => {
   } catch (err) {
     console.error('/api/routine/suggest error:', err);
     res.status(500).json({ error: 'Could not create a routine right now.' });
+  }
+});
+
+// ---- V11: 期限ベースの真のペース%・オンラインプロフィール ----
+// identity: 認証オン時はセッションの userId、認証オフ時はクライアントが
+// 送る userId（未サインイン時の匿名ID）→クエリ→ X-Device-Id の順。
+function onlineIdentity(req) {
+  if (REQUIRE_AUTH) return req.userId ? String(req.userId) : '';
+  const fromBody = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
+  if (fromBody) return fromBody;
+  const fromQuery = typeof req.query?.userId === 'string' ? req.query.userId.trim() : '';
+  if (fromQuery) return fromQuery;
+  return resolveDeviceId(req) || '';
+}
+// JST の今日（YYYY-MM-DD）。週の区切り・plannedByToday の起点は JST。
+function todayJst() {
+  return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+}
+const anonDisplayName = (userId) => 'プレイヤー-' + crypto.createHash('sha256').update(String(userId)).digest('hex').slice(0, 4);
+
+/**
+ * V11: 期限ベースの真のペース%を同期する（POST /api/leaderboard/sync-pace）。
+ * 旧 /api/leaderboard/sync は残す（旧クライアント互換。7日間の日次タスク
+ * 達成率のまま）。こちらは目標の締切・目標量・実績を受け取り、サーバー側で
+ * ペース% = 実績 ÷ 今日までの計画量（plannedByToday。pace.ts と同じ定義）
+ * を計算して今週のリーグ順位に使う。順位は生のペース%（キャップなし）で決め、
+ * 表示はクライアントが 100% でキャップ＋「先行」バッジにする。
+ * goals: [{ target, actual, deadline: 'YYYY-MM-DD', startDate?: 'YYYY-MM-DD' }]
+ *   startDate が無い目標（v11 以前に作られた目標）は今週の月曜を起点にする
+ *   （週間リーグの窓口に合わせる。pace.ts の fallbackPacePercent と同じ考え方）。
+ * stats: { pomodoro, memorized, tasksDone }（その週の回数・枚数・件数。
+ *   順位には使わない。プロフィールの4つの数字として表示する）。
+ * displayName を送るとプロフィールの表示名として保存する（スクリーニング付き）。
+ * 未設定のままなら保存済みの表示名→匿名（プレイヤー-xxxx）の順で表示する。
+ */
+app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
+  try {
+    const userId = onlineIdentity(req);
+    if (!userId || userId.length > 80) {
+      return res.status(400).json({ error: 'Invalid userId' });
+    }
+    const goals = Array.isArray(req.body?.goals) ? req.body.goals : [];
+    if (goals.length > 30) {
+      return res.status(400).json({ error: 'Too many goals' });
+    }
+    const today = todayJst();
+    const { weekDate } = await db.getWeekWindow();
+    let totalActual = 0;
+    let totalTarget = 0;
+    let totalPlanned = 0;
+    for (const g of goals) {
+      const target = Number(g?.target);
+      const actual = Number(g?.actual) || 0;
+      const deadline = String(g?.deadline || '');
+      if (!Number.isFinite(target) || target <= 0 || target > 100000000) {
+        return res.status(400).json({ error: 'Invalid goal target' });
+      }
+      if (!Number.isFinite(actual) || actual < 0 || actual > 100000000) {
+        return res.status(400).json({ error: 'Invalid goal actual' });
+      }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(deadline)) {
+        return res.status(400).json({ error: 'Invalid goal deadline' });
+      }
+      const startDate = /^\d{4}-\d{2}-\d{2}$/.test(String(g?.startDate || '')) ? String(g.startDate) : weekDate;
+      totalActual += actual;
+      totalTarget += target;
+      totalPlanned += plannedByToday(target, startDate, deadline, today);
+    }
+    const rawPace = totalPlanned > 0 ? (totalActual / totalPlanned) * 100 : (totalActual > 0 ? 100 : 0);
+    const achievement = totalTarget > 0 ? Math.min(100, (totalActual / totalTarget) * 100) : 0;
+    const stats = req.body?.stats || {};
+    const count = (v) => Math.max(0, Math.min(100000, Math.floor(Number(v) || 0)));
+
+    // 表示名・アイコンドット・参加設定：送られてきた項目だけ保存する。
+    const patch = {};
+    if (typeof req.body?.displayName === 'string' && req.body.displayName.trim()) {
+      const name = req.body.displayName.trim().slice(0, 20);
+      const s = screenText(name);
+      if (!s.ok) return res.status(422).json({ error: s.error, code: s.code });
+      patch.displayName = name;
+    }
+    if (typeof req.body?.avatarColor === 'string' && db.AVATAR_COLORS.includes(req.body.avatarColor)) {
+      patch.avatarColor = req.body.avatarColor;
+    }
+    if (typeof req.body?.leagueOptIn === 'boolean') patch.leagueOptIn = req.body.leagueOptIn;
+    if (typeof req.body?.activityPublic === 'boolean') patch.activityPublic = req.body.activityPublic;
+    let profile = await db.getOnlineProfile(userId).catch(() => null);
+    if (Object.keys(patch).length > 0) {
+      profile = await db.upsertOnlineProfile(userId, patch);
+      if (patch.displayName) await db.applyDisplayName(userId, patch.displayName).catch(() => {});
+    }
+    const displayName = profile?.displayName || anonDisplayName(userId);
+    await db.upsertPaceScore(userId, weekDate, {
+      displayName,
+      avatarColor: profile?.avatarColor || null,
+      rawPace,
+      achievementPercent: achievement,
+      pomodoro: count(stats.pomodoro),
+      memorized: count(stats.memorized),
+      tasksDone: count(stats.tasksDone),
+      leagueOptIn: profile ? profile.leagueOptIn !== false : true,
+    });
+    res.json({ ok: true, weekDate, pacePercent: Math.round(rawPace), achievementPercent: Math.round(achievement) });
+  } catch (err) {
+    console.error('/api/leaderboard/sync-pace error:', err);
+    res.status(503).json({ error: 'Leaderboard is unavailable' });
+  }
+});
+
+// V11: 今週のペースリーグ（正式版）。期限ベースの真のペース%（生値）順。
+// 旧クライアント向けの GET /api/leaderboard（metric=rate＝7日間ペース%）は残す。
+// 参加をオフにしている人は一覧に出ない。?userId= で自分の行に isMe が付く。
+app.get('/api/league/weekly', optionalAuth, async (req, res) => {
+  try {
+    const { weekDate } = await db.getWeekWindow();
+    const requesterId = onlineIdentity(req) || null;
+    const { optedOut, entries } = await db.getWeeklyLeague(weekDate, requesterId);
+    res.json({ weekStart: weekDate, entries, optedOut, isPlaceholder: false });
+  } catch (err) {
+    console.error('/api/league/weekly error:', err);
+    res.status(503).json({ error: 'Leaderboard is unavailable' });
+  }
+});
+
+// V11: オンラインプロフィール（表示名・アイコンドット・リーグ参加・公開設定）。
+// 表示名はランキング／リーグ／共有目標の全部で同じ名前として使う。
+// 未設定なら null を返し、クライアントは今まで通りプレイヤー-xxxx を表示する。
+app.get('/api/online/profile', optionalAuth, async (req, res) => {
+  try {
+    const userId = onlineIdentity(req);
+    if (!userId) return res.status(400).json({ error: 'Invalid userId' });
+    const profile = await db.getOnlineProfile(userId);
+    res.json({
+      profile: profile || {
+        userId,
+        displayName: null,
+        avatarColor: null,
+        leagueOptIn: true,
+        activityPublic: true,
+      },
+    });
+  } catch (err) {
+    console.error('/api/online/profile error:', err);
+    res.status(503).json({ error: 'Profile is unavailable' });
+  }
+});
+
+app.put('/api/online/profile', optionalAuth, async (req, res) => {
+  try {
+    const userId = onlineIdentity(req);
+    if (!userId || userId.length > 80) {
+      return res.status(400).json({ error: 'Invalid userId' });
+    }
+    const patch = {};
+    if (req.body?.displayName !== undefined) {
+      if (typeof req.body.displayName !== 'string' || req.body.displayName.trim().length > 20) {
+        return res.status(400).json({ error: '表示名は20文字までです。' });
+      }
+      const name = req.body.displayName.trim();
+      if (name) {
+        const s = screenText(name);
+        if (!s.ok) return res.status(422).json({ error: s.error, code: s.code });
+      }
+      patch.displayName = name;
+    }
+    if (req.body?.avatarColor !== undefined) {
+      if (req.body.avatarColor !== null && !db.AVATAR_COLORS.includes(req.body.avatarColor)) {
+        return res.status(400).json({ error: 'Invalid avatarColor' });
+      }
+      patch.avatarColor = req.body.avatarColor;
+    }
+    if (req.body?.leagueOptIn !== undefined) patch.leagueOptIn = Boolean(req.body.leagueOptIn);
+    if (req.body?.activityPublic !== undefined) patch.activityPublic = Boolean(req.body.activityPublic);
+    const profile = await db.upsertOnlineProfile(userId, patch);
+    if (patch.displayName) await db.applyDisplayName(userId, patch.displayName).catch(() => {});
+    res.json({ profile });
+  } catch (err) {
+    console.error('PUT /api/online/profile error:', err);
+    res.status(503).json({ error: 'Profile is unavailable' });
   }
 });
 

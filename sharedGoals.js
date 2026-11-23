@@ -6,14 +6,20 @@
 //   — やり取りはスタンプ（絵文字リアクション）のみ。
 //
 // 競争指標（ユーザーと決定済み）: ペース% のみ。
-//   ペース% = 実績 ÷ 今日までの計画量 × 100、上限 150%。
+//   ペース% = 実績 ÷ 今日までの計画量 × 100。サーバーは生のペース%
+//   （キャップなし）を返す。表示はクライアントが 100% でキャップし、
+//   先行分を「+28% 先行」バッジで別に出す（V11-1）。順位は生値で決める。
 //   メンバーのペース% = メンバー貢献量 ÷ メンバーの今日までの計画量
 //     （目標量をメンバー数で均等割り）。
-//   共有ペース% = 合計貢献量 ÷ 合計の今日までの計画量（上限 150%）。
+//   共有ペース% = 合計貢献量 ÷ 合計の今日までの計画量。
 //   週間ペースは月曜時点の目標で計算する（週の途中で目標を緩めても
 //   ペースは変わらない）。共有目標の target は作成後変更できない
 //   （更新エンドポイントを用意していない）ため、このルールは自動的に満たされる。
 //   生の量（単語数・分数）は順位に使わない。
+//
+// 表示名（V11）: メンバーの表示名は online_profiles の設定名を優先する
+//   （未設定なら従来のプレイヤー-xxxx）。設定名の変更は
+//   PUT /api/online/profile で shared_goal_members にも反映される。
 //
 // 共有ストリーク: 全メンバーがその日の勝利条件を満たした日だけ数える。
 //   勝利条件 = その日の貢献量が「1人あたりの1日分」以上。
@@ -36,7 +42,7 @@ const crypto = require('crypto');
 // V6: スタンプ機能は廃止した（POST /api/shared-goals/:id/stamp を削除）。
 // shared_goal_stamps テーブルと loadGoalDetail の stamps 読み取りは残置
 // （旧データの CASCADE 削除と互換性のため。v6クライアントは表示しない）。
-const PACE_CAP = 150;
+// V11: ペース% は生値（キャップなし）。rawPace() を参照。
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS shared_goals (
@@ -168,9 +174,12 @@ function daysBetween(a, b) {
   const utcB = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate());
   return Math.round((utcB - utcA) / 86400000);
 }
-function capPace(v) {
+// V11: ペース% は生値（キャップなし）で返す。表示の 100% キャップ＋
+// 「先行」バッジはクライアント側（src/utils/pace.ts の displayPace /
+// aheadLabel）で行う。順位はこの生値で決める。
+function rawPace(v) {
   if (!Number.isFinite(v) || v <= 0) return 0;
-  return Math.min(PACE_CAP, v);
+  return v;
 }
 // 今日までの計画量（src/utils/pace.ts の plannedByToday と同じ定義）。
 function plannedByToday(target, startDate, deadline, today) {
@@ -231,6 +240,16 @@ function register({ app, db, auth }) {
   async function isMember(goalId, userId) {
     const r = await q('SELECT 1 FROM shared_goal_members WHERE goal_id = $1 AND user_id = $2', [goalId, userId]);
     return r.rowCount > 0;
+  }
+
+  // V11: メンバーの表示名は online_profiles の設定名を優先する
+  // （未設定なら従来のプレイヤー-xxxx）。
+  async function displayNameFor(uid) {
+    try {
+      const profile = await db.getOnlineProfile(uid);
+      if (profile && profile.displayName) return profile.displayName;
+    } catch (_) { /* 取れなくても匿名名で作る */ }
+    return anonName(uid);
   }
 
   // 目標1件分の集計（メンバー・貢献・スタンプ・ペース%・共有ストリーク・共通タスク）。
@@ -323,7 +342,7 @@ function register({ app, db, auth }) {
         displayName: m.display_name || anonName(m.user_id),
         contribution: u.total,
         todayContribution: u.today,
-        pacePercent: memberPlanned > 0 ? capPace((u.total / memberPlanned) * 100) : (u.total > 0 ? 100 : 0),
+        pacePercent: memberPlanned > 0 ? rawPace((u.total / memberPlanned) * 100) : (u.total > 0 ? 100 : 0),
         wonToday: u.winDates.has(goal.today),
         // 共通タスク：そのメンバーが今日完了したタスク数（後で tasks から数えて入れる）
         tasksDoneToday: 0,
@@ -331,7 +350,7 @@ function register({ app, db, auth }) {
         joinedAt: m.joined_at,
       };
     });
-    // 共有目標内の順位はペース% 順（上限 150%）。
+    // 共有目標内の順位はペース% 順（生値。表示は 100% キャップ＋先行バッジ）。
     memberList.sort((a, b) => b.pacePercent - a.pacePercent || b.contribution - a.contribution);
 
     // 共通タスク（Iteration 4）：一覧＋今日の完了者。完了は当日のみ有効
@@ -380,7 +399,7 @@ function register({ app, db, auth }) {
       memberCount,
       totalContribution,
       plannedByToday: planned,
-      pacePercent: planned > 0 ? capPace((totalContribution / planned) * 100) : (totalContribution > 0 ? 100 : 0),
+      pacePercent: planned > 0 ? rawPace((totalContribution / planned) * 100) : (totalContribution > 0 ? 100 : 0),
       dailyTargetPerMember: dailyTarget,
       sharedStreakDays: sharedWinDates.length,
       sharedWinDates,
@@ -445,6 +464,8 @@ function register({ app, db, auth }) {
     // 修正前は INSERT 成功後に loadGoalDetail が例外を投げると目標だけ
     // DB に残り、次回作成時も20個上限のカウントに入る「ゴミ目標」に
     // なっていた。leave ハンドラと同じ client.query('BEGIN') の流儀。
+    // V11: 作成者の表示名はプロフィールの設定名を優先する。
+    const creatorName = await displayNameFor(uid);
     let goalId = null;
     for (let attempt = 0; attempt < 5; attempt++) {
       const code = randomInviteCode();
@@ -457,7 +478,7 @@ function register({ app, db, auth }) {
           [uid, title, target, unit, deadline, code]);
         goalId = ins.rows[0].id;
         await client.query('INSERT INTO shared_goal_members (goal_id, user_id, display_name) VALUES ($1, $2, $3)',
-          [goalId, uid, anonName(uid)]);
+          [goalId, uid, creatorName]);
         await client.query('COMMIT');
         break;
       } catch (e) {
@@ -544,7 +565,7 @@ function register({ app, db, auth }) {
     const cnt = await q('SELECT COUNT(*)::int AS n FROM shared_goal_members WHERE goal_id = $1', [goalId]);
     if (cnt.rows[0].n >= 30) return res.status(400).json({ error: 'この共有目標は満員です（30人まで）。' });
     await q('INSERT INTO shared_goal_members (goal_id, user_id, display_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-      [goalId, uid, anonName(uid)]);
+      [goalId, uid, await displayNameFor(uid)]);
     const detail = await loadGoalDetail(goalId, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
     detail.isOwner = false;
@@ -675,7 +696,8 @@ module.exports = { register, parseDay, daysBetween, plannedByToday, formatDay };
  *    - POST /api/shared-goals（title/target/unit/deadline）→ 200 で goal が返る
  *    - 返った inviteCode（8文字）で別アカウントが POST /api/shared-goals/join
  *    - 両者が POST /api/shared-goals/:id/contribute（amount）→ pacePercent が
- *      150% で頭打ちになること（大量に contribute して確認）
+ *      生値で返ること（V11: 表示はクライアントが 100% でキャップ＋先行バッジ。
+ *      旧 v10 クライアントは formatPace が 150% で頭打ちするため表示は変わらない）
  *    - 全員が dailyTargetPerMember 以上を当日入れた日だけ sharedStreakDays が
  *      増えること。片方だけの日は増えないこと
  *    - スタンプは V6 で廃止（POST /api/shared-goals/:id/stamp は存在しないこと）
@@ -689,7 +711,7 @@ module.exports = { register, parseDay, daysBetween, plannedByToday, formatDay };
  *      （タスクは貢献量に換算しない＝順位はペース%のまま）
  *    - DELETE /api/shared-goals/:id/tasks/:taskId はオーナー以外 403
  *    - 31件目のタスク作成は 400（上限30件）
- * 6. GET /api/version → { version: '5.0.0', features: { sharedGoals: true, ... } }
+ * 6. GET /api/version → { version: '7.0.0', features: { sharedGoals: true, ... } }
  *    が返ること（server.js に追加済み。旧サーバーでは 404 になる）。
  * 7. 503 が出たときの切り分け（v5）: Render → Logs で
  *    `[shared-goals] requestId=... POST /api/shared-goals user=... step=... error=...`
