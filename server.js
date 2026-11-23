@@ -31,12 +31,15 @@ const REQUIRE_AUTH = process.env.REQUIRE_AUTH === 'true';
 
 // ==========================================================================
 // AI利用枠（週単位・毎週月曜0:00 JSTにリセット）
-//   無料 : 週10回 / Premium : 週100回
+//   無料 : 週10回（利用開始から7日間は週50回） / Premium : 週300回
 //   特典 : シェアで今週だけ +3（週1回） / 友達招待で双方に +10（ボーナス残高・期限なし）
 // 値はすべて環境変数で上書きできる。コードを触らずに調整可能。
 // ==========================================================================
 const FREE_WEEKLY_LIMIT = parseInt(process.env.FREE_WEEKLY_LIMIT || '10', 10);
-const PAID_WEEKLY_LIMIT = parseInt(process.env.PAID_WEEKLY_LIMIT || '100', 10);
+const PAID_WEEKLY_LIMIT = parseInt(process.env.PAID_WEEKLY_LIMIT || '300', 10);
+// お試し期間: アカウント作成（初回サインイン）から FREE_TRIAL_DAYS 日間は、無料でも週 FREE_TRIAL_WEEKLY_LIMIT 回まで使える
+const FREE_TRIAL_DAYS = parseInt(process.env.FREE_TRIAL_DAYS || '7', 10);
+const FREE_TRIAL_WEEKLY_LIMIT = parseInt(process.env.FREE_TRIAL_WEEKLY_LIMIT || '50', 10);
 const SHARE_BONUS_AMOUNT = parseInt(process.env.SHARE_BONUS_AMOUNT || '3', 10);
 const REFERRAL_FRIEND_BONUS = parseInt(process.env.REFERRAL_FRIEND_BONUS || '10', 10);
 const REFERRAL_OWNER_BONUS = parseInt(process.env.REFERRAL_OWNER_BONUS || '10', 10);
@@ -223,12 +226,20 @@ async function buildUsage(user) {
     db.getUserById(user.id),
     db.countReferrals(user.id),
   ]);
-  const baseLimit = paid ? PAID_WEEKLY_LIMIT : FREE_WEEKLY_LIMIT;
+  // 開始日はサーバーに保存された作成日時で判定する（端末の時計は変えられるため使わない）
+  const createdAt = fresh?.created_at || user.created_at;
+  const trialEndsAt = createdAt ? new Date(new Date(createdAt).getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000) : null;
+  const inTrial = !paid && Boolean(trialEndsAt) && trialEndsAt.getTime() > Date.now();
+  const baseLimit = paid
+    ? PAID_WEEKLY_LIMIT
+    : (inTrial ? Math.max(FREE_WEEKLY_LIMIT, FREE_TRIAL_WEEKLY_LIMIT) : FREE_WEEKLY_LIMIT);
   const weeklyLimit = baseLimit + shareBonus;
   const remainingWeekly = Math.max(0, weeklyLimit - used);
   const bonusCredits = fresh?.bonus_credits || 0;
   return {
     plan: paid ? 'premium' : 'free',
+    inTrial,
+    trialEndsAt: inTrial ? trialEndsAt.toISOString() : null,
     weeklyLimit,
     baseLimit,
     used,
@@ -444,6 +455,13 @@ app.post('/api/checkin', optionalAuth, quotaStd, async (req, res) => {
 プロジェクト全体の進捗履歴、今日の進捗ログ（気分・完了タスク・メモ）を分析し、
 達成確率・着地予想日・軌道修正プランを算出してフィードバックしてください。
 
+【ユーザー自作のタスクについて】
+プロジェクト情報の customTasks は、ユーザーが自分で決めた「この目標のためにやるタスク」です。
+- 必ず計画の一部として考慮し、すでに customTasks にある内容と重複するタスクを updatedTasks に入れないこと
+- customTasks のうち、本日の完了タスクに含まれないものは未着手として扱い、ペースの評価に反映すること
+- customTasks が多すぎて期日に収まらない場合は、messageでそのことを率直に伝えること
+- updatedTasks には customTasks を書き写さず、それを補う新しい具体的タスクだけを入れること
+
 必ず以下のJSON形式のみで出力してください：
 {
   "onTrack": true または false,
@@ -455,7 +473,9 @@ app.post('/api/checkin', optionalAuth, quotaStd, async (req, res) => {
   "currentPacePercent": 0〜130の数値（全体の道のりを100とした場合の現在地）
 }` + localeSuffix(locale);
 
+    const customTaskList = Array.isArray(project && project.customTasks) ? project.customTasks.filter((t) => typeof t === 'string').slice(0, 30) : [];
     const userText = `【プロジェクト情報】: ${JSON.stringify(project)}
+【ユーザー自作のタスク（${customTaskList.length}件）】: ${customTaskList.length ? JSON.stringify(customTaskList) : 'なし'}
 【本日のチェックイン】: ${JSON.stringify(todayEntry)}
 【経過日数の割合目安】: ${scheduleElapsedPercent === null ? '不明' : scheduleElapsedPercent + '%'}
 【前回のAI進捗率】: ${previousCurrentPacePercent === null ? '初回' : previousCurrentPacePercent + '%'}`;

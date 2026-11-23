@@ -3,6 +3,8 @@
 // 方針: サインイン必須 / 1人1コメント / 通報3人で自動非表示 / ブロック / 管理者の非表示・削除・投稿禁止 / 緊急停止スイッチ
 const crypto = require('crypto');
 
+// バッドが多い投稿の自動非表示（バッド数がこの値以上、かつ いいねの2倍超）
+const DISLIKE_HIDE_MIN = Math.max(5, Number(process.env.DISLIKE_HIDE_MIN) || 10);
 const REPORT_HIDE_THRESHOLD = Math.max(2, Number(process.env.REPORT_HIDE_THRESHOLD) || 3);
 const POSTS_PER_DAY = 3;
 const MAX_LIVE_POSTS = 30;
@@ -38,6 +40,16 @@ CREATE TABLE IF NOT EXISTS community_posts (
 CREATE INDEX IF NOT EXISTS idx_community_posts_list ON community_posts (hidden, deleted, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_community_posts_owner ON community_posts (owner_user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_community_posts_hash ON community_posts (body_hash);
+ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS like_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS dislike_count INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_community_posts_score ON community_posts (hidden, deleted, (like_count - dislike_count) DESC, created_at DESC);
+CREATE TABLE IF NOT EXISTS post_reactions (
+  post_id BIGINT NOT NULL,
+  user_id TEXT NOT NULL,
+  value SMALLINT NOT NULL CHECK (value IN (-1, 1)),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (post_id, user_id)
+);
 CREATE TABLE IF NOT EXISTS rank_comments (
   id BIGSERIAL PRIMARY KEY,
   owner_user_id TEXT NOT NULL,
@@ -199,6 +211,8 @@ function register({ app, db, auth }) {
     id: String(r.id), authorName: r.author_name, kind: r.kind, title: r.title, body: r.body,
     categoryName: r.category_name, basedOn: r.based_on || null, aiAssisted: r.ai_assisted,
     createdAt: r.created_at, mine: !!r.mine,
+    likes: Number(r.like_count) || 0, dislikes: Number(r.dislike_count) || 0,
+    myReaction: Number(r.my_reaction) || 0,
   });
 
   // ---- アカウント削除のとき、投稿・コメントも消す（既存の削除処理の前に実行） ----
@@ -255,7 +269,7 @@ function register({ app, db, auth }) {
 
   app.get('/api/posts/mine', auth.requireAuth, wrap(async (req, res) => {
     const r = await q(
-      `SELECT id, author_name, kind, title, body, category_name, based_on, ai_assisted, created_at, hidden, TRUE AS mine
+      `SELECT id, author_name, kind, title, body, category_name, based_on, ai_assisted, created_at, hidden, like_count, dislike_count, TRUE AS mine
        FROM community_posts WHERE owner_user_id = $1 AND deleted = FALSE ORDER BY created_at DESC LIMIT 50`,
       [String(req.userId)]);
     res.json({ posts: r.rows.map((x) => ({ ...shapePost(x), hidden: x.hidden })) });
@@ -264,17 +278,71 @@ function register({ app, db, auth }) {
   app.get('/api/posts', wrap(async (req, res) => {
     const uid = softUserId(req);
     const kind = ['story', 'essay'].includes(req.query.kind) ? req.query.kind : null;
+    const sort = req.query.sort === 'new' ? 'new' : 'popular';
+    const search = oneLine(req.query.q, 40);
+    // LIKE の特殊文字をエスケープして、入力した文字そのものを検索する
+    const pattern = search ? '%' + search.replace(/[\\%_]/g, (m) => '\\' + m) + '%' : null;
     const limit = Math.max(1, Math.min(30, Math.floor(Number(req.query.limit) || 20)));
     const offset = Math.max(0, Math.floor(Number(req.query.offset) || 0));
+    const order = sort === 'new'
+      ? 'p.created_at DESC'
+      : '(p.like_count - p.dislike_count) DESC, p.like_count DESC, p.created_at DESC';
     const r = await q(
       `SELECT p.id, p.author_name, p.kind, p.title, p.body, p.category_name, p.based_on, p.ai_assisted, p.created_at,
-              (p.owner_user_id = $1) AS mine
+              p.like_count, p.dislike_count,
+              (p.owner_user_id = $1) AS mine,
+              COALESCE((SELECT value FROM post_reactions pr WHERE pr.post_id = p.id AND pr.user_id = $1), 0) AS my_reaction
        FROM community_posts p
        WHERE p.hidden = FALSE AND p.deleted = FALSE AND ($2::text IS NULL OR p.kind = $2::text)
+         AND ($5::text IS NULL OR p.title ILIKE $5::text OR p.body ILIKE $5::text OR p.category_name ILIKE $5::text)
          AND NOT EXISTS (SELECT 1 FROM community_blocks b WHERE b.blocker_user_id = $1 AND b.blocked_user_id = p.owner_user_id)
-       ORDER BY p.created_at DESC LIMIT $3 OFFSET $4`,
-      [uid, kind, limit, offset]);
+       ORDER BY ${order} LIMIT $3 OFFSET $4`,
+      [uid, kind, limit, offset, pattern]);
     res.json({ posts: r.rows.map(shapePost) });
+  }));
+
+  // いいね / バッド（1人1票。同じ値をもう一度送ると取り消し、逆の値を送ると切り替え）
+  //   body: { value: 1 | -1 | 0 }  0 = 取り消し
+  app.post('/api/posts/:id/react', auth.requireAuth, wrap(async (req, res) => {
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (limited('react:' + req.userId, 60, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
+    const uid = String(req.userId);
+    const value = Number(req.body && req.body.value);
+    if (![1, -1, 0].includes(value)) return res.status(400).json({ error: '不正な値です。' });
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const post = await client.query('SELECT owner_user_id FROM community_posts WHERE id = $1 AND deleted = FALSE FOR UPDATE', [req.params.id]);
+      if (!post.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: '投稿が見つかりません。' }); }
+      if (post.rows[0].owner_user_id === uid) { await client.query('ROLLBACK'); return res.status(400).json({ error: '自分の投稿には押せません。' }); }
+      if (value === 0) {
+        await client.query('DELETE FROM post_reactions WHERE post_id = $1 AND user_id = $2', [req.params.id, uid]);
+      } else {
+        await client.query(
+          `INSERT INTO post_reactions (post_id, user_id, value) VALUES ($1, $2, $3)
+           ON CONFLICT (post_id, user_id) DO UPDATE SET value = EXCLUDED.value`,
+          [req.params.id, uid, value]);
+      }
+      const cnt = await client.query(
+        `SELECT COALESCE(SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END), 0)::int AS likes,
+                COALESCE(SUM(CASE WHEN value = -1 THEN 1 ELSE 0 END), 0)::int AS dislikes
+         FROM post_reactions WHERE post_id = $1`, [req.params.id]);
+      const { likes, dislikes } = cnt.rows[0];
+      const autoHide = dislikes >= DISLIKE_HIDE_MIN && dislikes > likes * 2;
+      await client.query(
+        `UPDATE community_posts SET like_count = $2, dislike_count = $3,
+           hidden_reason = CASE WHEN (NOT hidden) AND $4::boolean THEN 'dislikes' ELSE hidden_reason END,
+           hidden = (hidden OR $4::boolean)
+         WHERE id = $1`,
+        [req.params.id, likes, dislikes, autoHide]);
+      await client.query('COMMIT');
+      res.json({ likes, dislikes, myReaction: value });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
   }));
 
   app.delete('/api/posts/:id', auth.requireAuth, wrap(async (req, res) => {
