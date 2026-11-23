@@ -23,7 +23,7 @@
 //   grep 確認）。フリーズが追加されたら、ここで「フリーズ消費で
 //   共有ストリークの欠けた日を補う」エンドポイントを繋ぐこと。
 //
-// ⚠️ UNVERIFIED: backend/auth.js と backend/iap.js がこのパックに無いため
+// UNVERIFIED: backend/auth.js と backend/iap.js がこのパックに無いため
 //   （server.js が require しているがファイルが存在しない）、このモジュール
 //   の認証まわりの動作は未検証。community.js と同じ auth.requireAuth の
 //   使い方だけを踏襲しており、認証ロジック自体は一切作っていない。
@@ -33,8 +33,9 @@
 // ============================================================================
 const crypto = require('crypto');
 
-// スタンプは固定の絵文字だけ（自由入力なし＝モデレーション不要）。
-const STAMP_EMOJIS = ['👏', '🔥', '💪', '🎉', '✨', '🙌'];
+// V6: スタンプ機能は廃止した（POST /api/shared-goals/:id/stamp を削除）。
+// shared_goal_stamps テーブルと loadGoalDetail の stamps 読み取りは残置
+// （旧データの CASCADE 削除と互換性のため。v6クライアントは表示しない）。
 const PACE_CAP = 150;
 
 const SCHEMA = `
@@ -631,24 +632,6 @@ function register({ app, db, auth }) {
     res.json({ goal: detail });
   }));
 
-  // スタンプ（絵文字リアクション）。自由入力なし。同じ絵文字を同じ相手に
-  // 何度も押せるが、履歴は最新100件まで返す。
-  app.post('/api/shared-goals/:id/stamp', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
-    const uid = String(req.userId);
-    if (limited('sg:stamp:' + uid, 60, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
-    const emoji = String((req.body && req.body.emoji) || '');
-    if (!STAMP_EMOJIS.includes(emoji)) return res.status(400).json({ error: '使えるスタンプは 👏 🔥 💪 🎉 ✨ 🙌 です。' });
-    const targetUserId = typeof (req.body && req.body.targetUserId) === 'string' && req.body.targetUserId
-      ? String(req.body.targetUserId).slice(0, 80) : null;
-    if (targetUserId && !(await isMember(req.params.id, targetUserId))) return res.status(400).json({ error: 'スタンプの相手はメンバーから選んでください。' });
-    const ins = await q(
-      `INSERT INTO shared_goal_stamps (goal_id, user_id, emoji, target_user_id) VALUES ($1, $2, $3, $4) RETURNING id, created_at`,
-      [req.params.id, uid, emoji, targetUserId]);
-    res.json({ stamp: { id: String(ins.rows[0].id), userId: uid, emoji, targetUserId, createdAt: ins.rows[0].created_at } });
-  }));
-
   // 抜ける。オーナーが抜けたら最も古いメンバーへ所有権を移す。
   // 最後の1人が抜けたら目標ごと消す（貢献・スタンプは CASCADE で消える）。
   app.post('/api/shared-goals/:id/leave', auth.requireAuth, wrap(async (req, res) => {
@@ -678,7 +661,7 @@ function register({ app, db, auth }) {
   }));
 }
 
-module.exports = { register, STAMP_EMOJIS, parseDay, daysBetween, plannedByToday, formatDay };
+module.exports = { register, parseDay, daysBetween, plannedByToday, formatDay };
 
 /*
  * ── Render での確認手順（Postgres がこの環境に無いため未検証） ──
@@ -695,7 +678,7 @@ module.exports = { register, STAMP_EMOJIS, parseDay, daysBetween, plannedByToday
  *      150% で頭打ちになること（大量に contribute して確認）
  *    - 全員が dailyTargetPerMember 以上を当日入れた日だけ sharedStreakDays が
  *      増えること。片方だけの日は増えないこと
- *    - POST /api/shared-goals/:id/stamp（emoji は 👏 🔥 💪 🎉 ✨ 🙌 のみ）
+ *    - スタンプは V6 で廃止（POST /api/shared-goals/:id/stamp は存在しないこと）
  *    - GET /api/shared-goals で自分の参加中の目標だけが返ること
  *    - 共有目標の target を変える API が無いこと（週の途中で目標を緩められない）
  * 5. 共通タスク（Iteration 4）:

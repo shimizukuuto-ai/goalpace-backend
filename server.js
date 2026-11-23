@@ -442,6 +442,12 @@ function aiQuota(cost) {
 }
 const quotaFree = aiQuota(COST.free);
 const quotaStd = aiQuota(COST.standard);
+// V6 (I6-7): カード生成は作った枚数分だけ枠を予約する。
+// quotaStd は cost=1 固定のため、count=5 でも1回分しか減らなかった。
+const quotaFlashcards = (req, res, next) => {
+  const count = Math.max(1, Math.min(10, Math.floor(Number(req.body?.count) || 5)));
+  return aiQuota(count)(req, res, next);
+};
 
 // ==========================================================================
 // エンドポイント
@@ -463,8 +469,8 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '5.0.0',
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true },
+    version: '6.0.0',
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true },
   });
 });
 
@@ -474,7 +480,7 @@ app.get('/', (req, res) => {
     status: 'running',
     aiProvider: IS_OPENROUTER ? 'OpenRouter' : (API_KEY ? 'Groq (Llama 3)' : 'unconfigured'),
     model: DEFAULT_MODEL,
-    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/health']
+    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/health']
   });
 });
 
@@ -649,7 +655,7 @@ linkedTasks は、ユーザーがタスク一覧からこの目標に紐づけ�
   }
 });
 
-app.post('/api/flashcards', optionalAuth, quotaStd, async (req, res) => {
+app.post('/api/flashcards', optionalAuth, quotaFlashcards, async (req, res) => {
   try {
     const topic = typeof req.body?.topic === 'string' ? req.body.topic.trim() : '';
     const count = Math.max(1, Math.min(10, Math.floor(Number(req.body?.count) || 5)));
@@ -804,6 +810,46 @@ app.get('/api/shared-decks', optionalAuth, async (req, res) => {
   } catch (err) {
     console.error('GET /api/shared-decks error:', err);
     res.status(503).json({ error: '公開デッキを読み込めませんでした。' });
+  }
+});
+
+// ---- 公開デッキのカテゴリー（教科）一覧：デッキが1件以上あるカテゴリーだけを件数付きで返す ----
+// カテゴリー名はユーザーが作ったタスクカテゴリー由来の自由入力で、固定の教科一覧は無い。
+// そのため「カテゴリーごと」の絞り込みは、実際にデッキがある名前だけを出すこの一覧を使う。
+// NOTE: /api/shared-decks/:id より前に置くこと（'categories' が :id に取られないように）。
+app.get('/api/shared-decks/categories', optionalAuth, async (req, res) => {
+  try {
+    const { rows } = await db.pool.query(
+      `SELECT category_name AS name, COUNT(*)::int AS count
+       FROM shared_decks WHERE hidden = FALSE AND category_name <> ''
+       GROUP BY category_name ORDER BY count DESC, category_name ASC LIMIT 100`
+    );
+    res.json({ categories: rows });
+  } catch (err) {
+    console.error('GET /api/shared-decks/categories error:', err);
+    res.status(503).json({ error: 'カテゴリーを読み込めませんでした。' });
+  }
+});
+
+// ---- 自分が公開中のデッキ一覧（サーバー側の真実） ----
+// クライアントは従来、端末内の @my_shared_deck_ids だけを頼りにしていたため、
+// 再インストールや別端末では自分の公開デッキが分からなくなっていた。
+// hidden のものも含めて返す（通報で非表示になった自分のデッキも取り下げできるように）。
+// NOTE: /api/shared-decks/:id より前に置くこと（'mine' が :id に取られないように）。
+app.get('/api/shared-decks/mine', auth.requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.pool.query(
+      `SELECT d.id, d.title, d.category_name AS "categoryName", d.description,
+              d.card_count AS "cardCount", d.created_at AS "createdAt",
+              d.hidden, d.report_count AS "reportCount",
+              (SELECT COUNT(*)::int FROM shared_deck_imports i WHERE i.deck_id = d.id) AS "importCount"
+       FROM shared_decks d WHERE d.owner_user_id = $1 ORDER BY d.created_at DESC LIMIT 50`,
+      [String(req.userId)]
+    );
+    res.json({ decks: rows.map((d) => ({ ...d, mine: true })) });
+  } catch (err) {
+    console.error('GET /api/shared-decks/mine error:', err);
+    res.status(503).json({ error: '自分の公開デッキを読み込めませんでした。' });
   }
 });
 
@@ -1261,15 +1307,15 @@ if (REQUIRE_AUTH && (!process.env.SESSION_JWT_SECRET || !process.env.APPLE_BUNDL
 db.initDb()
   .then(() => {
     app.listen(PORT, '0.0.0.0', () => {
-      console.log(`🚀 GoalPace + ControlCenter Unified Server running on port ${PORT}`);
-      console.log(`🤖 AI Provider: ${API_KEY ? (IS_OPENROUTER ? 'OpenRouter' : 'Groq') : 'not configured'} [Model: ${DEFAULT_MODEL}]`);
-      console.log(`🔒 Require Auth: ${REQUIRE_AUTH}`);
+      console.log(`GoalPace + ControlCenter Unified Server running on port ${PORT}`);
+      console.log(`AI Provider: ${API_KEY ? (IS_OPENROUTER ? 'OpenRouter' : 'Groq') : 'not configured'} [Model: ${DEFAULT_MODEL}]`);
+      console.log(`Require Auth: ${REQUIRE_AUTH}`);
     });
   })
   .catch(error => {
     console.error('Database initialization failed:', error);
     if (REQUIRE_AUTH) process.exit(1);
     app.listen(PORT, '0.0.0.0', () => {
-      console.log(`🚀 GoalPace + ControlCenter Unified Server running on port ${PORT} (database unavailable)`);
+      console.log(`GoalPace + ControlCenter Unified Server running on port ${PORT} (database unavailable)`);
     });
   });
