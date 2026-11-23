@@ -820,8 +820,34 @@ async function upsertPaceScore(userId, weekDate, score) {
  * 今週のペースリーグ：参加中の人だけを生のペース%（raw_pace）順に返す。
  * 表示名は保存時の名前（プロフィール更新時は次回同期で反映される）。
  * requesterId がリーグ不参加なら optedOut=true を返す（自分の行は出さない）。
+ * V12.2・A班: metric で並び替えの指標を切り替える（pace=raw_pace（既定・従来通り）/
+ * achievement=achievement_percent / memorized=memorized / pomodoro=pomodoro）。
+ * pace_scores の対応する列で降順ソートする。各行に value（その指標の値）と
+ * unit（'%'／'枚'／'回'）を付ける。既存の行フィールド（progress・pacePercent 等）は
+ * 変えない（旧クライアント互換）。metric は呼び出し側で正規化済みの値を渡すこと。
  */
-async function getWeeklyLeague(weekDate, requesterId) {
+const LEAGUE_METRIC_COLUMNS = {
+  pace: 'raw_pace',
+  achievement: 'achievement_percent',
+  memorized: 'memorized',
+  pomodoro: 'pomodoro',
+};
+const LEAGUE_METRIC_UNITS = {
+  pace: '%',
+  achievement: '%',
+  memorized: '枚',
+  pomodoro: '回',
+};
+const LEAGUE_METRIC_VALUE_FIELDS = {
+  pace: 'raw_pace',
+  achievement: 'achievement_percent',
+  memorized: 'memorized',
+  pomodoro: 'pomodoro',
+};
+async function getWeeklyLeague(weekDate, requesterId, metric = 'pace') {
+  const m = LEAGUE_METRIC_COLUMNS[metric] ? metric : 'pace';
+  const column = LEAGUE_METRIC_COLUMNS[m];
+  const valueField = LEAGUE_METRIC_VALUE_FIELDS[m];
   let optedOut = false;
   if (requesterId) {
     const mine = await getOnlineProfile(requesterId);
@@ -830,7 +856,7 @@ async function getWeeklyLeague(weekDate, requesterId) {
   const { rows } = await pool.query(
     `SELECT user_id, display_name AS name, avatar_color,
             raw_pace, achievement_percent, pomodoro, memorized, tasks_done,
-            row_number() OVER (ORDER BY raw_pace DESC, achievement_percent DESC, display_name ASC) AS rank
+            row_number() OVER (ORDER BY ${column} DESC, achievement_percent DESC, display_name ASC) AS rank
      FROM pace_scores
      WHERE week_date = $1 AND league_opt_in = TRUE
      ORDER BY rank
@@ -839,6 +865,7 @@ async function getWeeklyLeague(weekDate, requesterId) {
   );
   return {
     optedOut,
+    metric: m,
     entries: rows.map((r) => ({
       name: r.name,
       avatarColor: r.avatar_color || null,
@@ -853,6 +880,8 @@ async function getWeeklyLeague(weekDate, requesterId) {
       completed: Number(r.tasks_done),
       target: 0,
       points: 0,
+      value: Number(r[valueField]),
+      unit: LEAGUE_METRIC_UNITS[m],
       isMe: requesterId ? String(r.user_id) === String(requesterId) : false,
     })),
   };
@@ -980,6 +1009,8 @@ module.exports = {
   applyDisplayName,
   upsertPaceScore,
   getWeeklyLeague,
+  LEAGUE_METRIC_COLUMNS,
+  LEAGUE_METRIC_UNITS,
   AVATAR_COLORS,
   cleanDisplayName,
   cleanAvatarColor,

@@ -478,8 +478,8 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.1.0',
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true },
+    version: '7.3.0',
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true },
   });
 });
 
@@ -489,7 +489,7 @@ app.get('/', (req, res) => {
     status: 'running',
     aiProvider: IS_OPENROUTER ? 'OpenRouter' : (API_KEY ? 'Groq (Llama 3)' : 'unconfigured'),
     model: DEFAULT_MODEL,
-    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/activity', '/api/activity/feed', '/health']
+    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/activity', '/api/activity/feed', '/api/shared-goals/public', '/api/shared-goals/:id/join-public', '/api/shared-goals/:id/kick', '/api/shared-goals/kicked', '/api/shared-goals/:id/comments', '/health']
   });
 });
 
@@ -823,12 +823,17 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
 // V11: 今週のペースリーグ（正式版）。期限ベースの真のペース%（生値）順。
 // 旧クライアント向けの GET /api/leaderboard（metric=rate＝7日間ペース%）は残す。
 // 参加をオフにしている人は一覧に出ない。?userId= で自分の行に isMe が付く。
+// V12.2・A班: ?metric=pace|achievement|memorized|pomodoro で並び替えの指標を
+// 切り替える（未指定・不正値は pace で従来通り）。各行に value（その指標の値）と
+// unit（'%'／'枚'／'回'）を付け、トップレベルに metric をエコーする。
+// 既存の行フィールド（progress・pacePercent 等）は変えない。
 app.get('/api/league/weekly', optionalAuth, async (req, res) => {
   try {
     const { weekDate } = await db.getWeekWindow();
     const requesterId = onlineIdentity(req) || null;
-    const { optedOut, entries } = await db.getWeeklyLeague(weekDate, requesterId);
-    res.json({ weekStart: weekDate, entries, optedOut, isPlaceholder: false });
+    const metric = db.LEAGUE_METRIC_COLUMNS[String(req.query.metric)] ? String(req.query.metric) : 'pace';
+    const { optedOut, entries } = await db.getWeeklyLeague(weekDate, requesterId, metric);
+    res.json({ weekStart: weekDate, entries, optedOut, isPlaceholder: false, metric });
   } catch (err) {
     console.error('/api/league/weekly error:', err);
     res.status(503).json({ error: 'Leaderboard is unavailable' });
@@ -933,12 +938,27 @@ app.post('/api/leaderboard/sync', optionalAuth, async (req, res) => {
 
 // 週次ランキング: from/to（YYYY-MM-DD, 最大7日間）, category, metric で取得
 const LEADERBOARD_METRICS = Object.keys(db.LEADERBOARD_METRIC_COLUMNS);
+// V12.2・A班: ランキングタブの指標切り替え用エイリアス。pace / achievement は
+// このエンドポイントの rate（7日間ペース%＝日次タスクの達成率）と同じ列で並べる
+// （期限ベースの真のペース%で並べるのは GET /api/league/weekly の方。
+// daily_category_scores に achievement_percent 列は無いため rate と同一視する）。
+// memorized / pomodoro は従来の同名 metric と同じ。既存の呼び出し（rate / tasks 等）
+// の互換性は維持する（エコーも旧名は従来通り）。
+const LEADERBOARD_METRIC_ALIASES = { pace: 'rate', achievement: 'rate' };
+const LEADERBOARD_METRIC_UNITS = { tasks: '件', pomodoro: '回', minutes: '分', memorized: '枚', rate: '%', pace: '%', achievement: '%' };
 app.get('/api/leaderboard', optionalAuth, async (req, res) => {
   try {
     const to = String(req.query.to || req.query.date || '');
     const from = String(req.query.from || req.query.date || '');
     const category = String(req.query.category || '').trim().slice(0, 40);
-    const metric = LEADERBOARD_METRICS.includes(req.query.metric) ? req.query.metric : 'tasks';
+    const requestedMetric = String(req.query.metric || '');
+    const metric = LEADERBOARD_METRICS.includes(requestedMetric)
+      ? requestedMetric
+      : (LEADERBOARD_METRIC_ALIASES[requestedMetric] || 'tasks');
+    // エコーは呼んだ側が指定した名前を返す（pace/achievement はそのまま）。
+    const echoMetric = LEADERBOARD_METRICS.includes(requestedMetric) || LEADERBOARD_METRIC_ALIASES[requestedMetric]
+      ? requestedMetric
+      : metric;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to) || !category) {
       return res.status(400).json({ error: 'from, to and category are required' });
     }
@@ -947,7 +967,8 @@ app.get('/api/leaderboard', optionalAuth, async (req, res) => {
       return res.status(400).json({ error: 'Range must be 1 to 7 days' });
     }
     const entries = await db.getCategoryLeaderboard(from, to, category, metric);
-    res.json({ metric, entries });
+    // db が返す各行には value（その指標の値）が既に入っている。unit を付ける。
+    res.json({ metric: echoMetric, entries: entries.map((e) => ({ ...e, unit: LEADERBOARD_METRIC_UNITS[echoMetric] || LEADERBOARD_METRIC_UNITS[metric] })) });
   } catch (err) {
     console.error('/api/leaderboard error:', err);
     res.status(503).json({ error: 'Leaderboard is unavailable' });
