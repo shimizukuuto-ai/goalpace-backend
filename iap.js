@@ -43,7 +43,7 @@ const MONTHLY_PRODUCT_ID = process.env.IAP_MONTHLY_PRODUCT_ID || 'com.uuto.GoalP
 // yearlyProductID と合わせてある。App Store Connect側のProduct IDが違う場合は
 // 必ず .env の IAP_YEARLY_PRODUCT_ID で上書きすること（合っていないとMONTHLYと同様に
 // UNKNOWN_PRODUCT_ID で購入検証が全部失敗する）。
-const YEARLY_PRODUCT_ID = process.env.IAP_YEARLY_PRODUCT_ID || 'com.uuto.GoalPace.yearly';
+const YEARLY_PRODUCT_ID = process.env.IAP_YEARLY_PRODUCT_ID || 'com.uuto.GoalPace.yearly.v2';
 const LIFETIME_PRODUCT_ID = process.env.IAP_LIFETIME_PRODUCT_ID || 'com.uuto.GoalPace.lifetime';
 
 // 月額・年額はどちらも「有効期限のある自動更新サブスクリプション」という点で

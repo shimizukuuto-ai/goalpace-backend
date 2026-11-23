@@ -125,26 +125,195 @@ async function initDb() {
     );
   `);
 
+  // ---- 週次AI利用枠(v2) ----
+  // cost: 機能ごとの消費量 / source: 'weekly'(週の枠) か 'bonus'(ボーナス残高) のどちらから引いたか
+  await pool.query(`ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS cost INTEGER NOT NULL DEFAULT 1;`);
+  await pool.query(`ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'weekly';`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_usage_events_user_time ON usage_events (user_id, created_at);`);
+  // 招待・シェア特典で貯まるボーナス残高（週リセットされない。使った分だけ減る）
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_credits INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by INTEGER REFERENCES users(id);`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users (referral_code) WHERE referral_code IS NOT NULL;`);
+
   console.log('DB initialized (users, usage_events, share_bonuses, leaderboard tables ready).');
 }
 
-// 過去24時間・過去30日の利用回数を数える。
-async function getUsageCounts(userId) {
+// ==========================================================================
+// 週次AI利用枠
+// 週は「月曜 0:00 (日本時間)」で切り替わる。ユーザーに「毎週月曜にリセット」と説明できる固定ルール。
+// ==========================================================================
+const WEEK_TZ = 'Asia/Tokyo';
+
+// 今週の開始時刻(timestamptz) と 次のリセット時刻、今週の開始日(DATE) をDBの時計で返す
+async function getWeekWindow() {
   const { rows } = await pool.query(
     `SELECT
-       count(*) FILTER (WHERE created_at > now() - interval '1 day') AS today_count,
-       count(*) FILTER (WHERE created_at > now() - interval '30 days') AS month_count
-     FROM usage_events WHERE user_id = $1`,
-    [userId]
+       (date_trunc('week', now() AT TIME ZONE $1) AT TIME ZONE $1) AS week_start,
+       ((date_trunc('week', now() AT TIME ZONE $1) + interval '7 days') AT TIME ZONE $1) AS next_reset,
+       to_char(date_trunc('week', now() AT TIME ZONE $1), 'YYYY-MM-DD') AS week_date`,
+    [WEEK_TZ]
   );
-  return {
-    todayCount: parseInt(rows[0].today_count, 10),
-    monthCount: parseInt(rows[0].month_count, 10),
-  };
+  return { weekStart: rows[0].week_start, nextReset: rows[0].next_reset, weekDate: rows[0].week_date };
 }
 
-async function recordUsage(userId, endpoint) {
-  await pool.query('INSERT INTO usage_events (user_id, endpoint) VALUES ($1, $2)', [userId, endpoint]);
+// 今週「週の枠」から消費した量
+async function getWeeklyUsed(userId) {
+  const { weekStart } = await getWeekWindow();
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM(cost), 0)::int AS used
+     FROM usage_events
+     WHERE user_id = $1 AND source = 'weekly' AND created_at >= $2`,
+    [userId, weekStart]
+  );
+  return rows[0].used;
+}
+
+// 今週のシェア特典（付与済みならその量、未付与なら0）
+async function getShareBonusThisWeek(userId) {
+  const { weekDate } = await getWeekWindow();
+  const { rows } = await pool.query(
+    'SELECT amount FROM share_bonuses WHERE user_id = $1 AND bonus_date = $2',
+    [userId, weekDate]
+  );
+  return rows[0] ? parseInt(rows[0].amount, 10) : 0;
+}
+
+// 今週分のシェア特典を付与する。(user_id, bonus_date)の主キーで「1人・1週1回」をDBが保証する。
+// 付与できたら true、すでに付与済みなら false。
+async function grantShareBonusThisWeek(userId, amount) {
+  const { weekDate } = await getWeekWindow();
+  const { rowCount } = await pool.query(
+    `INSERT INTO share_bonuses (user_id, bonus_date, amount)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, bonus_date) DO NOTHING`,
+    [userId, weekDate, amount]
+  );
+  return rowCount > 0;
+}
+
+// AI利用を1回分「予約」する。成功したら { eventId, source } を返し、枠が足りなければ null。
+// 1文のSQLでチェックと記録を行い、同時リクエストでも上限を超えないようにする。
+//  1. 週の枠に空きがあれば source='weekly' で記録
+//  2. なければボーナス残高から引いて source='bonus' で記録
+async function reserveUsage(userId, endpoint, cost, weeklyLimit) {
+  const { weekStart } = await getWeekWindow();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // 同一ユーザーの同時リクエストを直列化（ユーザー行をロック）
+    const u = await client.query('SELECT bonus_credits FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    if (!u.rows[0]) { await client.query('ROLLBACK'); return null; }
+    const used = await client.query(
+      `SELECT COALESCE(SUM(cost), 0)::int AS used FROM usage_events
+       WHERE user_id = $1 AND source = 'weekly' AND created_at >= $2`,
+      [userId, weekStart]
+    );
+    let source = null;
+    if (cost === 0) {
+      source = 'weekly';
+    } else if (used.rows[0].used + cost <= weeklyLimit) {
+      source = 'weekly';
+    } else if (u.rows[0].bonus_credits >= cost) {
+      await client.query('UPDATE users SET bonus_credits = bonus_credits - $2 WHERE id = $1', [userId, cost]);
+      source = 'bonus';
+    }
+    if (!source) { await client.query('ROLLBACK'); return null; }
+    const ins = await client.query(
+      'INSERT INTO usage_events (user_id, endpoint, cost, source) VALUES ($1,$2,$3,$4) RETURNING id',
+      [userId, endpoint, cost, source]
+    );
+    await client.query('COMMIT');
+    return { eventId: ins.rows[0].id, source };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// AIが失敗したとき、予約した分を返す（ユーザーに失敗の分を払わせない）
+async function refundUsage(eventId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query('DELETE FROM usage_events WHERE id = $1 RETURNING user_id, cost, source', [eventId]);
+    if (rows[0] && rows[0].source === 'bonus') {
+      await client.query('UPDATE users SET bonus_credits = bonus_credits + $2 WHERE id = $1', [rows[0].user_id, rows[0].cost]);
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function addBonusCredits(userId, amount) {
+  await pool.query('UPDATE users SET bonus_credits = bonus_credits + $2 WHERE id = $1', [userId, amount]);
+}
+
+// ---- 招待コード ----
+const REFERRAL_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 紛らわしい文字(0/O, 1/I/L)を除外
+function randomReferralCode() {
+  let out = '';
+  for (let i = 0; i < 8; i++) out += REFERRAL_ALPHABET[Math.floor(Math.random() * REFERRAL_ALPHABET.length)];
+  return out;
+}
+
+async function ensureReferralCode(userId) {
+  const cur = await pool.query('SELECT referral_code FROM users WHERE id = $1', [userId]);
+  if (cur.rows[0] && cur.rows[0].referral_code) return cur.rows[0].referral_code;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = randomReferralCode();
+    try {
+      const { rows } = await pool.query(
+        `UPDATE users SET referral_code = $2 WHERE id = $1 AND referral_code IS NULL RETURNING referral_code`,
+        [userId, code]
+      );
+      if (rows[0]) return rows[0].referral_code;
+      const again = await pool.query('SELECT referral_code FROM users WHERE id = $1', [userId]);
+      if (again.rows[0] && again.rows[0].referral_code) return again.rows[0].referral_code;
+    } catch (e) {
+      if (e.code !== '23505') throw e; // 重複したらもう一度
+    }
+  }
+  throw new Error('Could not generate referral code');
+}
+
+// 招待コードの利用。友達(redeemer)とコードの持ち主の両方にボーナスを付与する。
+// 返り値: { ok: true } か { ok: false, reason }
+async function redeemReferral(redeemerId, code, redeemerBonus, referrerBonus, referrerMax) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const me = await client.query('SELECT id, referred_by FROM users WHERE id = $1 FOR UPDATE', [redeemerId]);
+    if (!me.rows[0]) { await client.query('ROLLBACK'); return { ok: false, reason: 'not_found' }; }
+    if (me.rows[0].referred_by) { await client.query('ROLLBACK'); return { ok: false, reason: 'already_redeemed' }; }
+    const ref = await client.query('SELECT id FROM users WHERE referral_code = $1 FOR UPDATE', [code]);
+    if (!ref.rows[0]) { await client.query('ROLLBACK'); return { ok: false, reason: 'invalid_code' }; }
+    if (String(ref.rows[0].id) === String(redeemerId)) { await client.query('ROLLBACK'); return { ok: false, reason: 'own_code' }; }
+    const cnt = await client.query('SELECT COUNT(*)::int AS n FROM users WHERE referred_by = $1', [ref.rows[0].id]);
+    await client.query('UPDATE users SET referred_by = $2, bonus_credits = bonus_credits + $3 WHERE id = $1', [redeemerId, ref.rows[0].id, redeemerBonus]);
+    // 持ち主側の特典には上限を設ける（上限を超えたら友達側だけ特典を受け取る）
+    if (cnt.rows[0].n < referrerMax) {
+      await client.query('UPDATE users SET bonus_credits = bonus_credits + $2 WHERE id = $1', [ref.rows[0].id, referrerBonus]);
+    }
+    await client.query('COMMIT');
+    return { ok: true };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function countReferrals(userId) {
+  const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM users WHERE referred_by = $1', [userId]);
+  return rows[0].n;
 }
 
 async function findOrCreateUser(appleUserId) {
@@ -186,6 +355,7 @@ async function deleteAccount(userId) {
   try {
     await client.query('BEGIN');
     const id = String(userId);
+    await client.query('UPDATE users SET referred_by = NULL WHERE referred_by = $1', [userId]);
     await client.query('DELETE FROM usage_events WHERE user_id = $1', [userId]);
     await client.query('DELETE FROM share_bonuses WHERE user_id = $1', [userId]);
     await client.query('DELETE FROM daily_category_scores WHERE client_user_id = $1', [id]);
@@ -234,27 +404,6 @@ async function getUserByOriginalTransactionId(originalTransactionId) {
     [originalTransactionId]
   );
   return rows[0] || null;
-}
-
-// NEW: 今日すでに付与済みのシェアボーナス量を返す（未付与なら0）。
-async function getShareBonusToday(userId) {
-  const { rows } = await pool.query(
-    'SELECT amount FROM share_bonuses WHERE user_id = $1 AND bonus_date = CURRENT_DATE',
-    [userId]
-  );
-  return rows[0] ? parseInt(rows[0].amount, 10) : 0;
-}
-
-// NEW: 今日分のシェアボーナスを付与する。同じユーザー・同じ日には
-// (user_id, bonus_date) の主キー制約により2回目以降は何も起きない
-// （呼び出し側は事前に getShareBonusToday で0であることを確認してから呼ぶ想定）。
-async function grantShareBonus(userId, amount) {
-  await pool.query(
-    `INSERT INTO share_bonuses (user_id, bonus_date, amount)
-     VALUES ($1, CURRENT_DATE, $2)
-     ON CONFLICT (user_id, bonus_date) DO NOTHING`,
-    [userId, amount]
-  );
 }
 
 async function upsertDailyCategoryScores(clientUserId, displayName, scoreDate, categories) {
@@ -431,8 +580,14 @@ async function reportSharedDeck(deckId, reporterUserId, reason) {
 module.exports = {
   DB_ENABLED,
   initDb,
-  getUsageCounts,
-  recordUsage,
+  getWeekWindow,
+  getWeeklyUsed,
+  reserveUsage,
+  refundUsage,
+  addBonusCredits,
+  ensureReferralCode,
+  redeemReferral,
+  countReferrals,
   findOrCreateUser,
   getUserById,
   saveAccountData,
@@ -442,8 +597,8 @@ module.exports = {
   setLifetimeStatus,
   linkOriginalTransaction,
   getUserByOriginalTransactionId,
-  getShareBonusToday,
-  grantShareBonus,
+  getShareBonusThisWeek,
+  grantShareBonusThisWeek,
   upsertDailyCategoryScores,
   getCategoryLeaderboard,
   createSharedDeck,
