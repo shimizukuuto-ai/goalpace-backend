@@ -578,6 +578,7 @@ async function reportSharedDeck(deckId, reporterUserId, reason) {
 }
 
 module.exports = {
+  get pool() { return pool; },
   DB_ENABLED,
   initDb,
   getWeekWindow,

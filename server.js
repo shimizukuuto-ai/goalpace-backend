@@ -9,6 +9,7 @@ const iap = require('./iap');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+require('./community').register({ app, db, auth });
 app.use(express.static('public'));
 
 // ==========================================================================
