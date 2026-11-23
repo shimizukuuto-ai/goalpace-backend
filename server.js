@@ -478,9 +478,10 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.7.0',
-    // V12.10・B班: bilingualErrors — エラー応答に errorJa / errorEn を併記する。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true },
+    version: '7.8.0',
+    // V12.11・A班: groupActivityToasts — グループ活動トースト用の
+    // 出来事ストア（shared_goal_events）と GET /api/shared-goals/updates。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true },
   });
 });
 
@@ -490,7 +491,7 @@ app.get('/', (req, res) => {
     status: 'running',
     aiProvider: IS_OPENROUTER ? 'OpenRouter' : (API_KEY ? 'Groq (Llama 3)' : 'unconfigured'),
     model: DEFAULT_MODEL,
-    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/shared-goals/suggest-structure', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/activity', '/api/activity/feed', '/api/shared-goals/public', '/api/shared-goals/:id/join-public', '/api/shared-goals/:id/kick', '/api/shared-goals/kicked', '/api/shared-goals/:id/comments', '/api/shared-goals/:id/declare', '/api/shared-goals/:id/deadline-result', '/api/shared-goals/:id/members/:userId/activity', '/health']
+    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/shared-goals/suggest-structure', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/activity', '/api/activity/feed', '/api/shared-goals/public', '/api/shared-goals/:id/join-public', '/api/shared-goals/:id/kick', '/api/shared-goals/kicked', '/api/shared-goals/updates', '/api/shared-goals/:id/comments', '/api/shared-goals/:id/declare', '/api/shared-goals/:id/deadline-result', '/api/shared-goals/:id/members/:userId/activity', '/health']
   });
 });
 

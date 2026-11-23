@@ -110,6 +110,25 @@ const { screenText } = require('./community');
 //   通報は community_reports（target_type='shared_goal_comment'）に記録する。
 //   既存のデータ構造・業務ロジックは再設計していない（新規オプションフィールド・
 //   列と新規エンドポイントの追加のみ）。
+// V12.11・A班: グループ活動トースト用の出来事ストア（shared_goal_events）。
+//   今日タブに「他の共有目標メンバーがコメント投稿／達成したときにトーストで
+//   知らせる」機能のための、共有目標に紐づく出来事だけの軽量ストア。
+//   既存の GET /api/activity/feed は全ユーザーの直近7日の task/card/
+//   pomodoro/goal で共有目標に紐づかず、コメントも達成も載らないため
+//   流用できない（新規テーブル＋専用エンドポイント GET /api/shared-goals/updates）。
+//   出来事は kind='comment'|'achieved'|'taskDone' の3種。
+//   - comment: コメント投稿時（text=コメント本文。500文字制限は従来通り）。
+//   - achieved: 達成への遷移（active→achieved）の瞬間のみ1行。
+//     declare（全員申告が揃ったとき）・deadline-result（pass のとき）・
+//     auto（contribute で到達したとき）。failed は対象外。
+//     refreshDeclareStatus は参加・退出・キックからも呼ばれるため、
+//     UPDATE の行数で遷移を検出してから書く（二重書き込み防止）。
+//   - taskDone: 共通タスクの完了時（text=タスク名。完了＝INSERT のみ。
+//     取消＝DELETE は対象外）。
+//   書き込みはすべてベストエフォート（失敗しても本体の処理は成功させる。
+//   キック時の activity_events への書き方と同じ流儀）。
+//   読み取りは GET /api/shared-goals/updates（認証必須・メンバー限定・
+//   直近24時間・新しい順。自分の出来事も含めて返す＝除外はクライアント側）。
 // V12・D班: 共有目標の種類（kind）。
 //   count=個数ベース（従来通り。unit は自由入力）/ time=時間ベース
 //   （target は分。unit は「分」固定）/ habit=習慣チェックベース
@@ -245,6 +264,23 @@ CREATE TABLE IF NOT EXISTS shared_goal_kicks (
   PRIMARY KEY (goal_id, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_shared_goal_kicks_user ON shared_goal_kicks (user_id, kicked_at DESC);
+-- V12.11・A班: グループ活動トースト用の出来事ストア（shared_goal_events）。
+--   共有目標に紐づく出来事だけを残す軽量テーブル。goal_id は TEXT
+--   （仕様通り。shared_goals.id とは文字列比較で結ぶ。外部キーなし）。
+--   目標が消えたら読み取り側の JOIN で出なくなる（CASCADE は無い）。
+--   kind は 'comment'|'achieved'|'taskDone' の3種のみを書く。
+--   text は kind によりコメント本文／目標タイトル（achieved）／タスク名。
+CREATE TABLE IF NOT EXISTS shared_goal_events (
+  id BIGSERIAL PRIMARY KEY,
+  goal_id TEXT NOT NULL,
+  author_user_id TEXT NOT NULL,
+  author_name TEXT NOT NULL,
+  avatar_color TEXT,
+  kind TEXT NOT NULL,
+  text TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_shared_goal_events_goal ON shared_goal_events (goal_id, created_at DESC);
 `;
 
 // ---------- 小さな道具（community.js と同じ流儀） ----------
@@ -424,6 +460,44 @@ function register({ app, db, auth }) {
       if (profile && profile.avatarColor) return profile.avatarColor;
     } catch (_) { /* 取れなくても null で作る */ }
     return null;
+  }
+
+  // V12.11・A班: 共有目標の出来事を1行書く（ベストエフォート）。
+  //   書き込みに失敗しても呼び出し元の処理は成功させる（例外はここで
+  //   吸収する。キック時の activity_events への書き方と同じ流儀）。
+  //   authorName / avatarColor は呼び出し元が持つスナップショットを渡す
+  //   （コメント投稿時は INSERT した行の値、他は displayNameFor 等）。
+  async function recordSharedGoalEvent({ goalId, authorUserId, authorName, avatarColor, kind, text }) {
+    try {
+      await q(
+        `INSERT INTO shared_goal_events (goal_id, author_user_id, author_name, avatar_color, kind, text)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [String(goalId), String(authorUserId), authorName || '', avatarColor || null, kind, text || '']);
+    } catch (e) {
+      console.error('[shared-goals] record event failed:', e.message);
+    }
+  }
+
+  // V12.11・A班: 達成の出来事を1行書く（ベストエフォート）。
+  //   text は目標タイトル（クライアントのトーストが「○○が達成しました」
+  //   と作るための材料。goalTitle は読み取り側も返すが、行自体にも残す）。
+  //   遷移検出は呼び出し元で行う（ここは「書く」だけ。呼ぶのは
+  //   active→achieved の瞬間だけ）。
+  async function recordAchievedEvent(goalId, authorUserId) {
+    try {
+      const g = await q('SELECT title FROM shared_goals WHERE id = $1', [goalId]);
+      const title = g.rowCount ? g.rows[0].title : '';
+      await recordSharedGoalEvent({
+        goalId,
+        authorUserId,
+        authorName: await displayNameFor(authorUserId),
+        avatarColor: await avatarColorFor(authorUserId),
+        kind: 'achieved',
+        text: title,
+      });
+    } catch (e) {
+      console.error('[shared-goals] record achieved event failed:', e.message);
+    }
   }
 
   // 目標1件分の集計（メンバー・貢献・スタンプ・ペース%・共有ストリーク・共通タスク）。
@@ -753,6 +827,9 @@ function register({ app, db, auth }) {
         // V12.7・A班: 「達成した」の申告も消す（貢献と同じ扱い）。
         await q('DELETE FROM shared_goal_declarations WHERE user_id = $1', [uid]);
         await q('DELETE FROM shared_goal_comments WHERE user_id = $1', [uid]);
+        // V12.11・A班: グループ活動トースト用の出来事も消す（自分の行のみ。
+        // 他メンバーの出来事は残る＝目標の履歴として読めるまま）。
+        await q('DELETE FROM shared_goal_events WHERE author_user_id = $1', [uid]);
         await q('DELETE FROM shared_goal_stamps WHERE user_id = $1 OR target_user_id = $1', [uid]);
         await q('DELETE FROM shared_goal_task_completions WHERE user_id = $1', [uid]);
         await q('DELETE FROM shared_goal_members WHERE user_id = $1', [uid]);
@@ -969,6 +1046,45 @@ function register({ app, db, auth }) {
     });
   }));
 
+  // ================= グループ活動の出来事（V12.11・A班） =================
+  // GET /api/shared-goals/updates
+  //   今日タブのグループ活動トースト用。クライアントがポーリングで叩く。
+  //   ?limit=（既定20・最大50）。返すのは「要求者がメンバーである共有目標」
+  //   の出来事で、直近24時間以内・新しい順。自分の出来事も含めて返す
+  //   （除外はクライアント側でやる）。メンバーでない目標の出来事は
+  //   絶対に返さない（shared_goal_members との JOIN で絞る）。
+  //   kind は 'comment'|'achieved'|'taskDone' の3種のみ。
+  // NOTE: GET /api/shared-goals/:id より前に置くこと（'updates' が :id に
+  // 取られないように。'kicked' と同じ理由）。
+  app.get('/api/shared-goals/updates', auth.requireAuth, wrap(async (req, res) => {
+    const uid = String(req.userId);
+    const limit = Math.max(1, Math.min(50, Math.floor(Number(req.query.limit) || 20)));
+    const rows = await q(
+      `SELECT e.id, e.goal_id, g.title AS goal_title, e.kind,
+              e.author_user_id, e.author_name, e.avatar_color, e.text, e.created_at
+       FROM shared_goal_events e
+       JOIN shared_goals g ON g.id::text = e.goal_id
+       JOIN shared_goal_members m ON m.goal_id = g.id AND m.user_id = $1
+       WHERE e.created_at > NOW() - INTERVAL '24 hours'
+         AND e.kind IN ('comment', 'achieved', 'taskDone')
+       ORDER BY e.created_at DESC, e.id DESC
+       LIMIT $2`,
+      [uid, limit]);
+    res.json({
+      events: rows.rows.map((r) => ({
+        id: String(r.id),
+        goalId: String(r.goal_id),
+        goalTitle: r.goal_title,
+        kind: r.kind,
+        authorUserId: r.author_user_id,
+        authorName: r.author_name,
+        avatarColor: r.avatar_color || null,
+        text: r.text,
+        createdAt: r.created_at,
+      })),
+    });
+  }));
+
   app.get('/api/shared-goals/:id', auth.requireAuth, wrap(async (req, res) => {
     if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
@@ -1144,6 +1260,17 @@ function register({ app, db, auth }) {
        VALUES ($1, $2, $3, $4, $5)
        RETURNING id, user_id, display_name, avatar_color, text, created_at`,
       [req.params.id, uid, await displayNameFor(uid), await avatarColorFor(uid), text]);
+    // V12.11・A班: コメント投稿の出来事を書く（ベストエフォート。
+    // 失敗してもコメント投稿自体は成功。text=コメント本文のまま。
+    // 表示側で短く切るのはクライアントの仕事）。
+    await recordSharedGoalEvent({
+      goalId: req.params.id,
+      authorUserId: uid,
+      authorName: ins.rows[0].display_name,
+      avatarColor: ins.rows[0].avatar_color,
+      kind: 'comment',
+      text,
+    });
     res.json({ comment: shapeComment(ins.rows[0]) });
   }));
 
@@ -1183,29 +1310,34 @@ function register({ app, db, auth }) {
   // 最新値が開始値→目標値に到達したら達成（開始値が無ければ判定しない）。
   // count/time/habit は貢献合計が target に到達したら達成
   // （同じ 'auto' の意味。例：300単語の合計が 300 になったら達成）。
+  // V12.11・A班: active→achieved への遷移が起きたら true を返す
+  // （呼び出し元が達成の出来事を書くため。遷移しなければ false。
+  // UPDATE に achievement_status='active' の条件を付けて行数で
+  // 遷移を検出する＝同時 contribute が重なっても二重に書かない）。
   async function maybeAutoAchieve(goalId, recordedValue) {
     const g = await q('SELECT achievement_rule, achievement_status, kind, target, start_value FROM shared_goals WHERE id = $1', [goalId]);
-    if (!g.rowCount) return;
+    if (!g.rowCount) return false;
     const row = g.rows[0];
-    if (normalizeAchievementRule(row.achievement_rule) !== 'auto') return;
-    if (row.achievement_status !== 'active') return;
+    if (normalizeAchievementRule(row.achievement_rule) !== 'auto') return false;
+    if (row.achievement_status !== 'active') return false;
     const target = Number(row.target);
-    if (!Number.isFinite(target) || target <= 0) return;
+    if (!Number.isFinite(target) || target <= 0) return false;
     let reached = false;
     if (normalizeKind(row.kind) === 'value') {
       const start = row.start_value == null ? null : Number(row.start_value);
       const current = Number(recordedValue);
-      if (start === null || !Number.isFinite(start) || !Number.isFinite(current)) return;
+      if (start === null || !Number.isFinite(start) || !Number.isFinite(current)) return false;
       const denom = target - start;
-      if (denom === 0) return;
+      if (denom === 0) return false;
       reached = (current - start) / denom >= 1;
     } else {
       const sum = await q('SELECT COALESCE(SUM(amount), 0)::float AS total FROM shared_goal_contributions WHERE goal_id = $1', [goalId]);
       reached = Number(sum.rows[0].total) >= target;
     }
-    if (reached) {
-      await q(`UPDATE shared_goals SET achievement_status = 'achieved', achieved_at = NOW() WHERE id = $1`, [goalId]);
-    }
+    if (!reached) return false;
+    const upd = await q(`UPDATE shared_goals SET achievement_status = 'achieved', achieved_at = NOW()
+                         WHERE id = $1 AND achievement_status = 'active'`, [goalId]);
+    return upd.rowCount > 0;
   }
 
   // V12.7・A班: 'declare' ルールの達成状態の再計算（申告・取り消し・
@@ -1222,8 +1354,21 @@ function register({ app, db, auth }) {
     const { members, declared } = counts.rows[0];
     const allDeclared = members > 0 && declared >= members;
     if (allDeclared) {
-      await q(`UPDATE shared_goals SET achievement_status = 'achieved', achieved_at = COALESCE(achieved_at, NOW())
+      const upd = await q(`UPDATE shared_goals SET achievement_status = 'achieved', achieved_at = COALESCE(achieved_at, NOW())
                WHERE id = $1 AND achievement_status = 'active'`, [goalId]);
+      // V12.11・A班: active→achieved への遷移のときだけ達成の出来事を1行
+      // 書く（UPDATE の行数で遷移を検出。既に achieved なら行数は 0）。
+      // この関数は申告・取り消しだけでなく参加・退出・キックからも
+      // 呼ばれるため、達成のきっかけになった人を引数では渡せない。
+      // 申告者のうち最新の人を出来事の作者とする（その人の申告で
+      // 全員分が揃った、という意味で最も近い）。
+      if (upd.rowCount > 0) {
+        const last = await q(
+          `SELECT user_id FROM shared_goal_declarations WHERE goal_id = $1
+           ORDER BY declared_at DESC LIMIT 1`,
+          [goalId]);
+        if (last.rowCount) await recordAchievedEvent(goalId, last.rows[0].user_id);
+      }
     } else {
       await q(`UPDATE shared_goals SET achievement_status = 'active', achieved_at = NULL
                WHERE id = $1 AND achievement_status = 'achieved'`, [goalId]);
@@ -1265,7 +1410,11 @@ function register({ app, db, auth }) {
           [req.params.id, uid, note]);
       }
       // V12.7・A班: 'auto' ルールの達成判定（value は記録した値で判定）。
-      await maybeAutoAchieve(req.params.id, value);
+      // V12.11・A班: active→achieved への遷移が起きたら達成の出来事を
+      // 書く（ベストエフォート。記録した人が作者）。
+      if (await maybeAutoAchieve(req.params.id, value)) {
+        await recordAchievedEvent(req.params.id, uid);
+      }
       const detail = await loadGoalDetail(req.params.id, uid);
       if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
       detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
@@ -1285,7 +1434,11 @@ function register({ app, db, auth }) {
       `INSERT INTO shared_goal_contributions (goal_id, user_id, amount, note) VALUES ($1, $2, $3, $4)`,
       [req.params.id, uid, amount, note]);
     // V12.7・A班: 'auto' ルールの達成判定（count/time/habit は貢献合計で判定）。
-    await maybeAutoAchieve(req.params.id, null);
+    // V12.11・A班: active→achieved への遷移が起きたら達成の出来事を
+    // 書く（ベストエフォート。記録した人が作者）。
+    if (await maybeAutoAchieve(req.params.id, null)) {
+      await recordAchievedEvent(req.params.id, uid);
+    }
     const detail = await loadGoalDetail(req.params.id, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
@@ -1331,12 +1484,16 @@ function register({ app, db, auth }) {
     const uid = String(req.userId);
     if (limited('sg:deadline-result:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
     if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
-    const g = await q('SELECT owner_user_id, achievement_rule FROM shared_goals WHERE id = $1', [req.params.id]);
+    const g = await q('SELECT owner_user_id, achievement_rule, achievement_status FROM shared_goals WHERE id = $1', [req.params.id]);
     if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     if (g.rows[0].owner_user_id !== uid) return res.status(403).json({ error: '期日の結果を入れられるのは作成者だけです。', errorJa: '期日の結果を入れられるのは作成者だけです。', errorEn: 'Only the creator can enter the deadline result.' });
     if (normalizeAchievementRule(g.rows[0].achievement_rule) !== 'deadline') {
       return res.status(400).json({ error: 'この共有目標は期日で達成を決める目標ではありません。', errorJa: 'この共有目標は期日で達成を決める目標ではありません。', errorEn: 'This shared goal does not decide completion by deadline.' });
     }
+    // V12.11・A班: pass 前の達成状態を覚えておく。既に achieved なら
+    // pass の入れ直しなので出来事は書かない（遷移のときだけ1行）。
+    // failed からの pass は achieved への遷移なので書く。
+    const wasAchieved = g.rows[0].achievement_status === 'achieved';
     const result = (req.body && req.body.result) ?? null;
     if (result !== 'pass' && result !== 'fail' && result !== null) return res.status(400).json({ error: '結果は合格・不合格のどちらかで入力してください。', errorJa: '結果は合格・不合格のどちらかで入力してください。', errorEn: 'Please enter a result of pass or fail.' });
     if (result === null) {
@@ -1345,6 +1502,10 @@ function register({ app, db, auth }) {
     } else if (result === 'pass') {
       await q(`UPDATE shared_goals SET deadline_result = 'pass', deadline_result_at = NOW(),
                achievement_status = 'achieved', achieved_at = COALESCE(achieved_at, NOW()) WHERE id = $1`, [req.params.id]);
+      // V12.11・A班: pass で achieved になった瞬間だけ出来事を書く
+      // （ベストエフォート。fail・取り消しは対象外。結果を入れた
+      // 作成者が作者）。
+      if (!wasAchieved) await recordAchievedEvent(req.params.id, uid);
     } else {
       await q(`UPDATE shared_goals SET deadline_result = 'fail', deadline_result_at = NOW(),
                achievement_status = 'failed', achieved_at = NULL WHERE id = $1`, [req.params.id]);
@@ -1383,7 +1544,7 @@ function register({ app, db, auth }) {
     const uid = String(req.userId);
     if (limited('sg:task-toggle:' + uid, 120, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
     if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
-    const t = await q('SELECT id FROM shared_goal_tasks WHERE id = $1 AND goal_id = $2', [req.params.taskId, req.params.id]);
+    const t = await q('SELECT id, title FROM shared_goal_tasks WHERE id = $1 AND goal_id = $2', [req.params.taskId, req.params.id]);
     if (!t.rowCount) return res.status(404).json({ error: 'タスクが見つかりません。', errorJa: 'タスクが見つかりません。', errorEn: 'Task not found.' });
     const done = await q(
       'SELECT 1 FROM shared_goal_task_completions WHERE task_id = $1 AND user_id = $2 AND completed_date = CURRENT_DATE',
@@ -1394,6 +1555,16 @@ function register({ app, db, auth }) {
     } else {
       await q('INSERT INTO shared_goal_task_completions (task_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
         [req.params.taskId, uid]);
+      // V12.11・A班: 共通タスクの完了の出来事を書く（ベストエフォート。
+      // 完了＝INSERT のときだけ。text=タスク名。取消＝DELETE は対象外）。
+      await recordSharedGoalEvent({
+        goalId: req.params.id,
+        authorUserId: uid,
+        authorName: await displayNameFor(uid),
+        avatarColor: await avatarColorFor(uid),
+        kind: 'taskDone',
+        text: t.rows[0].title,
+      });
     }
     const detail = await loadGoalDetail(req.params.id, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
