@@ -70,8 +70,24 @@ const { screenText } = require('./community');
 //   今日のノルマ達成率の「今日記録したか」を保つ。2回目以降は値の
 //   修正のみで貢献は増えない）。全体の達成率はクライアントの
 //   sharedGoalOverallRate が開始値→目標値の近づき具合で出す。
-//   達成の決め方（achievementRule）は保存だけ行い、達成判定の
-//   実行（「達成した」申告ボタン・期日の合否入力）は未実装（I12.6-6）。
+//   達成の決め方（achievementRule）は v12.6 では保存だけだったが、
+//   v12.7・A班で実行した（申告ボタン・期日の合否入力・自動判定。I12.7-9）。
+// V12.7・A班: 達成の決め方（achievementRule）の実行。
+//   v12.6 では保存だけだった achievement_rule を動かす。
+//   - declare: shared_goal_declarations（goal_id, user_id, declared_at）。
+//     メンバーが「達成した」を申告・取り消しできる。全員が申告したら
+//     達成（achievement_status='achieved'）。1人でも取り消したら active に戻る。
+//   - deadline: shared_goals.deadline_result（'pass'|'fail'）＋
+//     deadline_result_at。作成者だけが期日を過ぎてから入れられる。
+//     pass → achieved、fail → failed。取り消し（null）で active に戻る。
+//   - auto: contribute 時に判定する。value は記録したメンバーの最新値が
+//     開始値→目標値に到達したら達成。count/time/habit は貢献合計が
+//     target に到達したら達成（同じ 'auto' の意味）。
+//   達成状態は shared_goals.achievement_status（'active'|'achieved'|
+//   'failed'、既定 'active'）＋ achieved_at。loadGoalDetail が
+//   achievementStatus / achievedAt / deadlineResult / declaredCount /
+//   myDeclared / deadlinePassed とメンバーごとの declared を返す。
+//   旧データは全て 'active'・申告なし（表示・判定とも従来通り）。
 // V12.2・A班: 共有目標の公開範囲（visibility: private/public。未指定・
 //   旧データは 'private'）とコメント（shared_goal_comments）。
 //   公開目標は GET /api/shared-goals/public で一覧でき、
@@ -114,6 +130,20 @@ ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAU
 --   kind・visibility と同じ後付けパターン。
 ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS start_value NUMERIC;
 ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS achievement_rule TEXT NOT NULL DEFAULT 'auto';
+-- V12.7・A班: 達成の実行状態（achievement_status 'active'|'achieved'|
+-- 'failed'、achieved_at、deadline_result 'pass'|'fail'、deadline_result_at）
+-- と「達成した」の申告テーブル。kind・visibility と同じ後付けパターン。
+ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS achievement_status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS achieved_at TIMESTAMPTZ;
+ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS deadline_result TEXT;
+ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS deadline_result_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS shared_goal_declarations (
+  goal_id BIGINT NOT NULL REFERENCES shared_goals(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  declared_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (goal_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shared_goal_declarations ON shared_goal_declarations (goal_id, declared_at ASC);
 CREATE INDEX IF NOT EXISTS idx_shared_goals_public ON shared_goals (visibility, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_shared_goals_owner ON shared_goals (owner_user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_shared_goals_code ON shared_goals (invite_code);
@@ -402,6 +432,7 @@ function register({ app, db, auth }) {
     const g = await q(
       `SELECT id, owner_user_id, title, target, unit, kind, visibility,
               start_value, achievement_rule,
+              achievement_status, achieved_at, deadline_result, deadline_result_at,
               to_char(deadline, 'YYYY-MM-DD') AS deadline,
               to_char(start_date, 'YYYY-MM-DD') AS start_date,
               invite_code, created_at,
@@ -432,6 +463,14 @@ function register({ app, db, auth }) {
               to_char(logged_at, 'YYYY-MM-DD') AS logged_date
        FROM shared_goal_values WHERE goal_id = $1 ORDER BY logged_at DESC, id DESC LIMIT 500`,
       [goalId]);
+
+    // V12.7・A班: 「達成した」の申告（declare ルール用。メンバーごと）。
+    // 申告したメンバーの declaredAt と、申告した人数をここから導く。
+    const declarations = await q(
+      `SELECT user_id, declared_at FROM shared_goal_declarations WHERE goal_id = $1`,
+      [goalId]);
+    const declaredAtByUser = {};
+    for (const d of declarations.rows) declaredAtByUser[d.user_id] = d.declared_at;
 
     const memberCount = members.rows.length;
     const startDay = parseDay(goal.start_date);
@@ -531,6 +570,10 @@ function register({ app, db, auth }) {
         // （count/time/habit では null/false のまま）。
         currentValue: latestValueByUser[m.user_id] ?? null,
         valueLoggedToday: Boolean(valueLoggedTodayByUser[m.user_id]),
+        // V12.7・A班: 「達成した」の申告状態（declare ルール用。
+        // 申告していない・旧データでは declared=false・declaredAt=null）。
+        declared: Boolean(declaredAtByUser[m.user_id]),
+        declaredAt: declaredAtByUser[m.user_id] || null,
         wonToday: u.winDates.has(goal.today),
         // V12.2・A班: 直近の活動日時（貢献・タスク完了の最新。無ければ参加日時）。
         lastActiveAt: lastActiveByUser[m.user_id] || m.joined_at,
@@ -581,6 +624,9 @@ function register({ app, db, auth }) {
     const myTodayContribution = viewerUserId
       ? (byUser[String(viewerUserId)] || { today: 0 }).today
       : 0;
+    // V12.7・A班: 閲覧者（自分）が「達成した」を申告済みか
+    // （declare ルール用。未指定なら false）。
+    const myDeclared = viewerUserId ? Boolean(declaredAtByUser[String(viewerUserId)]) : false;
     return {
       id: String(goal.id),
       title: goal.title,
@@ -596,6 +642,18 @@ function register({ app, db, auth }) {
       // null＝記録待ち）。myCurrentValue は閲覧者本人の最新値。
       startValue: goal.start_value == null ? null : Number(goal.start_value),
       achievementRule: normalizeAchievementRule(goal.achievement_rule),
+      // V12.7・A班: 達成の実行状態。旧データ・旧カラム無しは 'active'
+      // （DB の DEFAULT と同じ）。achievedAt / deadlineResult /
+      // deadlineResultAt が無ければ null。declaredCount は今の
+      // メンバーのうち申告済みの人数。deadlinePassed は期日を過ぎたか
+      // （サーバー当日で判定。クライアントの時計に依存しない）。
+      achievementStatus: ['achieved', 'failed'].includes(goal.achievement_status) ? goal.achievement_status : 'active',
+      achievedAt: goal.achieved_at || null,
+      deadlineResult: goal.deadline_result === 'pass' || goal.deadline_result === 'fail' ? goal.deadline_result : null,
+      deadlineResultAt: goal.deadline_result_at || null,
+      declaredCount: memberList.filter((m) => m.declared).length,
+      myDeclared,
+      deadlinePassed: Boolean(endDay && daysBetween(endDay, parseDay(goal.today)) > 0),
       currentValue: latestValueOverall,
       myCurrentValue: viewerUserId ? (latestValueByUser[String(viewerUserId)] ?? null) : null,
       deadline: dayString(goal.deadline),
@@ -641,6 +699,8 @@ function register({ app, db, auth }) {
         await q('DELETE FROM shared_goal_contributions WHERE user_id = $1', [uid]);
         // V12.6・C班: 数値タイプの値の記録も消す（貢献と同じ扱い）。
         await q('DELETE FROM shared_goal_values WHERE user_id = $1', [uid]);
+        // V12.7・A班: 「達成した」の申告も消す（貢献と同じ扱い）。
+        await q('DELETE FROM shared_goal_declarations WHERE user_id = $1', [uid]);
         await q('DELETE FROM shared_goal_comments WHERE user_id = $1', [uid]);
         await q('DELETE FROM shared_goal_stamps WHERE user_id = $1 OR target_user_id = $1', [uid]);
         await q('DELETE FROM shared_goal_task_completions WHERE user_id = $1', [uid]);
@@ -784,7 +844,7 @@ function register({ app, db, auth }) {
     const offset = Math.max(0, Math.floor(Number(req.query.offset) || 0));
     const rows = await q(
       `SELECT g.id, g.owner_user_id, g.title, g.target, g.unit, g.kind,
-              g.start_value, g.achievement_rule,
+              g.start_value, g.achievement_rule, g.achievement_status,
               to_char(g.deadline, 'YYYY-MM-DD') AS deadline,
               to_char(g.start_date, 'YYYY-MM-DD') AS start_date,
               g.created_at,
@@ -813,6 +873,8 @@ function register({ app, db, auth }) {
         // V12.6・C班: 数値タイプの開始値と達成の決め方（公開一覧でも見える）。
         startValue: r.start_value == null ? null : Number(r.start_value),
         achievementRule: normalizeAchievementRule(r.achievement_rule),
+        // V12.7・A班: 達成状態（公開一覧でも見える。旧データは 'active'）。
+        achievementStatus: ['achieved', 'failed'].includes(r.achievement_status) ? r.achievement_status : 'active',
         unit: r.unit || '',
         target,
         deadline: dayString(r.deadline),
@@ -889,6 +951,9 @@ function register({ app, db, auth }) {
     // V12.4・A班: 過去にキックされた記録があれば、再参加で消す
     // （「外されました」の案内を出し続けないため）。
     await q('DELETE FROM shared_goal_kicks WHERE goal_id = $1 AND user_id = $2', [goalId, uid]);
+    // V12.7・A班: 新しいメンバーが増えたら「全員申告済み」ではなくなる
+    // ため、declare ルールの達成状態を数え直す（失敗しても参加は成功）。
+    try { await refreshDeclareStatus(goalId); } catch (_) {}
     const detail = await loadGoalDetail(goalId, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
     detail.isOwner = false;
@@ -919,6 +984,9 @@ function register({ app, db, auth }) {
       [goalId, uid, await displayNameFor(uid)]);
     // V12.4・A班: 過去にキックされた記録があれば、再参加で消す。
     await q('DELETE FROM shared_goal_kicks WHERE goal_id = $1 AND user_id = $2', [goalId, uid]);
+    // V12.7・A班: 新しいメンバーが増えたら「全員申告済み」ではなくなる
+    // ため、declare ルールの達成状態を数え直す（失敗しても参加は成功）。
+    try { await refreshDeclareStatus(goalId); } catch (_) {}
     const detail = await loadGoalDetail(goalId, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
     detail.isOwner = false;
@@ -1004,6 +1072,58 @@ function register({ app, db, auth }) {
     res.json({ ok: true });
   }));
 
+  // V12.7・A班: 'auto' ルールの達成判定（contribute 時に呼ぶ）。
+  // 既に achieved/failed なら何もしない。value は記録したメンバーの
+  // 最新値が開始値→目標値に到達したら達成（開始値が無ければ判定しない）。
+  // count/time/habit は貢献合計が target に到達したら達成
+  // （同じ 'auto' の意味。例：300単語の合計が 300 になったら達成）。
+  async function maybeAutoAchieve(goalId, recordedValue) {
+    const g = await q('SELECT achievement_rule, achievement_status, kind, target, start_value FROM shared_goals WHERE id = $1', [goalId]);
+    if (!g.rowCount) return;
+    const row = g.rows[0];
+    if (normalizeAchievementRule(row.achievement_rule) !== 'auto') return;
+    if (row.achievement_status !== 'active') return;
+    const target = Number(row.target);
+    if (!Number.isFinite(target) || target <= 0) return;
+    let reached = false;
+    if (normalizeKind(row.kind) === 'value') {
+      const start = row.start_value == null ? null : Number(row.start_value);
+      const current = Number(recordedValue);
+      if (start === null || !Number.isFinite(start) || !Number.isFinite(current)) return;
+      const denom = target - start;
+      if (denom === 0) return;
+      reached = (current - start) / denom >= 1;
+    } else {
+      const sum = await q('SELECT COALESCE(SUM(amount), 0)::float AS total FROM shared_goal_contributions WHERE goal_id = $1', [goalId]);
+      reached = Number(sum.rows[0].total) >= target;
+    }
+    if (reached) {
+      await q(`UPDATE shared_goals SET achievement_status = 'achieved', achieved_at = NOW() WHERE id = $1`, [goalId]);
+    }
+  }
+
+  // V12.7・A班: 'declare' ルールの達成状態の再計算（申告・取り消し・
+  // 参加・退出のときに呼ぶ）。メンバーが1人以上いて全員が申告済みなら
+  // achieved、そうでなければ achieved だったものを active に戻す
+  // （failed には触らない。declare ルールで failed になる経路は無い）。
+  async function refreshDeclareStatus(goalId) {
+    const counts = await q(
+      `SELECT (SELECT COUNT(*)::int FROM shared_goal_members WHERE goal_id = $1) AS members,
+              (SELECT COUNT(*)::int FROM shared_goal_declarations d
+                JOIN shared_goal_members m ON m.goal_id = d.goal_id AND m.user_id = d.user_id
+                WHERE d.goal_id = $1) AS declared`,
+      [goalId]);
+    const { members, declared } = counts.rows[0];
+    const allDeclared = members > 0 && declared >= members;
+    if (allDeclared) {
+      await q(`UPDATE shared_goals SET achievement_status = 'achieved', achieved_at = COALESCE(achieved_at, NOW())
+               WHERE id = $1 AND achievement_status = 'active'`, [goalId]);
+    } else {
+      await q(`UPDATE shared_goals SET achievement_status = 'active', achieved_at = NULL
+               WHERE id = $1 AND achievement_status = 'achieved'`, [goalId]);
+    }
+  }
+
   // 貢献を記録する。日付はサーバー当日固定（過去への書き込みで
   // ペース% を操作できないようにする）。amount は 1 回分の追加量。
   app.post('/api/shared-goals/:id/contribute', auth.requireAuth, wrap(async (req, res) => {
@@ -1038,6 +1158,8 @@ function register({ app, db, auth }) {
           `INSERT INTO shared_goal_contributions (goal_id, user_id, amount, note) VALUES ($1, $2, 1, $3)`,
           [req.params.id, uid, note]);
       }
+      // V12.7・A班: 'auto' ルールの達成判定（value は記録した値で判定）。
+      await maybeAutoAchieve(req.params.id, value);
       const detail = await loadGoalDetail(req.params.id, uid);
       if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
       detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
@@ -1056,9 +1178,74 @@ function register({ app, db, auth }) {
     await q(
       `INSERT INTO shared_goal_contributions (goal_id, user_id, amount, note) VALUES ($1, $2, $3, $4)`,
       [req.params.id, uid, amount, note]);
+    // V12.7・A班: 'auto' ルールの達成判定（count/time/habit は貢献合計で判定）。
+    await maybeAutoAchieve(req.params.id, null);
     const detail = await loadGoalDetail(req.params.id, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+    res.json({ goal: detail });
+  }));
+
+  // ================= 達成の決め方の実行（V12.7・A班） =================
+  // (a) 「達成した」の申告・取り消し（declare ルール用）。
+  // メンバーだけが自分の申告を出せる。body { declared?: boolean }
+  // （未指定は true＝申告する）。申告・取り消しのたびに全員申告かを
+  // 数え直し、達成状態を更新する。返すのは更新後の目標全体。
+  app.post('/api/shared-goals/:id/declare', auth.requireAuth, wrap(async (req, res) => {
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    const uid = String(req.userId);
+    if (limited('sg:declare:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    const g = await q('SELECT achievement_rule FROM shared_goals WHERE id = $1', [req.params.id]);
+    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (normalizeAchievementRule(g.rows[0].achievement_rule) !== 'declare') {
+      return res.status(400).json({ error: 'この共有目標は申告で達成を決める目標ではありません。' });
+    }
+    const declared = (req.body && req.body.declared) !== false;
+    if (declared) {
+      await q(`INSERT INTO shared_goal_declarations (goal_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [req.params.id, uid]);
+    } else {
+      await q('DELETE FROM shared_goal_declarations WHERE goal_id = $1 AND user_id = $2', [req.params.id, uid]);
+    }
+    await refreshDeclareStatus(req.params.id);
+    const detail = await loadGoalDetail(req.params.id, uid);
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+    res.json({ goal: detail });
+  }));
+
+  // (b) 期日の合否を入れる（deadline ルール用。作成者だけ）。
+  // body { result: 'pass' | 'fail' | null }。null は取り消し（active に戻す）。
+  // pass → achieved、fail → failed。期日前でも入れられるが、クライアントは
+  // 期日を過ぎてから入力を促す（作成者が期日前に合否を決めたい場合もあるため、
+  // サーバー側では期日を強制しない）。
+  app.post('/api/shared-goals/:id/deadline-result', auth.requireAuth, wrap(async (req, res) => {
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    const uid = String(req.userId);
+    if (limited('sg:deadline-result:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    const g = await q('SELECT owner_user_id, achievement_rule FROM shared_goals WHERE id = $1', [req.params.id]);
+    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (g.rows[0].owner_user_id !== uid) return res.status(403).json({ error: '期日の結果を入れられるのは作成者だけです。' });
+    if (normalizeAchievementRule(g.rows[0].achievement_rule) !== 'deadline') {
+      return res.status(400).json({ error: 'この共有目標は期日で達成を決める目標ではありません。' });
+    }
+    const result = (req.body && req.body.result) ?? null;
+    if (result !== 'pass' && result !== 'fail' && result !== null) return res.status(400).json({ error: '結果は合格・不合格のどちらかで入力してください。' });
+    if (result === null) {
+      await q(`UPDATE shared_goals SET deadline_result = NULL, deadline_result_at = NULL,
+               achievement_status = 'active', achieved_at = NULL WHERE id = $1`, [req.params.id]);
+    } else if (result === 'pass') {
+      await q(`UPDATE shared_goals SET deadline_result = 'pass', deadline_result_at = NOW(),
+               achievement_status = 'achieved', achieved_at = COALESCE(achieved_at, NOW()) WHERE id = $1`, [req.params.id]);
+    } else {
+      await q(`UPDATE shared_goals SET deadline_result = 'fail', deadline_result_at = NOW(),
+               achievement_status = 'failed', achieved_at = NULL WHERE id = $1`, [req.params.id]);
+    }
+    const detail = await loadGoalDetail(req.params.id, uid);
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    detail.isOwner = true;
     res.json({ goal: detail });
   }));
 
@@ -1134,6 +1321,9 @@ function register({ app, db, auth }) {
     try {
       await client.query('BEGIN');
       await client.query('DELETE FROM shared_goal_members WHERE goal_id = $1 AND user_id = $2', [req.params.id, uid]);
+      // V12.7・A班: 抜ける人の申告も消す（残すと「全員申告済み」の
+      // 数え直しがずれるため。貢献履歴・コメントは従来通り残す）。
+      await client.query('DELETE FROM shared_goal_declarations WHERE goal_id = $1 AND user_id = $2', [req.params.id, uid]);
       const g = await client.query('SELECT owner_user_id FROM shared_goals WHERE id = $1 FOR UPDATE', [req.params.id]);
       if (!g.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: '共有目標が見つかりません。' }); }
       const rest = await client.query('SELECT user_id FROM shared_goal_members WHERE goal_id = $1 ORDER BY joined_at ASC LIMIT 1', [req.params.id]);
@@ -1143,6 +1333,9 @@ function register({ app, db, auth }) {
         await client.query('UPDATE shared_goals SET owner_user_id = $1 WHERE id = $2', [rest.rows[0].user_id, req.params.id]);
       }
       await client.query('COMMIT');
+      // V12.7・A班: 残りのメンバーだけで「全員申告済み」になることがある
+      // ため、declare ルールの達成状態を数え直す（失敗しても退出は成功）。
+      try { await refreshDeclareStatus(req.params.id); } catch (_) {}
       res.json({ ok: true });
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});
@@ -1156,8 +1349,8 @@ function register({ app, db, auth }) {
   //   - 自分自身はキック不可（オーナーが抜けるときは /leave を使う。
   //     所有権は最古メンバーへ移る。最後の1人なら目標ごと消える）。
   //   - キックされた人は shared_goal_members から外れる（貢献履歴・
-  //     コメントは残す）。その目標の共通タスクの完了記録も消す
-  //     （残すと「今日 N/M人」の分母・分子がずれるため）。
+  //     コメントは残す）。その目標の共通タスクの完了記録と「達成した」
+  //     の申告も消す（残すと「今日 N/M人」・「全員申告済み」がずれるため）。
   //   - shared_goal_kicks に記録を残す（キックされた人が次回開いたときに
   //     GET /api/shared-goals/kicked で「外されました」と分かるように）。
   //   - アクティビティにも記録する（activity_events。失敗してもキック
@@ -1182,6 +1375,10 @@ function register({ app, db, auth }) {
         `DELETE FROM shared_goal_task_completions
          WHERE user_id = $2 AND task_id IN (SELECT id FROM shared_goal_tasks WHERE goal_id = $1)`,
         [req.params.id, targetUserId]);
+      // V12.7・A班: キックされた人の申告も消す（残すと「全員申告済み」の
+      // 数え直しがずれるため）。
+      await client.query('DELETE FROM shared_goal_declarations WHERE goal_id = $1 AND user_id = $2',
+        [req.params.id, targetUserId]);
       await client.query(
         `INSERT INTO shared_goal_kicks (goal_id, user_id, kicked_by) VALUES ($1, $2, $3)
          ON CONFLICT (goal_id, user_id) DO UPDATE SET kicked_by = EXCLUDED.kicked_by, kicked_at = NOW()`,
@@ -1193,6 +1390,9 @@ function register({ app, db, auth }) {
     } finally {
       client.release();
     }
+    // V12.7・A班: 残りのメンバーだけで「全員申告済み」になることがある
+    // ため、declare ルールの達成状態を数え直す（失敗してもキックは成功）。
+    try { await refreshDeclareStatus(req.params.id); } catch (_) {}
     // アクティビティへの記録はベストエフォート（activity_events が
     // まだ無い・失敗してもキック自体は成功扱いにする）。
     try {
@@ -1310,6 +1510,33 @@ module.exports = { register, parseDay, daysBetween, plannedByToday, formatDay };
  *      各行に startValue・achievementRule が付くこと
  *    - GET /api/version → { version: '7.4.0', features: {
  *      aiSharedGoalCreation: true, ... } }
+ * 12. 達成の決め方の実行（V12.7・A班。バージョンは 7.5.0 に上がる）:
+ *    - POST /api/shared-goals（kind: 'value', target: 80, startValue: 95,
+ *      achievementRule: 'declare'）→ goal.achievementStatus='active'、
+ *      goal.declaredCount=0、goal.deadlinePassed=false（期日前なら）
+ *    - POST /api/shared-goals/:id/declare（{ declared: true }、メンバー）
+ *      → { goal } が返り、自分の members[] に declared=true、declaredCount=1
+ *    - 全員が declare したら goal.achievementStatus='achieved'、
+ *      achievedAt が入ること。1人が { declared: false } で取り消したら
+ *      achievementStatus='active'、achievedAt=null に戻ること
+ *    - POST /api/shared-goals/:id/declare（rule が 'auto' の目標）
+ *      → 400「申告で達成を決める目標ではありません。」
+ *    - POST /api/shared-goals/:id/declare（メンバーでない人）→ 403
+ *    - POST /api/shared-goals/:id/deadline-result（{ result: 'pass' }、
+ *      作成者・rule='deadline'）→ achievementStatus='achieved'、
+ *      deadlineResult='pass'。{ result: 'fail' } → 'failed'。
+ *      { result: null } → 'active'・deadlineResult=null に戻ること
+ *    - POST /api/shared-goals/:id/deadline-result（作成者以外）→ 403。
+ *      （rule が 'deadline' でない目標）→ 400
+ *    - POST /api/shared-goals/:id/contribute（value、{ value: 80 }、
+ *      start 95・target 80・rule='auto'）→ achievementStatus='achieved'
+ *    - POST /api/shared-goals/:id/contribute（count、合計が target 到達・
+ *      rule='auto'）→ achievementStatus='achieved'
+ *    - POST /api/shared-goals/:id/contribute（rule='declare'・'deadline'）
+ *      → 記録しても achievementStatus は変わらないこと
+ *    - GET /api/shared-goals/public の各行に achievementStatus が付くこと
+ *    - GET /api/version → { version: '7.5.0', features: {
+ *      achievementRuleExecution: true, ... } }
  * 10. 503 が出たときの切り分け（v5）: Render → Logs で
  *    `[shared-goals] requestId=... POST /api/shared-goals user=... step=... error=...`
  *    を探す。step=loadGoalDetail なら集計の例外、step=ensure-schema なら
