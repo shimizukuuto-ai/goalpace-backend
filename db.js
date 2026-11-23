@@ -53,12 +53,11 @@ async function initDb() {
     );
   `);
 
-  // NEW: SNSシェアによる本日の利用上限ボーナス。
-  // (user_id, bonus_date) を主キーにすることで「1ユーザー・1日1回」を
+  // NEW: SNSシェアによる今週の利用上限ボーナス。
+  // (user_id, bonus_date) を主キーにすることで「1ユーザー・1週1回」を
   // DBレベルで保証する（ON CONFLICT DO NOTHINGで2回目以降の付与を防ぐ）。
-  // bonus_date は「サーバーのタイムゾーンでの今日の日付」。usage_eventsの
-  // today_count はローリング24時間窓だが、シェア特典は素朴に「暦日で1回」とした
-  // （ユーザーから見て「今日もう一回シェアできる/できない」がわかりやすいため）。
+  // bonus_date は「今週の月曜の日付」（getWeekWindow の weekDate）。
+  // 週が変わると月曜の日付が変わるので、翌週はまた1回もらえる。
   await pool.query(`
     CREATE TABLE IF NOT EXISTS share_bonuses (
       user_id INTEGER NOT NULL REFERENCES users(id),
@@ -135,6 +134,26 @@ async function initDb() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by INTEGER REFERENCES users(id);`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users (referral_code) WHERE referral_code IS NOT NULL;`);
+
+  // ---- デバイス単位の週次AI利用枠（Iteration 4・班B） ----
+  // 認証オフ（REQUIRE_AUTH=false）のとき、AI枠はアカウントではなく端末で数える。
+  // device_id はクライアントが AsyncStorage に永続化した匿名ID（認証ではない）。
+  // 1行＝1端末×1週。first_seen はその端末の最初の利用週の記録時刻で、
+  // お試し期間（初回利用から7日間は週50回）の判定に使う。週が変わると
+  // 新しい行が作られ used は 0 から始まる（週リセット）。
+  // bonus_credits は将来のデバイス向け特典用の枠で、現状は常に 0
+  // （シェア・招待特典はアカウント紐づけのため認証オン時のみ）。
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS device_ai_usage (
+      device_id TEXT NOT NULL,
+      week_date DATE NOT NULL,
+      used INTEGER NOT NULL DEFAULT 0 CHECK (used >= 0),
+      bonus_credits INTEGER NOT NULL DEFAULT 0 CHECK (bonus_credits >= 0),
+      first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (device_id, week_date)
+    );
+  `);
 
   console.log('DB initialized (users, usage_events, share_bonuses, leaderboard tables ready).');
 }
@@ -248,6 +267,101 @@ async function refundUsage(eventId) {
     throw error;
   } finally {
     client.release();
+  }
+}
+
+// ==========================================================================
+// デバイス単位の週次AI利用枠（Iteration 4・班B。認証オフ時専用）
+// users テーブルは触らない。アカウント側の reserveUsage / refundUsage と
+// 同じ契約：成功したら { weekDate, source }、枠が足りなければ null。
+// ==========================================================================
+
+// 今週のデバイス利用状況。行が無ければ「未使用」（used=0, firstSeen=null）。
+async function getDeviceUsage(deviceId) {
+  const { weekStart, nextReset, weekDate } = await getWeekWindow();
+  const { rows } = await pool.query(
+    `SELECT used, bonus_credits,
+            (SELECT MIN(first_seen) FROM device_ai_usage WHERE device_id = $1) AS first_seen
+     FROM device_ai_usage WHERE device_id = $1 AND week_date = $2`,
+    [deviceId, weekDate]
+  );
+  return {
+    used: rows[0] ? rows[0].used : 0,
+    bonusCredits: rows[0] ? rows[0].bonus_credits : 0,
+    firstSeen: rows[0] && rows[0].first_seen ? new Date(rows[0].first_seen).toISOString() : null,
+    weekStart,
+    nextReset,
+    weekDate,
+  };
+}
+
+// デバイスの AI利用を cost 回分「予約」する。reserveUsage のデバイス版。
+async function reserveDeviceUsage(deviceId, cost, weeklyLimit) {
+  const { weekDate } = await getWeekWindow();
+  if (cost === 0) return { weekDate, source: 'weekly' };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const cur = await client.query(
+      'SELECT used, bonus_credits FROM device_ai_usage WHERE device_id = $1 AND week_date = $2 FOR UPDATE',
+      [deviceId, weekDate]
+    );
+    const used = cur.rows[0] ? cur.rows[0].used : 0;
+    const bonus = cur.rows[0] ? cur.rows[0].bonus_credits : 0;
+    let source = null;
+    if (used + cost <= weeklyLimit) {
+      source = 'weekly';
+    } else if (bonus >= cost) {
+      source = 'bonus';
+    }
+    if (!source) { await client.query('ROLLBACK'); return null; }
+    if (cur.rows[0]) {
+      if (source === 'weekly') {
+        await client.query(
+          'UPDATE device_ai_usage SET used = used + $3, updated_at = now() WHERE device_id = $1 AND week_date = $2',
+          [deviceId, weekDate, cost]
+        );
+      } else {
+        await client.query(
+          'UPDATE device_ai_usage SET bonus_credits = bonus_credits - $3, updated_at = now() WHERE device_id = $1 AND week_date = $2',
+          [deviceId, weekDate, cost]
+        );
+      }
+    } else {
+      // 初回利用：この行の first_seen がお試し期間の起点になる
+      await client.query(
+        'INSERT INTO device_ai_usage (device_id, week_date, used, bonus_credits) VALUES ($1, $2, $3, 0)',
+        [deviceId, weekDate, source === 'weekly' ? cost : 0]
+      );
+      if (source === 'bonus') {
+        // 行が無かったのに bonus 経由はあり得ない（bonus=0のため）が、念のため
+        await client.query('ROLLBACK');
+        return null;
+      }
+    }
+    await client.query('COMMIT');
+    return { weekDate, source };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// デバイスの予約分を返す（AI失敗時）。refundUsage のデバイス版。
+async function refundDeviceUsage(deviceId, weekDate, cost, source) {
+  if (!cost) return;
+  if (source === 'weekly') {
+    await pool.query(
+      'UPDATE device_ai_usage SET used = GREATEST(0, used - $3), updated_at = now() WHERE device_id = $1 AND week_date = $2',
+      [deviceId, weekDate, cost]
+    );
+  } else if (source === 'bonus') {
+    await pool.query(
+      'UPDATE device_ai_usage SET bonus_credits = bonus_credits + $3, updated_at = now() WHERE device_id = $1 AND week_date = $2',
+      [deviceId, weekDate, cost]
+    );
   }
 }
 
@@ -585,6 +699,9 @@ module.exports = {
   getWeeklyUsed,
   reserveUsage,
   refundUsage,
+  getDeviceUsage,
+  reserveDeviceUsage,
+  refundDeviceUsage,
   addBonusCredits,
   ensureReferralCode,
   redeemReferral,

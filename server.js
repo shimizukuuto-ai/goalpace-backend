@@ -10,6 +10,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 require('./community').register({ app, db, auth });
+require('./sharedGoals').register({ app, db, auth }); // Iteration 3: 共有目標（UNVERIFIED — auth.js/iap.js が無いため Render で確認すること）
 app.use(express.static('public'));
 
 // ==========================================================================
@@ -197,6 +198,21 @@ function parseJson(text) {
   return JSON.parse(cleaned.slice(start, end + 1));
 }
 
+// Iteration 4 (C5の根本対策): LLMが返す日付のバリデーション。形式不正・過去の日付は
+// 期日(fallback)に寄せる。TINKOの端末で「達成可能日 2025-06-15」が出たのは、
+// AI生成の自由テキスト日付が無検証で保存・表示されていたため。クライアント側にも
+// 表示ガードがあるが、発生源のサーバー側で止める。
+function sanitizeProjectedDate(value, fallback) {
+  const fb = typeof fallback === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(fallback) ? fallback : null;
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return fb;
+  const d = new Date(value + 'T00:00:00');
+  if (Number.isNaN(d.getTime())) return fb;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  if (d < today) return fb;
+  return value;
+}
+
 // ==========================================================================
 // 認証 & レート制限ミドルウェア
 // ==========================================================================
@@ -264,6 +280,57 @@ function setUsageHeaders(res, usage) {
   res.setHeader('X-AI-Resets-At', new Date(usage.resetsAt).toISOString());
 }
 
+// ==========================================================================
+// デバイス単位のAI利用枠（Iteration 4・班B。認証オフ時専用）
+//   原因：REQUIRE_AUTH=false のとき aiQuota が `return next()` で枠を
+//   数えず、X-AI-* ヘッダーも返さなかったため、クライアントの楽観的-1が
+//   直後の getUsage() 再取得（サーバー値は used=0 のまま）で上書きされ、
+//   バッジが「残り50回」のまま減らないバグになっていた。
+//   修正：認証オフでも X-Device-Id ヘッダーの匿名デバイスIDで週次quotaを
+//   数え、ヘッダーも返す。デバイスIDは認証ではない（誰でも送れる匿名キー）。
+//   認証オン時の挙動は一切変えない（下の aiQuota の前半を参照）。
+// ==========================================================================
+
+// クライアントが送る匿名デバイスID。形式が不正なら null（＝未特定）。
+function resolveDeviceId(req) {
+  const raw = req.headers['x-device-id'];
+  if (typeof raw !== 'string') return null;
+  const id = raw.trim();
+  return /^[A-Za-z0-9_-]{8,64}$/.test(id) ? id : null;
+}
+
+// デバイス用の利用状況（buildUsage のデバイス版）。アカウント側の特典
+// （シェア・招待）はアカウント紐づけのためデバイス枠には付かない。
+// お試し期間は「その端末の初回利用から7日間」（first_seen が起点）。
+// 未使用の端末は inTrial=true・used=0・trialEndsAt=null を返す
+// （trialEndsAt は初回利用時に first_seen+7日で確定する）。
+async function buildDeviceUsage(deviceId) {
+  const d = await db.getDeviceUsage(deviceId);
+  const firstSeenAt = d.firstSeen ? new Date(d.firstSeen).getTime() : null;
+  const trialEndsAt = firstSeenAt ? new Date(firstSeenAt + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000) : null;
+  const inTrial = !trialEndsAt || trialEndsAt.getTime() > Date.now();
+  const baseLimit = inTrial ? Math.max(FREE_WEEKLY_LIMIT, FREE_TRIAL_WEEKLY_LIMIT) : FREE_WEEKLY_LIMIT;
+  const weeklyLimit = baseLimit; // デバイス枠にシェア特典は付かない
+  const remainingWeekly = Math.max(0, weeklyLimit - d.used);
+  return {
+    plan: 'free',
+    inTrial,
+    trialEndsAt: trialEndsAt ? trialEndsAt.toISOString() : null,
+    weeklyLimit,
+    baseLimit,
+    used: d.used,
+    remainingWeekly,
+    bonusCredits: d.bonusCredits,
+    remaining: remainingWeekly + d.bonusCredits,
+    resetsAt: d.nextReset,
+    shareBonusAmount: SHARE_BONUS_AMOUNT,
+    shareClaimedThisWeek: false,
+    referralBonus: { friend: REFERRAL_FRIEND_BONUS, owner: REFERRAL_OWNER_BONUS, ownerMax: REFERRAL_OWNER_MAX },
+    referralCount: 0,
+    referredBy: false,
+  };
+}
+
 // 暴走防止: 1ユーザーあたり10分に30リクエストまで（コスト0の質問生成の乱用対策も兼ねる）
 const rateBuckets = new Map();
 function burstLimited(userId) {
@@ -280,20 +347,68 @@ function burstLimited(userId) {
 
 // AI機能用ミドルウェア。cost 回分を週の枠（足りなければボーナス残高）から予約する。
 // AIが失敗(4xx/5xx)で終わったら、予約した分は自動で返す。
+// 【認証オン】従来通りアカウント単位で数える（挙動は変えない）。
+// 【認証オフ】デバイス単位（X-Device-Id）で数える。デバイスIDが無い旧クライアントや
+//   DB無効時は従来通りスキップする（数えない・ヘッダー無し＝旧挙動）。
 function aiQuota(cost) {
   return async function (req, res, next) {
-    if (!REQUIRE_AUTH) return next();
-    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
-    try {
-      const user = await db.getUserById(req.userId);
-      if (!user) return res.status(401).json({ error: 'User not found' });
+    if (REQUIRE_AUTH) {
+      if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
+      try {
+        const user = await db.getUserById(req.userId);
+        if (!user) return res.status(401).json({ error: 'User not found' });
 
-      if (burstLimited(String(user.id))) {
+        if (burstLimited(String(user.id))) {
+          return res.status(429).json({ error: 'リクエストが多すぎます。少し待ってからもう一度お試しください。', code: 'RATE_LIMITED' });
+        }
+
+        const usage0 = await buildUsage(user);
+        const reservation = await db.reserveUsage(user.id, req.path, cost, usage0.weeklyLimit);
+        if (!reservation) {
+          return res.status(429).json({
+            error: '今週のAI利用回数の上限に達しました。',
+            code: 'AI_QUOTA_EXCEEDED',
+            usage: usage0,
+          });
+        }
+
+        const usage = await buildUsage(user);
+        setUsageHeaders(res, usage);
+
+        // AIが失敗(4xx/5xx)で終わったら、予約した分は自動で返す。
+        // 通信が途中で切れてクライアントに結果が届かなかった場合も返す
+        // （その場合は 'finish' が発火しないため 'close' で拾う。
+        //  refundUsage は DELETE ... RETURNING ベースで冪等なので二重返却は起きない）。
+        let refunded = false;
+        const refundOnce = () => {
+          if (refunded || cost <= 0) return;
+          refunded = true;
+          db.refundUsage(reservation.eventId).catch((e) => console.error('refundUsage failed:', e));
+        };
+        res.on('finish', () => {
+          if (res.statusCode >= 400) refundOnce();
+        });
+        res.on('close', () => {
+          if (!res.writableEnded) refundOnce();
+        });
+        next();
+      } catch (err) {
+        console.error('AI usage limit check failed:', err);
+        res.status(503).json({ error: 'AI usage service is temporarily unavailable' });
+      }
+      return;
+    }
+
+    // ---- 認証オフ：デバイス単位の quota（Iteration 4） ----
+    if (!db.DB_ENABLED) return next();
+    const deviceId = resolveDeviceId(req);
+    if (!deviceId) return next(); // 旧クライアント（X-Device-Id 無し）は旧挙動のまま
+    try {
+      if (burstLimited('device:' + deviceId)) {
         return res.status(429).json({ error: 'リクエストが多すぎます。少し待ってからもう一度お試しください。', code: 'RATE_LIMITED' });
       }
-
-      const usage0 = await buildUsage(user);
-      const reservation = await db.reserveUsage(user.id, req.path, cost, usage0.weeklyLimit);
+      const usage0 = await buildDeviceUsage(deviceId);
+      const reservation = await db.reserveDeviceUsage(deviceId, cost, usage0.weeklyLimit);
       if (!reservation) {
         return res.status(429).json({
           error: '今週のAI利用回数の上限に達しました。',
@@ -301,14 +416,22 @@ function aiQuota(cost) {
           usage: usage0,
         });
       }
-
-      const usage = await buildUsage(user);
+      const usage = await buildDeviceUsage(deviceId);
       setUsageHeaders(res, usage);
 
+      // 失敗時の返金はアカウント版と同じ仕組み（冪等な refundDeviceUsage）。
+      let refunded = false;
+      const refundOnce = () => {
+        if (refunded || cost <= 0) return;
+        refunded = true;
+        db.refundDeviceUsage(deviceId, reservation.weekDate, cost, reservation.source)
+          .catch((e) => console.error('refundDeviceUsage failed:', e));
+      };
       res.on('finish', () => {
-        if (res.statusCode >= 400 && cost > 0) {
-          db.refundUsage(reservation.eventId).catch((e) => console.error('refundUsage failed:', e));
-        }
+        if (res.statusCode >= 400) refundOnce();
+      });
+      res.on('close', () => {
+        if (!res.writableEnded) refundOnce();
       });
       next();
     } catch (err) {
@@ -333,13 +456,25 @@ app.get('/health', (req, res) => {
   });
 });
 
+// サーバーバージョン（Iteration 4・班G）。クライアント起動時に叩き、
+// 共有目標ルートが無い古いサーバーかどうかを判定する。
+// 旧サーバーにはこのエンドポイント自体が無い（＝404になる）ので、
+// クライアントは「/api/version が 404 ＝古いサーバー」と判定できる。
+// /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
+app.get('/api/version', (req, res) => {
+  res.status(200).json({
+    version: '4.0.0',
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true },
+  });
+});
+
 app.get('/', (req, res) => {
   res.json({
     app: 'GoalPace & ControlCenter Unified Backend',
     status: 'running',
     aiProvider: IS_OPENROUTER ? 'OpenRouter' : (API_KEY ? 'Groq (Llama 3)' : 'unconfigured'),
     model: DEFAULT_MODEL,
-    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/health']
+    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/health']
   });
 });
 
@@ -384,15 +519,19 @@ app.post('/api/plan', optionalAuth, quotaStd, async (req, res) => {
   try {
     const { goal, targetDate, baselineAnswers } = req.body;
     const locale = resolveLocale(req);
+    // ユーザーがこの目標に紐づけた自分のタスク（タイトル＋完了状態）。計画に組み込み、重複させない
+    const linkedTasks = Array.isArray(req.body?.linkedTasks)
+      ? req.body.linkedTasks.filter((t) => t && typeof t.title === 'string' && t.title.trim()).slice(0, 30)
+      : [];
 
     if (MOCK_MODE || !API_KEY) {
       console.log('[MOCK] /api/plan');
-      return res.json(MOCK_PLAN);
+      return res.json({ ...MOCK_PLAN, achievableDate: sanitizeProjectedDate(MOCK_PLAN.achievableDate, targetDate) });
     }
 
     const system = `あなたは目標達成・行動設計のエキスパートです。
 ユーザーの目標、期日、現状の回答をもとに、達成可能性（feasibility）を科学的・現実的に分析し、週ごとの具体的なタスクロードマップを作成してください。
-
+${linkedTasks.length > 0 ? '【紐づけたタスクについて】\nユーザーがこの目標に紐づけた自分のタスクがあります。計画の一部として必ず考慮し、同じ内容のタスクを tasks に重複して入れないこと。紐づけたタスクを補う具体的なタスクを中心に組み立てること。\n' : ''}
 必ず以下のJSON形式のみで出力してください：
 {
   "feasibility": "現実的" または "やや厳しい" または "非現実的",
@@ -412,9 +551,12 @@ app.post('/api/plan', optionalAuth, quotaStd, async (req, res) => {
 }
 ※ tasksは最初の2〜4週分の具体的なアクションを出力してください。各タスクはControlCenterのToDoリストに登録しやすい具体的で実行可能な粒度にしてください。` + localeSuffix(locale);
 
-    const userText = `【目標】: ${goal}\n【達成期日】: ${targetDate}\n【現状の回答】: ${JSON.stringify(baselineAnswers)}`;
+    const userText = `【目標】: ${goal}\n【達成期日】: ${targetDate}\n【現状の回答】: ${JSON.stringify(baselineAnswers)}${linkedTasks.length ? `\n【紐づけた自分のタスク（${linkedTasks.length}件）】: ${JSON.stringify(linkedTasks.map(t => ({ title: t.title, completed: Boolean(t.completed) })))}` : ''}`;
     const text = await callGroqLlama({ system, userText, locale });
     const parsed = parseJson(text);
+    if (parsed && typeof parsed === 'object') {
+      parsed.achievableDate = sanitizeProjectedDate(parsed.achievableDate, targetDate);
+    }
     res.json(parsed);
   } catch (err) {
     console.error('/api/plan error:', err);
@@ -430,7 +572,7 @@ app.post('/api/checkin', optionalAuth, quotaStd, async (req, res) => {
 
     if (MOCK_MODE || !API_KEY) {
       console.log('[MOCK] /api/checkin');
-      return res.json(MOCK_CHECKIN);
+      return res.json({ ...MOCK_CHECKIN, projectedFinishDate: sanitizeProjectedDate(MOCK_CHECKIN.projectedFinishDate, project && project.targetDate) });
     }
 
     let scheduleElapsedPercent = null;
@@ -462,6 +604,9 @@ app.post('/api/checkin', optionalAuth, quotaStd, async (req, res) => {
 - customTasks が多すぎて期日に収まらない場合は、messageでそのことを率直に伝えること
 - updatedTasks には customTasks を書き写さず、それを補う新しい具体的タスクだけを入れること
 
+【紐づけたタスクについて】
+linkedTasks は、ユーザーがタスク一覧からこの目標に紐づけた自分のタスク（タイトル＋今日の完了状態）です。customTasks と同じ扱いで、計画の一部として必ず考慮し、重複するタスクを updatedTasks に入れないこと。完了済みは達成済み、未完了は未着手としてペースの評価に反映すること。
+
 必ず以下のJSON形式のみで出力してください：
 {
   "onTrack": true または false,
@@ -474,8 +619,12 @@ app.post('/api/checkin', optionalAuth, quotaStd, async (req, res) => {
 }` + localeSuffix(locale);
 
     const customTaskList = Array.isArray(project && project.customTasks) ? project.customTasks.filter((t) => typeof t === 'string').slice(0, 30) : [];
+    const linkedTaskList = Array.isArray(req.body?.linkedTasks)
+      ? req.body.linkedTasks.filter((t) => t && typeof t.title === 'string' && t.title.trim()).slice(0, 30)
+      : [];
     const userText = `【プロジェクト情報】: ${JSON.stringify(project)}
 【ユーザー自作のタスク（${customTaskList.length}件）】: ${customTaskList.length ? JSON.stringify(customTaskList) : 'なし'}
+【紐づけたタスク（${linkedTaskList.length}件）】: ${linkedTaskList.length ? JSON.stringify(linkedTaskList.map(t => ({ title: t.title, completed: Boolean(t.completed) }))) : 'なし'}
 【本日のチェックイン】: ${JSON.stringify(todayEntry)}
 【経過日数の割合目安】: ${scheduleElapsedPercent === null ? '不明' : scheduleElapsedPercent + '%'}
 【前回のAI進捗率】: ${previousCurrentPacePercent === null ? '初回' : previousCurrentPacePercent + '%'}`;
@@ -488,6 +637,9 @@ app.post('/api/checkin', optionalAuth, quotaStd, async (req, res) => {
     }
     if (typeof parsed.currentPacePercent === 'number') {
       parsed.currentPacePercent = Math.min(Math.max(parsed.currentPacePercent, 0), 130);
+    }
+    if (parsed && typeof parsed === 'object') {
+      parsed.projectedFinishDate = sanitizeProjectedDate(parsed.projectedFinishDate, project && project.targetDate);
     }
 
     res.json(parsed);
@@ -897,13 +1049,30 @@ app.post('/api/discover/generate', optionalAuth, quotaStd, async (req, res) => {
 // ==========================================================================
 // 利用状況 / シェア特典 / 友達招待
 // ==========================================================================
-app.get('/api/usage', auth.requireAuth, async (req, res) => {
+// 利用状況。認証オン時は従来通りアカウント単位（auth.requireAuth 経由）。
+// 認証オフ時（Iteration 4）はデバイス単位：X-Device-Id ヘッダーで数える。
+// 旧クライアント（ヘッダー無し）には 400 を返す（数える鍵が無いため）。
+app.get('/api/usage', async (req, res) => {
+  if (REQUIRE_AUTH) {
+    return auth.requireAuth(req, res, async () => {
+      try {
+        if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
+        const user = await db.getUserById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Account not found' });
+        const usage = await buildUsage(user);
+        usage.referralCode = await db.ensureReferralCode(user.id);
+        res.json({ usage });
+      } catch (err) {
+        console.error('/api/usage error:', err);
+        res.status(503).json({ error: 'Usage service is unavailable' });
+      }
+    });
+  }
   try {
     if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
-    const user = await db.getUserById(req.userId);
-    if (!user) return res.status(404).json({ error: 'Account not found' });
-    const usage = await buildUsage(user);
-    usage.referralCode = await db.ensureReferralCode(user.id);
+    const deviceId = resolveDeviceId(req);
+    if (!deviceId) return res.status(400).json({ error: 'X-Device-Id header is required' });
+    const usage = await buildDeviceUsage(deviceId);
     res.json({ usage });
   } catch (err) {
     console.error('/api/usage error:', err);
