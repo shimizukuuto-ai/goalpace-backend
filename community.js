@@ -19,6 +19,12 @@ const SUPPORT_MESSAGE =
   'ひとりで抱え込まず、話せる窓口もあります。#いのちSOS 0120-061-338、よりそいホットライン 0120-279-338（どちらも24時間・無料）。' +
   'いま危険を感じるときは110番か119番へ。海外にいる場合は、その国の緊急通報番号へ連絡してください。';
 
+// V12.10・B班: SUPPORT_MESSAGE の英語版。窓口の番号は日本国内のもののためそのまま載せ、国外の場合は現地の緊急番号へ案内する。
+const SUPPORT_MESSAGE_EN =
+  'Thank you for writing about how you feel. For safety, this cannot be shared publicly (your draft has not been deleted).' +
+  ' Please don\'t carry this alone — help is available. In Japan: #いのちSOS 0120-061-338, よりそいホットライン 0120-279-338 (both 24 hours, free).' +
+  ' If you feel in danger right now, call 110 or 119. If you are outside Japan, contact your local emergency number.';
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS community_posts (
   id BIGSERIAL PRIMARY KEY,
@@ -107,13 +113,13 @@ function hasPhone(raw) {
 function screenText(text) {
   const raw = nfkc(text).toLowerCase();
   const sq = squash(text);
-  if (CARE_WORDS.some((w) => sq.includes(w))) return { ok: false, code: 'CARE', error: SUPPORT_MESSAGE };
-  if (URL_RE.test(raw)) return { ok: false, code: 'LINK', error: 'URLやリンクは載せられません。' };
+  if (CARE_WORDS.some((w) => sq.includes(w))) return { ok: false, code: 'CARE', error: SUPPORT_MESSAGE, errorJa: SUPPORT_MESSAGE, errorEn: SUPPORT_MESSAGE_EN };
+  if (URL_RE.test(raw)) return { ok: false, code: 'LINK', error: 'URLやリンクは載せられません。', errorJa: 'URLやリンクは載せられません。', errorEn: 'URLs and links are not allowed.' };
   if (EMAIL_RE.test(raw) || HANDLE_RE.test(raw) || hasPhone(raw) || CONTACT_WORDS.some((w) => sq.includes(w))) {
-    return { ok: false, code: 'CONTACT', error: 'メールアドレス・電話番号・IDなどの連絡先は載せられません。' };
+    return { ok: false, code: 'CONTACT', error: 'メールアドレス・電話番号・IDなどの連絡先は載せられません。', errorJa: 'メールアドレス・電話番号・IDなどの連絡先は載せられません。', errorEn: 'Contact details such as email addresses, phone numbers, or IDs are not allowed.' };
   }
   if (BAD_WORDS.some((w) => sq.includes(w))) {
-    return { ok: false, code: 'BAD', error: '攻撃的な言葉が含まれています。言い方を変えてみてください。' };
+    return { ok: false, code: 'BAD', error: '攻撃的な言葉が含まれています。言い方を変えてみてください。', errorJa: '攻撃的な言葉が含まれています。言い方を変えてみてください。', errorEn: 'It contains aggressive language. Please rephrase it.' };
   }
   return { ok: true };
 }
@@ -167,22 +173,22 @@ function register({ app, db, auth }) {
   }
 
   const wrap = (fn) => async (req, res) => {
-    if (!enabled()) return res.status(503).json({ error: '現在、投稿機能は一時停止しています。' });
+    if (!enabled()) return res.status(503).json({ error: '現在、投稿機能は一時停止しています。', errorJa: '現在、投稿機能は一時停止しています。', errorEn: 'Posting is paused right now.' });
     try { await ensure(); await fn(req, res); }
     catch (e) {
       console.error('[community]', req.method, req.path, e.message);
-      if (!res.headersSent) res.status(503).json({ error: 'いま利用できません。時間をおいて再度お試しください。' });
+      if (!res.headersSent) res.status(503).json({ error: 'いま利用できません。時間をおいて再度お試しください。', errorJa: 'いま利用できません。時間をおいて再度お試しください。', errorEn: 'Unavailable right now. Please try again later.' });
     }
   };
 
   async function writeGuard(req, res) {
     const uid = String(req.userId);
     if (limited('w:' + uid, 20, 10 * 60 * 1000)) {
-      res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
+      res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
       return true;
     }
     const banned = await q('SELECT 1 FROM community_bans WHERE user_id = $1', [uid]);
-    if (banned.rowCount) { res.status(403).json({ error: 'このアカウントは投稿できません。' }); return true; }
+    if (banned.rowCount) { res.status(403).json({ error: 'このアカウントは投稿できません。', errorJa: 'このアカウントは投稿できません。', errorEn: 'This account cannot post.' }); return true; }
     return false;
   }
 
@@ -239,9 +245,9 @@ function register({ app, db, auth }) {
     const title = oneLine(b.title, TITLE_MAX);
     const body = clean(b.body, BODY_MAX);
     const category = oneLine(b.categoryName, 20);
-    if (!kind) return res.status(400).json({ error: '「自分の話」か「小論文」を選んでください。' });
-    if (!title) return res.status(400).json({ error: 'タイトルを入力してください。' });
-    if (Array.from(body).length < BODY_MIN) return res.status(400).json({ error: `本文は${BODY_MIN}文字以上で書いてください。` });
+    if (!kind) return res.status(400).json({ error: '「自分の話」か「小論文」を選んでください。', errorJa: '「自分の話」か「小論文」を選んでください。', errorEn: 'Please choose "My story" or "Essay".' });
+    if (!title) return res.status(400).json({ error: 'タイトルを入力してください。', errorJa: 'タイトルを入力してください。', errorEn: 'Please enter a title.' });
+    if (Array.from(body).length < BODY_MIN) return res.status(400).json({ error: `本文は${BODY_MIN}文字以上で書いてください。`, errorJa: `本文は${BODY_MIN}文字以上で書いてください。`, errorEn: `Please write at least ${BODY_MIN} characters.` });
     let basedOn = null;
     if (b.basedOn && typeof b.basedOn === 'object') {
       const k = ['lesson', 'book', 'quiz'].includes(b.basedOn.kind) ? b.basedOn.kind : null;
@@ -251,15 +257,15 @@ function register({ app, db, auth }) {
     }
     for (const text of [title, body]) {
       const s = screenText(text);
-      if (!s.ok) return res.status(422).json({ error: s.error, code: s.code });
+      if (!s.ok) return res.status(422).json({ error: s.error, errorJa: s.error, errorEn: s.errorEn, code: s.code });
     }
     const day = await q("SELECT COUNT(*)::int AS c FROM community_posts WHERE owner_user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'", [uid]);
-    if (day.rows[0].c >= POSTS_PER_DAY) return res.status(429).json({ error: `投稿は1日${POSTS_PER_DAY}件までです。明日また書いてください。` });
+    if (day.rows[0].c >= POSTS_PER_DAY) return res.status(429).json({ error: `投稿は1日${POSTS_PER_DAY}件までです。明日また書いてください。`, errorJa: `投稿は1日${POSTS_PER_DAY}件までです。明日また書いてください。`, errorEn: `You can post up to ${POSTS_PER_DAY} posts a day. Please write again tomorrow.` });
     const live = await q('SELECT COUNT(*)::int AS c FROM community_posts WHERE owner_user_id = $1 AND deleted = FALSE', [uid]);
-    if (live.rows[0].c >= MAX_LIVE_POSTS) return res.status(400).json({ error: `公開できる投稿は${MAX_LIVE_POSTS}件までです。古い投稿を消してください。` });
+    if (live.rows[0].c >= MAX_LIVE_POSTS) return res.status(400).json({ error: `公開できる投稿は${MAX_LIVE_POSTS}件までです。古い投稿を消してください。`, errorJa: `公開できる投稿は${MAX_LIVE_POSTS}件までです。古い投稿を消してください。`, errorEn: `You can publish up to ${MAX_LIVE_POSTS} posts. Please delete an old post.` });
     const hash = crypto.createHash('sha256').update(squash(body)).digest('hex');
     const dup = await q("SELECT 1 FROM community_posts WHERE body_hash = $1 AND created_at > NOW() - INTERVAL '7 days' LIMIT 1", [hash]);
-    if (dup.rowCount) return res.status(400).json({ error: '同じ内容の投稿がすでにあります。' });
+    if (dup.rowCount) return res.status(400).json({ error: '同じ内容の投稿がすでにあります。', errorJa: '同じ内容の投稿がすでにあります。', errorEn: 'A post with the same content already exists.' });
     const ins = await q(
       `INSERT INTO community_posts (owner_user_id, author_name, kind, title, body, body_hash, category_name, based_on, ai_assisted)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
@@ -304,17 +310,17 @@ function register({ app, db, auth }) {
   // いいね / バッド（1人1票。同じ値をもう一度送ると取り消し、逆の値を送ると切り替え）
   //   body: { value: 1 | -1 | 0 }  0 = 取り消し
   app.post('/api/posts/:id/react', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
-    if (limited('react:' + req.userId, 60, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
+    if (limited('react:' + req.userId, 60, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
     const uid = String(req.userId);
     const value = Number(req.body && req.body.value);
-    if (![1, -1, 0].includes(value)) return res.status(400).json({ error: '不正な値です。' });
+    if (![1, -1, 0].includes(value)) return res.status(400).json({ error: '不正な値です。', errorJa: '不正な値です。', errorEn: 'Invalid value.' });
     const client = await db.pool.connect();
     try {
       await client.query('BEGIN');
       const post = await client.query('SELECT owner_user_id FROM community_posts WHERE id = $1 AND deleted = FALSE FOR UPDATE', [req.params.id]);
-      if (!post.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: '投稿が見つかりません。' }); }
-      if (post.rows[0].owner_user_id === uid) { await client.query('ROLLBACK'); return res.status(400).json({ error: '自分の投稿には押せません。' }); }
+      if (!post.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: '投稿が見つかりません。', errorJa: '投稿が見つかりません。', errorEn: 'Post not found.' }); }
+      if (post.rows[0].owner_user_id === uid) { await client.query('ROLLBACK'); return res.status(400).json({ error: '自分の投稿には押せません。', errorJa: '自分の投稿には押せません。', errorEn: 'You cannot react to your own post.' }); }
       if (value === 0) {
         await client.query('DELETE FROM post_reactions WHERE post_id = $1 AND user_id = $2', [req.params.id, uid]);
       } else {
@@ -346,18 +352,18 @@ function register({ app, db, auth }) {
   }));
 
   app.delete('/api/posts/:id', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const r = await q('UPDATE community_posts SET deleted = TRUE, hidden = TRUE WHERE id = $1 AND owner_user_id = $2 AND deleted = FALSE RETURNING id', [req.params.id, String(req.userId)]);
-    if (!r.rowCount) return res.status(404).json({ error: '投稿が見つかりません。' });
+    if (!r.rowCount) return res.status(404).json({ error: '投稿が見つかりません。', errorJa: '投稿が見つかりません。', errorEn: 'Post not found.' });
     res.json({ ok: true });
   }));
 
   app.post('/api/posts/:id/report', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
-    if (limited('r:' + req.userId, 20, 3600 * 1000)) return res.status(429).json({ error: '通報が多すぎます。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
+    if (limited('r:' + req.userId, 20, 3600 * 1000)) return res.status(429).json({ error: '通報が多すぎます。', errorJa: '通報が多すぎます。', errorEn: 'Too many reports.' });
     const out = await reportTarget('post', req.params.id, String(req.userId), oneLine(req.body && req.body.reason, 100) || '不適切な内容');
-    if (out === 'missing') return res.status(404).json({ error: '投稿が見つかりません。' });
-    if (out === 'own') return res.status(400).json({ error: '自分の投稿は通報できません。' });
+    if (out === 'missing') return res.status(404).json({ error: '投稿が見つかりません。', errorJa: '投稿が見つかりません。', errorEn: 'Post not found.' });
+    if (out === 'own') return res.status(400).json({ error: '自分の投稿は通報できません。', errorJa: '自分の投稿は通報できません。', errorEn: 'You cannot report your own post.' });
     res.json({ ok: true });
   }));
 
@@ -388,14 +394,14 @@ function register({ app, db, auth }) {
     if (await writeGuard(req, res)) return;
     const uid = String(req.userId);
     const text = oneLine(req.body && req.body.text, COMMENT_MAX * 3);
-    if (!text) return res.status(400).json({ error: 'コメントを入力してください。' });
-    if (Array.from(text).length > COMMENT_MAX) return res.status(400).json({ error: `${COMMENT_MAX}文字までです。` });
+    if (!text) return res.status(400).json({ error: 'コメントを入力してください。', errorJa: 'コメントを入力してください。', errorEn: 'Please enter a comment.' });
+    if (Array.from(text).length > COMMENT_MAX) return res.status(400).json({ error: `${COMMENT_MAX}文字までです。`, errorJa: `${COMMENT_MAX}文字までです。`, errorEn: `Up to ${COMMENT_MAX} characters.` });
     const s = screenText(text);
-    if (!s.ok) return res.status(422).json({ error: s.error, code: s.code });
+    if (!s.ok) return res.status(422).json({ error: s.error, errorJa: s.error, errorEn: s.errorEn, code: s.code });
     const week = weekStartJst();
     const cur = await q('SELECT updated_at FROM rank_comments WHERE owner_user_id = $1 AND week_start = $2', [uid, week]);
     if (cur.rowCount && Date.now() - new Date(cur.rows[0].updated_at).getTime() < COMMENT_COOLDOWN_MS) {
-      return res.status(429).json({ error: '少し時間をおいてから書き直してください。' });
+      return res.status(429).json({ error: '少し時間をおいてから書き直してください。', errorJa: '少し時間をおいてから書き直してください。', errorEn: 'Please wait a while, then write it again.' });
     }
     await q(
       `INSERT INTO rank_comments (owner_user_id, author_name, week_start, body) VALUES ($1, $2, $3, $4)
@@ -410,11 +416,11 @@ function register({ app, db, auth }) {
   }));
 
   app.post('/api/rank-comments/:id/report', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
-    if (limited('r:' + req.userId, 20, 3600 * 1000)) return res.status(429).json({ error: '通報が多すぎます。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
+    if (limited('r:' + req.userId, 20, 3600 * 1000)) return res.status(429).json({ error: '通報が多すぎます。', errorJa: '通報が多すぎます。', errorEn: 'Too many reports.' });
     const out = await reportTarget('comment', req.params.id, String(req.userId), oneLine(req.body && req.body.reason, 100) || '不適切な内容');
-    if (out === 'missing') return res.status(404).json({ error: 'コメントが見つかりません。' });
-    if (out === 'own') return res.status(400).json({ error: '自分のコメントは通報できません。' });
+    if (out === 'missing') return res.status(404).json({ error: 'コメントが見つかりません。', errorJa: 'コメントが見つかりません。', errorEn: 'Comment not found.' });
+    if (out === 'own') return res.status(400).json({ error: '自分のコメントは通報できません。', errorJa: '自分のコメントは通報できません。', errorEn: 'You cannot report your own comment.' });
     res.json({ ok: true });
   }));
 
@@ -422,11 +428,11 @@ function register({ app, db, auth }) {
   app.post('/api/community/block', auth.requireAuth, wrap(async (req, res) => {
     const table = TABLES[req.body && req.body.type];
     const id = req.body && req.body.id;
-    if (!table || !isId(id)) return res.status(400).json({ error: '不正なリクエストです。' });
+    if (!table || !isId(id)) return res.status(400).json({ error: '不正なリクエストです。', errorJa: '不正なリクエストです。', errorEn: 'Invalid request.' });
     const r = await q(`SELECT owner_user_id FROM ${table} WHERE id = $1`, [id]);
-    if (!r.rowCount) return res.status(404).json({ error: '見つかりません。' });
+    if (!r.rowCount) return res.status(404).json({ error: '見つかりません。', errorJa: '見つかりません。', errorEn: 'Not found.' });
     const owner = r.rows[0].owner_user_id;
-    if (owner === String(req.userId)) return res.status(400).json({ error: '自分はブロックできません。' });
+    if (owner === String(req.userId)) return res.status(400).json({ error: '自分はブロックできません。', errorJa: '自分はブロックできません。', errorEn: 'You cannot block yourself.' });
     await q('INSERT INTO community_blocks (blocker_user_id, blocked_user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [String(req.userId), owner]);
     res.json({ ok: true });
   }));
@@ -445,9 +451,9 @@ function register({ app, db, auth }) {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   }
   const adminWrap = (fn) => async (req, res) => {
-    if (!adminOk(req)) return res.status(404).json({ error: 'Not found' });
+    if (!adminOk(req)) return res.status(404).json({ error: 'Not found', errorJa: '見つかりません。', errorEn: 'Not found' });
     try { await ensure(); await fn(req, res); }
-    catch (e) { console.error('[community-admin]', e.message); res.status(500).json({ error: 'failed' }); }
+    catch (e) { console.error('[community-admin]', e.message); res.status(500).json({ error: 'failed', errorJa: '失敗しました。', errorEn: 'failed' }); }
   };
 
   app.get('/api/admin/community/queue', adminWrap(async (req, res) => {
@@ -465,7 +471,7 @@ function register({ app, db, auth }) {
   app.post('/api/admin/community/:type/:id/:action', adminWrap(async (req, res) => {
     const { type, id, action } = req.params;
     const table = TABLES[type];
-    if (!table || !isId(id)) return res.status(400).json({ error: 'bad request' });
+    if (!table || !isId(id)) return res.status(400).json({ error: 'bad request', errorJa: '不正なリクエストです。', errorEn: 'bad request' });
     if (action === 'hide') {
       await q(`UPDATE ${table} SET hidden = TRUE, hidden_reason = 'admin' WHERE id = $1`, [id]);
     } else if (action === 'unhide') {
@@ -475,14 +481,14 @@ function register({ app, db, auth }) {
       if (type === 'post') await q('UPDATE community_posts SET deleted = TRUE, hidden = TRUE WHERE id = $1', [id]);
       else await q('DELETE FROM rank_comments WHERE id = $1', [id]);
     } else {
-      return res.status(400).json({ error: 'bad action' });
+      return res.status(400).json({ error: 'bad action', errorJa: '不正な操作です。', errorEn: 'bad action' });
     }
     res.json({ ok: true });
   }));
 
   app.post('/api/admin/community-ban', adminWrap(async (req, res) => {
     const userId = String((req.body && req.body.userId) || '');
-    if (!userId) return res.status(400).json({ error: 'userId required' });
+    if (!userId) return res.status(400).json({ error: 'userId required', errorJa: 'userIdが必要です。', errorEn: 'userId required' });
     if (req.body.ban === false) {
       await q('DELETE FROM community_bans WHERE user_id = $1', [userId]);
     } else {

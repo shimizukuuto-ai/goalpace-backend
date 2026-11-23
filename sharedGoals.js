@@ -393,7 +393,7 @@ function register({ app, db, auth }) {
         // DB 自体が無効/未接続なら種別を分ける（再試行しても直らない系）。
         const code = e.message === 'DB disabled' ? 'DB_UNAVAILABLE' : 'SERVER_ERROR';
         res.status(503).json({
-          error: 'いま利用できません。時間をおいて再度お試しください。',
+          error: 'いま利用できません。時間をおいて再度お試しください。', errorJa: 'いま利用できません。時間をおいて再度お試しください。', errorEn: 'Unavailable right now. Please try again later.',
           code,
           requestId,
         });
@@ -772,7 +772,7 @@ function register({ app, db, auth }) {
   // ================= 共有目標の作成・参加 =================
   app.post('/api/shared-goals', auth.requireAuth, wrap(async (req, res) => {
     const uid = String(req.userId);
-    if (limited('sg:create:' + uid, 10, 3600 * 1000)) return res.status(429).json({ error: '作成が多すぎます。少し時間をおいてください。' });
+    if (limited('sg:create:' + uid, 10, 3600 * 1000)) return res.status(429).json({ error: '作成が多すぎます。少し時間をおいてください。', errorJa: '作成が多すぎます。少し時間をおいてください。', errorEn: 'You are creating too many. Please wait a while.' });
     const b = req.body || {};
     const title = oneLine(b.title, 80);
     const target = Number(b.target);
@@ -791,15 +791,15 @@ function register({ app, db, auth }) {
     const startValue = kind === 'value' && Number.isFinite(startValueRaw) ? startValueRaw : null;
     const achievementRule = normalizeAchievementRule(b.achievementRule);
     const deadline = String(b.deadline || '');
-    if (!title) return res.status(400).json({ error: 'タイトルを入力してください。' });
-    if (!Number.isFinite(target) || target <= 0 || target > 100000000) return res.status(400).json({ error: '目標量は 0 より大きい数で入力してください。' });
-    if (kind === 'habit' && target > 365) return res.status(400).json({ error: '習慣の目標日数は 365日までです。' });
-    if (startValue !== null && Math.abs(startValue) > 100000000) return res.status(400).json({ error: '開始値は 1億以内の数で入力してください。' });
-    if (kind === 'value' && startValue !== null && startValue === target) return res.status(400).json({ error: '開始値と目標値は違う値にしてください。' });
-    if (!parseDay(deadline)) return res.status(400).json({ error: '期限は YYYY-MM-DD で入力してください。' });
-    if (parseDay(deadline) < parseDay(new Date().toISOString().slice(0, 10))) return res.status(400).json({ error: '期限は今日以降にしてください。' });
+    if (!title) return res.status(400).json({ error: 'タイトルを入力してください。', errorJa: 'タイトルを入力してください。', errorEn: 'Please enter a title.' });
+    if (!Number.isFinite(target) || target <= 0 || target > 100000000) return res.status(400).json({ error: '目標量は 0 より大きい数で入力してください。', errorJa: '目標量は 0 より大きい数で入力してください。', errorEn: 'Please enter a target greater than 0.' });
+    if (kind === 'habit' && target > 365) return res.status(400).json({ error: '習慣の目標日数は 365日までです。', errorJa: '習慣の目標日数は 365日までです。', errorEn: 'Habit goals are up to 365 days.' });
+    if (startValue !== null && Math.abs(startValue) > 100000000) return res.status(400).json({ error: '開始値は 1億以内の数で入力してください。', errorJa: '開始値は 1億以内の数で入力してください。', errorEn: 'Please enter a start value within 100,000,000.' });
+    if (kind === 'value' && startValue !== null && startValue === target) return res.status(400).json({ error: '開始値と目標値は違う値にしてください。', errorJa: '開始値と目標値は違う値にしてください。', errorEn: 'The start value and target value must be different.' });
+    if (!parseDay(deadline)) return res.status(400).json({ error: '期限は YYYY-MM-DD で入力してください。', errorJa: '期限は YYYY-MM-DD で入力してください。', errorEn: 'Please enter the deadline as YYYY-MM-DD.' });
+    if (parseDay(deadline) < parseDay(new Date().toISOString().slice(0, 10))) return res.status(400).json({ error: '期限は今日以降にしてください。', errorJa: '期限は今日以降にしてください。', errorEn: 'Please set the deadline to today or later.' });
     const mine = await q('SELECT COUNT(*)::int AS n FROM shared_goals WHERE owner_user_id = $1', [uid]);
-    if (mine.rows[0].n >= 20) return res.status(400).json({ error: '作れる共有目標は20個までです。' });
+    if (mine.rows[0].n >= 20) return res.status(400).json({ error: '作れる共有目標は20個までです。', errorJa: '作れる共有目標は20個までです。', errorEn: 'You can create up to 20 shared goals.' });
     // 目標＋メンバーの INSERT は1トランザクションにする（v5 修正）。
     // 修正前は INSERT 成功後に loadGoalDetail が例外を投げると目標だけ
     // DB に残り、次回作成時も20個上限のカウントに入る「ゴミ目標」に
@@ -831,7 +831,7 @@ function register({ app, db, auth }) {
     }
     if (!goalId) {
       return res.status(503).json({
-        error: '招待コードを作れませんでした。もう一度お試しください。',
+        error: '招待コードを作れませんでした。もう一度お試しください。', errorJa: '招待コードを作れませんでした。もう一度お試しください。', errorEn: 'Could not create an invite code. Please try again.',
         code: 'SERVER_ERROR',
         requestId: req.requestId,
       });
@@ -849,7 +849,7 @@ function register({ app, db, auth }) {
     if (!detail) {
       await q('DELETE FROM shared_goals WHERE id = $1', [goalId]).catch(() => {});
       return res.status(503).json({
-        error: 'いま利用できません。時間をおいて再度お試しください。',
+        error: 'いま利用できません。時間をおいて再度お試しください。', errorJa: 'いま利用できません。時間をおいて再度お試しください。', errorEn: 'Unavailable right now. Please try again later.',
         code: 'SERVER_ERROR',
         requestId: req.requestId,
       });
@@ -970,11 +970,11 @@ function register({ app, db, auth }) {
   }));
 
   app.get('/api/shared-goals/:id', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const detail = await loadGoalDetail(req.params.id, uid);
-    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
     res.json({ goal: detail });
   }));
@@ -988,12 +988,12 @@ function register({ app, db, auth }) {
   //   （直近7日分。貢献の text が空のときはクライアントが量から作る）。
   //   どちらかのテーブルが無い環境でも空の一覧を返す（503 にしない）。
   app.get('/api/shared-goals/:id/members/:userId/activity', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const targetUserId = String(req.params.userId || '');
-    if (!targetUserId || targetUserId.length > 80) return res.status(400).json({ error: '不正なIDです。' });
+    if (!targetUserId || targetUserId.length > 80) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
-    if (!(await isMember(req.params.id, targetUserId))) return res.status(404).json({ error: 'メンバーが見つかりません。' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
+    if (!(await isMember(req.params.id, targetUserId))) return res.status(404).json({ error: 'メンバーが見つかりません。', errorJa: 'メンバーが見つかりません。', errorEn: 'Member not found.' });
     const limit = Math.max(1, Math.min(20, Math.floor(Number(req.query.limit) || 10)));
     const events = [];
     try {
@@ -1038,20 +1038,20 @@ function register({ app, db, auth }) {
   app.post('/api/shared-goals/join', auth.requireAuth, wrap(async (req, res) => {
     const uid = String(req.userId);
     const code = String((req.body && req.body.code) || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (code.length !== 8) return res.status(400).json({ error: '招待コードは8文字です。', code: 'INVALID_CODE' });
+    if (code.length !== 8) return res.status(400).json({ error: '招待コードは8文字です。', errorJa: '招待コードは8文字です。', errorEn: 'The invite code is 8 characters.', code: 'INVALID_CODE' });
     const g = await q('SELECT id FROM shared_goals WHERE invite_code = $1', [code]);
-    if (!g.rowCount) return res.status(404).json({ error: '招待コードが見つかりません。', code: 'INVALID_CODE' });
+    if (!g.rowCount) return res.status(404).json({ error: '招待コードが見つかりません。', errorJa: '招待コードが見つかりません。', errorEn: 'Invite code not found.', code: 'INVALID_CODE' });
     const goalId = g.rows[0].id;
     if (await isMember(goalId, uid)) {
       const detail = await loadGoalDetail(goalId, uid);
-      if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+      if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
       detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
       return res.json({ goal: detail, alreadyMember: true });
     }
     const cnt = await q('SELECT COUNT(*)::int AS n FROM shared_goal_members WHERE goal_id = $1', [goalId]);
     // V12.4・A班: メンバー上限は 10人。既存の10人超の目標は追い出さない
     // （新規参加だけ止める）。
-    if (cnt.rows[0].n >= SHARED_GOAL_MAX_MEMBERS) return res.status(400).json({ error: 'この共有目標は満員です（10人まで）。' });
+    if (cnt.rows[0].n >= SHARED_GOAL_MAX_MEMBERS) return res.status(400).json({ error: 'この共有目標は満員です（10人まで）。', errorJa: 'この共有目標は満員です（10人まで）。', errorEn: 'This shared goal is full (up to 10 members).' });
     await q('INSERT INTO shared_goal_members (goal_id, user_id, display_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
       [goalId, uid, await displayNameFor(uid)]);
     // V12.4・A班: 過去にキックされた記録があれば、再参加で消す
@@ -1061,7 +1061,7 @@ function register({ app, db, auth }) {
     // ため、declare ルールの達成状態を数え直す（失敗しても参加は成功）。
     try { await refreshDeclareStatus(goalId); } catch (_) {}
     const detail = await loadGoalDetail(goalId, uid);
-    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = false;
     res.json({ goal: detail, alreadyMember: false });
   }));
@@ -1070,22 +1070,22 @@ function register({ app, db, auth }) {
   // 同じ（{ goal, alreadyMember }）。対象がプライベートなら 403。
   // メンバー数上限（10人）はコード参加と同じものを適用する。
   app.post('/api/shared-goals/:id/join-public', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
     const g = await q('SELECT id, visibility FROM shared_goals WHERE id = $1', [req.params.id]);
-    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     if (normalizeVisibility(g.rows[0].visibility) !== 'public') {
-      return res.status(403).json({ error: 'この共有目標は招待コードでのみ参加できます。' });
+      return res.status(403).json({ error: 'この共有目標は招待コードでのみ参加できます。', errorJa: 'この共有目標は招待コードでのみ参加できます。', errorEn: 'This shared goal can only be joined with an invite code.' });
     }
     const goalId = g.rows[0].id;
     if (await isMember(goalId, uid)) {
       const detail = await loadGoalDetail(goalId, uid);
-      if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+      if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
       detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
       return res.json({ goal: detail, alreadyMember: true });
     }
     const cnt = await q('SELECT COUNT(*)::int AS n FROM shared_goal_members WHERE goal_id = $1', [goalId]);
-    if (cnt.rows[0].n >= SHARED_GOAL_MAX_MEMBERS) return res.status(400).json({ error: 'この共有目標は満員です（10人まで）。' });
+    if (cnt.rows[0].n >= SHARED_GOAL_MAX_MEMBERS) return res.status(400).json({ error: 'この共有目標は満員です（10人まで）。', errorJa: 'この共有目標は満員です（10人まで）。', errorEn: 'This shared goal is full (up to 10 members).' });
     await q('INSERT INTO shared_goal_members (goal_id, user_id, display_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
       [goalId, uid, await displayNameFor(uid)]);
     // V12.4・A班: 過去にキックされた記録があれば、再参加で消す。
@@ -1094,7 +1094,7 @@ function register({ app, db, auth }) {
     // ため、declare ルールの達成状態を数え直す（失敗しても参加は成功）。
     try { await refreshDeclareStatus(goalId); } catch (_) {}
     const detail = await loadGoalDetail(goalId, uid);
-    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = false;
     res.json({ goal: detail, alreadyMember: false });
   }));
@@ -1112,9 +1112,9 @@ function register({ app, db, auth }) {
 
   // コメント一覧（古い順。通報で非表示になったものは出さない）。
   app.get('/api/shared-goals/:id/comments', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const limit = Math.max(1, Math.min(50, Math.floor(Number(req.query.limit) || 20)));
     const offset = Math.max(0, Math.floor(Number(req.query.offset) || 0));
     const rows = await q(
@@ -1130,15 +1130,15 @@ function register({ app, db, auth }) {
 
   // コメントを投稿する（最大500文字。community.js の screenText と同じチェック）。
   app.post('/api/shared-goals/:id/comments', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (limited('sg:comment:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (limited('sg:comment:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const text = clean(req.body && req.body.text, 500);
-    if (!text) return res.status(400).json({ error: 'コメントを入力してください。' });
-    if (Array.from(text).length > 500) return res.status(400).json({ error: 'コメントは500文字までです。' });
+    if (!text) return res.status(400).json({ error: 'コメントを入力してください。', errorJa: 'コメントを入力してください。', errorEn: 'Please enter a comment.' });
+    if (Array.from(text).length > 500) return res.status(400).json({ error: 'コメントは500文字までです。', errorJa: 'コメントは500文字までです。', errorEn: 'Comments are up to 500 characters.' });
     const s = screenText(text);
-    if (!s.ok) return res.status(422).json({ error: s.error, code: s.code });
+    if (!s.ok) return res.status(422).json({ error: s.error, errorJa: s.error, errorEn: s.errorEn, code: s.code });
     const ins = await q(
       `INSERT INTO shared_goal_comments (goal_id, user_id, display_name, avatar_color, text)
        VALUES ($1, $2, $3, $4, $5)
@@ -1151,15 +1151,15 @@ function register({ app, db, auth }) {
   // 記録する（投稿 'post'・ランキングひとこと 'comment' と区別できる値）。
   // 通報3件で自動非表示（community.js の REPORT_HIDE_THRESHOLD と同じ3件）。
   app.post('/api/shared-goals/:id/comments/:commentId/report', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id) || !isId(req.params.commentId)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id) || !isId(req.params.commentId)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (limited('sg:comment-report:' + uid, 20, 3600 * 1000)) return res.status(429).json({ error: '通報が多すぎます。' });
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (limited('sg:comment-report:' + uid, 20, 3600 * 1000)) return res.status(429).json({ error: '通報が多すぎます。', errorJa: '通報が多すぎます。', errorEn: 'Too many reports.' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const found = await q(
       'SELECT id, user_id FROM shared_goal_comments WHERE id = $1 AND goal_id = $2',
       [req.params.commentId, req.params.id]);
-    if (!found.rowCount) return res.status(404).json({ error: 'コメントが見つかりません。' });
-    if (found.rows[0].user_id === uid) return res.status(400).json({ error: '自分のコメントは通報できません。' });
+    if (!found.rowCount) return res.status(404).json({ error: 'コメントが見つかりません。', errorJa: 'コメントが見つかりません。', errorEn: 'Comment not found.' });
+    if (found.rows[0].user_id === uid) return res.status(400).json({ error: '自分のコメントは通報できません。', errorJa: '自分のコメントは通報できません。', errorEn: 'You cannot report your own comment.' });
     const reason = oneLine(req.body && req.body.reason, 100) || '不適切な内容';
     const ins = await q(
       `INSERT INTO community_reports (target_type, target_id, reporter_user_id, reason)
@@ -1233,10 +1233,10 @@ function register({ app, db, auth }) {
   // 貢献を記録する。日付はサーバー当日固定（過去への書き込みで
   // ペース% を操作できないようにする）。amount は 1 回分の追加量。
   app.post('/api/shared-goals/:id/contribute', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (limited('sg:contrib:' + uid, 60, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (limited('sg:contrib:' + uid, 60, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const note = clean(req.body && req.body.note, 100);
     // V12・D班: 習慣チェックは 1日1回・amount=1 だけ（チェック＝1日達成）。
     // 複数回・まとめての記録で日数を水増しできないようにする。
@@ -1251,7 +1251,7 @@ function register({ app, db, auth }) {
     // 貢献は増えない）。値が無い・数値でない場合は 400。
     if (goalKind === 'value') {
       const value = Number(req.body && req.body.value);
-      if (!Number.isFinite(value) || Math.abs(value) > 100000000) return res.status(400).json({ error: '現在の値を入力してください。' });
+      if (!Number.isFinite(value) || Math.abs(value) > 100000000) return res.status(400).json({ error: '現在の値を入力してください。', errorJa: '現在の値を入力してください。', errorEn: 'Please enter the current value.' });
       const today = await q(
         `SELECT COUNT(*)::int AS n FROM shared_goal_contributions
          WHERE goal_id = $1 AND user_id = $2 AND contributed_date = CURRENT_DATE`,
@@ -1267,19 +1267,19 @@ function register({ app, db, auth }) {
       // V12.7・A班: 'auto' ルールの達成判定（value は記録した値で判定）。
       await maybeAutoAchieve(req.params.id, value);
       const detail = await loadGoalDetail(req.params.id, uid);
-      if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+      if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
       detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
       return res.json({ goal: detail });
     }
     const amount = Number(req.body && req.body.amount);
-    if (!Number.isFinite(amount) || amount <= 0 || amount > 100000000) return res.status(400).json({ error: '記録する量は 0 より大きい数で入力してください。' });
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 100000000) return res.status(400).json({ error: '記録する量は 0 より大きい数で入力してください。', errorJa: '記録する量は 0 より大きい数で入力してください。', errorEn: 'Please enter an amount greater than 0.' });
     if (goalKind === 'habit') {
-      if (amount !== 1) return res.status(400).json({ error: '習慣チェックは1日1回です。' });
+      if (amount !== 1) return res.status(400).json({ error: '習慣チェックは1日1回です。', errorJa: '習慣チェックは1日1回です。', errorEn: 'Habit check-ins are once a day.' });
       const today = await q(
         `SELECT COUNT(*)::int AS n FROM shared_goal_contributions
          WHERE goal_id = $1 AND user_id = $2 AND contributed_date = CURRENT_DATE`,
         [req.params.id, uid]);
-      if (today.rows[0].n > 0) return res.status(400).json({ error: '今日はすでにチェック済みです。' });
+      if (today.rows[0].n > 0) return res.status(400).json({ error: '今日はすでにチェック済みです。', errorJa: '今日はすでにチェック済みです。', errorEn: 'Already checked in today.' });
     }
     await q(
       `INSERT INTO shared_goal_contributions (goal_id, user_id, amount, note) VALUES ($1, $2, $3, $4)`,
@@ -1287,7 +1287,7 @@ function register({ app, db, auth }) {
     // V12.7・A班: 'auto' ルールの達成判定（count/time/habit は貢献合計で判定）。
     await maybeAutoAchieve(req.params.id, null);
     const detail = await loadGoalDetail(req.params.id, uid);
-    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
     res.json({ goal: detail });
   }));
@@ -1298,14 +1298,14 @@ function register({ app, db, auth }) {
   // （未指定は true＝申告する）。申告・取り消しのたびに全員申告かを
   // 数え直し、達成状態を更新する。返すのは更新後の目標全体。
   app.post('/api/shared-goals/:id/declare', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (limited('sg:declare:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (limited('sg:declare:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const g = await q('SELECT achievement_rule FROM shared_goals WHERE id = $1', [req.params.id]);
-    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     if (normalizeAchievementRule(g.rows[0].achievement_rule) !== 'declare') {
-      return res.status(400).json({ error: 'この共有目標は申告で達成を決める目標ではありません。' });
+      return res.status(400).json({ error: 'この共有目標は申告で達成を決める目標ではありません。', errorJa: 'この共有目標は申告で達成を決める目標ではありません。', errorEn: 'This shared goal does not decide completion by declaration.' });
     }
     const declared = (req.body && req.body.declared) !== false;
     if (declared) {
@@ -1316,7 +1316,7 @@ function register({ app, db, auth }) {
     }
     await refreshDeclareStatus(req.params.id);
     const detail = await loadGoalDetail(req.params.id, uid);
-    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
     res.json({ goal: detail });
   }));
@@ -1327,18 +1327,18 @@ function register({ app, db, auth }) {
   // 期日を過ぎてから入力を促す（作成者が期日前に合否を決めたい場合もあるため、
   // サーバー側では期日を強制しない）。
   app.post('/api/shared-goals/:id/deadline-result', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (limited('sg:deadline-result:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (limited('sg:deadline-result:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const g = await q('SELECT owner_user_id, achievement_rule FROM shared_goals WHERE id = $1', [req.params.id]);
-    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。' });
-    if (g.rows[0].owner_user_id !== uid) return res.status(403).json({ error: '期日の結果を入れられるのは作成者だけです。' });
+    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
+    if (g.rows[0].owner_user_id !== uid) return res.status(403).json({ error: '期日の結果を入れられるのは作成者だけです。', errorJa: '期日の結果を入れられるのは作成者だけです。', errorEn: 'Only the creator can enter the deadline result.' });
     if (normalizeAchievementRule(g.rows[0].achievement_rule) !== 'deadline') {
-      return res.status(400).json({ error: 'この共有目標は期日で達成を決める目標ではありません。' });
+      return res.status(400).json({ error: 'この共有目標は期日で達成を決める目標ではありません。', errorJa: 'この共有目標は期日で達成を決める目標ではありません。', errorEn: 'This shared goal does not decide completion by deadline.' });
     }
     const result = (req.body && req.body.result) ?? null;
-    if (result !== 'pass' && result !== 'fail' && result !== null) return res.status(400).json({ error: '結果は合格・不合格のどちらかで入力してください。' });
+    if (result !== 'pass' && result !== 'fail' && result !== null) return res.status(400).json({ error: '結果は合格・不合格のどちらかで入力してください。', errorJa: '結果は合格・不合格のどちらかで入力してください。', errorEn: 'Please enter a result of pass or fail.' });
     if (result === null) {
       await q(`UPDATE shared_goals SET deadline_result = NULL, deadline_result_at = NULL,
                achievement_status = 'active', achieved_at = NULL WHERE id = $1`, [req.params.id]);
@@ -1350,7 +1350,7 @@ function register({ app, db, auth }) {
                achievement_status = 'failed', achieved_at = NULL WHERE id = $1`, [req.params.id]);
     }
     const detail = await loadGoalDetail(req.params.id, uid);
-    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = true;
     res.json({ goal: detail });
   }));
@@ -1361,30 +1361,30 @@ function register({ app, db, auth }) {
   // サーバー当日固定。過去日への書き込みでごまかせない）。
   // 作成はメンバー誰でも可（上限30件）。削除はオーナーのみ。
   app.post('/api/shared-goals/:id/tasks', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (limited('sg:task:' + uid, 20, 3600 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (limited('sg:task:' + uid, 20, 3600 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const title = oneLine(req.body && req.body.title, 80);
-    if (!title) return res.status(400).json({ error: 'タスクを入力してください。' });
+    if (!title) return res.status(400).json({ error: 'タスクを入力してください。', errorJa: 'タスクを入力してください。', errorEn: 'Please enter a task.' });
     const cnt = await q('SELECT COUNT(*)::int AS n FROM shared_goal_tasks WHERE goal_id = $1', [req.params.id]);
-    if (cnt.rows[0].n >= 30) return res.status(400).json({ error: '共通タスクは30個までです。' });
+    if (cnt.rows[0].n >= 30) return res.status(400).json({ error: '共通タスクは30個までです。', errorJa: '共通タスクは30個までです。', errorEn: 'You can add up to 30 shared tasks.' });
     await q('INSERT INTO shared_goal_tasks (goal_id, title, created_by) VALUES ($1, $2, $3)',
       [req.params.id, title, uid]);
     const detail = await loadGoalDetail(req.params.id, uid);
-    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
     res.json({ goal: detail });
   }));
 
   // 今日の完了をトグルする（押すたびに完了⇄未完了）。返すのは更新後の目標全体。
   app.post('/api/shared-goals/:id/tasks/:taskId/toggle', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id) || !isId(req.params.taskId)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id) || !isId(req.params.taskId)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (limited('sg:task-toggle:' + uid, 120, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (limited('sg:task-toggle:' + uid, 120, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const t = await q('SELECT id FROM shared_goal_tasks WHERE id = $1 AND goal_id = $2', [req.params.taskId, req.params.id]);
-    if (!t.rowCount) return res.status(404).json({ error: 'タスクが見つかりません。' });
+    if (!t.rowCount) return res.status(404).json({ error: 'タスクが見つかりません。', errorJa: 'タスクが見つかりません。', errorEn: 'Task not found.' });
     const done = await q(
       'SELECT 1 FROM shared_goal_task_completions WHERE task_id = $1 AND user_id = $2 AND completed_date = CURRENT_DATE',
       [req.params.taskId, uid]);
@@ -1396,23 +1396,23 @@ function register({ app, db, auth }) {
         [req.params.taskId, uid]);
     }
     const detail = await loadGoalDetail(req.params.id, uid);
-    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
     res.json({ goal: detail });
   }));
 
   // 共通タスクの削除（オーナーのみ。完了履歴は CASCADE で消える）。
   app.delete('/api/shared-goals/:id/tasks/:taskId', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id) || !isId(req.params.taskId)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id) || !isId(req.params.taskId)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const g = await q('SELECT owner_user_id FROM shared_goals WHERE id = $1', [req.params.id]);
-    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。' });
-    if (g.rows[0].owner_user_id !== uid) return res.status(403).json({ error: 'タスクを削除できるのは作成者だけです。' });
+    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
+    if (g.rows[0].owner_user_id !== uid) return res.status(403).json({ error: 'タスクを削除できるのは作成者だけです。', errorJa: 'タスクを削除できるのは作成者だけです。', errorEn: 'Only the creator can delete tasks.' });
     const del = await q('DELETE FROM shared_goal_tasks WHERE id = $1 AND goal_id = $2', [req.params.taskId, req.params.id]);
-    if (!del.rowCount) return res.status(404).json({ error: 'タスクが見つかりません。' });
+    if (!del.rowCount) return res.status(404).json({ error: 'タスクが見つかりません。', errorJa: 'タスクが見つかりません。', errorEn: 'Task not found.' });
     const detail = await loadGoalDetail(req.params.id, uid);
-    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = true;
     res.json({ goal: detail });
   }));
@@ -1420,9 +1420,9 @@ function register({ app, db, auth }) {
   // 抜ける。オーナーが抜けたら最も古いメンバーへ所有権を移す。
   // 最後の1人が抜けたら目標ごと消す（貢献・スタンプは CASCADE で消える）。
   app.post('/api/shared-goals/:id/leave', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const client = await db.pool.connect();
     try {
       await client.query('BEGIN');
@@ -1431,7 +1431,7 @@ function register({ app, db, auth }) {
       // 数え直しがずれるため。貢献履歴・コメントは従来通り残す）。
       await client.query('DELETE FROM shared_goal_declarations WHERE goal_id = $1 AND user_id = $2', [req.params.id, uid]);
       const g = await client.query('SELECT owner_user_id FROM shared_goals WHERE id = $1 FOR UPDATE', [req.params.id]);
-      if (!g.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: '共有目標が見つかりません。' }); }
+      if (!g.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' }); }
       const rest = await client.query('SELECT user_id FROM shared_goal_members WHERE goal_id = $1 ORDER BY joined_at ASC LIMIT 1', [req.params.id]);
       if (!rest.rowCount) {
         await client.query('DELETE FROM shared_goals WHERE id = $1', [req.params.id]);
@@ -1463,16 +1463,16 @@ function register({ app, db, auth }) {
   //     自体は成功させる＝ベストエフォート）。
   //   - 返すのは更新後の目標全体（クライアントは差し替えるだけ）。
   app.post('/api/shared-goals/:id/kick', auth.requireAuth, wrap(async (req, res) => {
-    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = String(req.userId);
-    if (limited('sg:kick:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
+    if (limited('sg:kick:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
     const targetUserId = String((req.body && req.body.userId) || '').trim();
-    if (!targetUserId) return res.status(400).json({ error: '外すメンバーを指定してください。' });
-    if (targetUserId === uid) return res.status(400).json({ error: '自分自身を外すことはできません。オーナーが抜けるときは「抜ける」を使ってください。' });
+    if (!targetUserId) return res.status(400).json({ error: '外すメンバーを指定してください。', errorJa: '外すメンバーを指定してください。', errorEn: 'Please choose a member to remove.' });
+    if (targetUserId === uid) return res.status(400).json({ error: '自分自身を外すことはできません。オーナーが抜けるときは「抜ける」を使ってください。', errorJa: '自分自身を外すことはできません。オーナーが抜けるときは「抜ける」を使ってください。', errorEn: 'You cannot remove yourself. If the owner wants to leave, use "Leave".' });
     const g = await q('SELECT id, owner_user_id, title FROM shared_goals WHERE id = $1', [req.params.id]);
-    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。' });
-    if (g.rows[0].owner_user_id !== uid) return res.status(403).json({ error: 'メンバーを外せるのは作成者だけです。' });
-    if (!(await isMember(req.params.id, targetUserId))) return res.status(404).json({ error: 'そのメンバーは見つかりません。' });
+    if (!g.rowCount) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
+    if (g.rows[0].owner_user_id !== uid) return res.status(403).json({ error: 'メンバーを外せるのは作成者だけです。', errorJa: 'メンバーを外せるのは作成者だけです。', errorEn: 'Only the creator can remove members.' });
+    if (!(await isMember(req.params.id, targetUserId))) return res.status(404).json({ error: 'そのメンバーは見つかりません。', errorJa: 'そのメンバーは見つかりません。', errorEn: 'That member was not found.' });
     const client = await db.pool.connect();
     try {
       await client.query('BEGIN');
@@ -1509,7 +1509,7 @@ function register({ app, db, auth }) {
         [uid, ownerName, `共有目標「${String(g.rows[0].title).slice(0, 40)}」からメンバーを外しました`]);
     } catch (_) { /* 記録できなくてもキックは成功 */ }
     const detail = await loadGoalDetail(req.params.id, uid);
-    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = true;
     res.json({ goal: detail });
   }));

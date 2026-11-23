@@ -100,7 +100,7 @@ function register({ app, db, auth }) {
     try { await ensure(); await fn(req, res); }
     catch (e) {
       console.error('[activity]', req.method, req.path, e.message);
-      if (!res.headersSent) res.status(503).json({ error: 'いま利用できません。時間をおいて再度お試しください。' });
+      if (!res.headersSent) res.status(503).json({ error: 'いま利用できません。時間をおいて再度お試しください。', errorJa: 'いま利用できません。時間をおいて再度お試しください。', errorEn: 'Unavailable right now. Please try again later.' });
     }
   };
 
@@ -132,16 +132,16 @@ function register({ app, db, auth }) {
   // 連続投稿の暴走防止：1人10分に30件まで。公開オフの人は hidden で保存。
   app.post('/api/activity', wrap(async (req, res) => {
     const uid = resolveIdentity(req);
-    if (!uid || uid.length > 80) return res.status(400).json({ error: 'Invalid userId' });
+    if (!uid || uid.length > 80) return res.status(400).json({ error: 'Invalid userId', errorJa: 'ユーザーIDが正しくありません。', errorEn: 'Invalid userId' });
     if (limited('act:' + uid, 30, 10 * 60 * 1000)) {
-      return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
+      return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
     }
     const kind = ACTIVITY_KINDS.includes(req.body?.kind) ? req.body.kind : '';
     const text = clean(req.body?.text, TEXT_MAX);
-    if (!kind) return res.status(400).json({ error: 'kind を指定してください。' });
-    if (!text) return res.status(400).json({ error: '内容を入力してください。' });
+    if (!kind) return res.status(400).json({ error: 'kind を指定してください。', errorJa: 'kind を指定してください。', errorEn: 'Please specify a kind.' });
+    if (!text) return res.status(400).json({ error: '内容を入力してください。', errorJa: '内容を入力してください。', errorEn: 'Please enter the content.' });
     const s = screenText(text);
-    if (!s.ok) return res.status(422).json({ error: s.error, code: s.code });
+    if (!s.ok) return res.status(422).json({ error: s.error, errorJa: s.error, errorEn: s.errorEn, code: s.code });
     let hidden = false;
     try {
       const profile = await db.getOnlineProfile(uid);
@@ -194,12 +194,12 @@ function register({ app, db, auth }) {
   // ================= 通報（3件で自動非表示。community_reports を流用） =================
   app.post('/api/activity/:id/report', auth.requireAuth, wrap(async (req, res) => {
     const id = String(req.params.id || '');
-    if (!/^\d{1,18}$/.test(id)) return res.status(400).json({ error: '不正なIDです。' });
-    if (limited('act-r:' + req.userId, 20, 3600 * 1000)) return res.status(429).json({ error: '通報が多すぎます。' });
+    if (!/^\d{1,18}$/.test(id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
+    if (limited('act-r:' + req.userId, 20, 3600 * 1000)) return res.status(429).json({ error: '通報が多すぎます。', errorJa: '通報が多すぎます。', errorEn: 'Too many reports.' });
     const reporter = String(req.userId);
     const found = await q('SELECT owner_user_id FROM activity_events WHERE id = $1', [id]);
-    if (!found.rowCount) return res.status(404).json({ error: '見つかりません。' });
-    if (found.rows[0].owner_user_id === reporter) return res.status(400).json({ error: '自分の投稿は通報できません。' });
+    if (!found.rowCount) return res.status(404).json({ error: '見つかりません。', errorJa: '見つかりません。', errorEn: 'Not found.' });
+    if (found.rows[0].owner_user_id === reporter) return res.status(400).json({ error: '自分の投稿は通報できません。', errorJa: '自分の投稿は通報できません。', errorEn: 'You cannot report your own post.' });
     const reason = clean(req.body?.reason, 100) || '不適切な内容';
     const ins = await q(
       `INSERT INTO community_reports (target_type, target_id, reporter_user_id, reason)

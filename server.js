@@ -362,20 +362,20 @@ function burstLimited(userId) {
 function aiQuota(cost) {
   return async function (req, res, next) {
     if (REQUIRE_AUTH) {
-      if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
+      if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable', errorJa: 'アカウントのサービスは利用できません。', errorEn: 'Account service is unavailable' });
       try {
         const user = await db.getUserById(req.userId);
-        if (!user) return res.status(401).json({ error: 'User not found' });
+        if (!user) return res.status(401).json({ error: 'User not found', errorJa: 'ユーザーが見つかりません。', errorEn: 'User not found' });
 
         if (burstLimited(String(user.id))) {
-          return res.status(429).json({ error: 'リクエストが多すぎます。少し待ってからもう一度お試しください。', code: 'RATE_LIMITED' });
+          return res.status(429).json({ error: 'リクエストが多すぎます。少し待ってからもう一度お試しください。', errorJa: 'リクエストが多すぎます。少し待ってからもう一度お試しください。', errorEn: 'Too many requests. Please wait a moment and try again.', code: 'RATE_LIMITED' });
         }
 
         const usage0 = await buildUsage(user);
         const reservation = await db.reserveUsage(user.id, req.path, cost, usage0.weeklyLimit);
         if (!reservation) {
           return res.status(429).json({
-            error: '今週のAI利用回数の上限に達しました。',
+            error: '今週のAI利用回数の上限に達しました。', errorJa: '今週のAI利用回数の上限に達しました。', errorEn: 'You have used all of this week\'s AI uses.',
             code: 'AI_QUOTA_EXCEEDED',
             usage: usage0,
           });
@@ -403,7 +403,7 @@ function aiQuota(cost) {
         next();
       } catch (err) {
         console.error('AI usage limit check failed:', err);
-        res.status(503).json({ error: 'AI usage service is temporarily unavailable' });
+        res.status(503).json({ error: 'AI usage service is temporarily unavailable', errorJa: 'AI利用回数のサービスは一時的に利用できません。', errorEn: 'AI usage service is temporarily unavailable' });
       }
       return;
     }
@@ -414,13 +414,13 @@ function aiQuota(cost) {
     if (!deviceId) return next(); // 旧クライアント（X-Device-Id 無し）は旧挙動のまま
     try {
       if (burstLimited('device:' + deviceId)) {
-        return res.status(429).json({ error: 'リクエストが多すぎます。少し待ってからもう一度お試しください。', code: 'RATE_LIMITED' });
+        return res.status(429).json({ error: 'リクエストが多すぎます。少し待ってからもう一度お試しください。', errorJa: 'リクエストが多すぎます。少し待ってからもう一度お試しください。', errorEn: 'Too many requests. Please wait a moment and try again.', code: 'RATE_LIMITED' });
       }
       const usage0 = await buildDeviceUsage(deviceId);
       const reservation = await db.reserveDeviceUsage(deviceId, cost, usage0.weeklyLimit);
       if (!reservation) {
         return res.status(429).json({
-          error: '今週のAI利用回数の上限に達しました。',
+          error: '今週のAI利用回数の上限に達しました。', errorJa: '今週のAI利用回数の上限に達しました。', errorEn: 'You have used all of this week\'s AI uses.',
           code: 'AI_QUOTA_EXCEEDED',
           usage: usage0,
         });
@@ -445,7 +445,7 @@ function aiQuota(cost) {
       next();
     } catch (err) {
       console.error('AI usage limit check failed:', err);
-      res.status(503).json({ error: 'AI usage service is temporarily unavailable' });
+      res.status(503).json({ error: 'AI usage service is temporarily unavailable', errorJa: 'AI利用回数のサービスは一時的に利用できません。', errorEn: 'AI usage service is temporarily unavailable' });
     }
   };
 }
@@ -478,8 +478,9 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.6.0',
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true },
+    version: '7.7.0',
+    // V12.10・B班: bilingualErrors — エラー応答に errorJa / errorEn を併記する。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true },
   });
 });
 
@@ -670,7 +671,7 @@ app.post('/api/flashcards', optionalAuth, quotaFlashcards, async (req, res) => {
     const count = Math.max(1, Math.min(10, Math.floor(Number(req.body?.count) || 5)));
     const locale = resolveLocale(req);
     if (!topic || topic.length > 300) {
-      return res.status(400).json({ error: 'Topic must contain 1–300 characters.' });
+      return res.status(400).json({ error: 'Topic must contain 1–300 characters.', errorJa: 'テーマは1〜300文字で入力してください。', errorEn: 'Topic must contain 1–300 characters.' });
     }
     if (MOCK_MODE || !API_KEY) return res.json({ cards: [] });
 
@@ -685,7 +686,7 @@ app.post('/api/flashcards', optionalAuth, quotaFlashcards, async (req, res) => {
     res.json({ cards });
   } catch (err) {
     console.error('/api/flashcards error:', err);
-    res.status(500).json({ error: 'Could not generate flashcards right now.' });
+    res.status(500).json({ error: 'Could not generate flashcards right now.', errorJa: 'カードを今は作れませんでした。', errorEn: 'Could not generate flashcards right now.' });
   }
 });
 
@@ -695,7 +696,7 @@ app.post('/api/routine/suggest', optionalAuth, quotaStd, async (req, res) => {
     const goal = typeof req.body?.goal === 'string' ? req.body.goal.trim() : '';
     const locale = resolveLocale(req);
     if (!goal || goal.length > 300) {
-      return res.status(400).json({ error: 'Goal must contain 1–300 characters.' });
+      return res.status(400).json({ error: 'Goal must contain 1–300 characters.', errorJa: '目標は1〜300文字で入力してください。', errorEn: 'Goal must contain 1–300 characters.' });
     }
     if (MOCK_MODE || !API_KEY) return res.json({ blocks: [] });
 
@@ -710,7 +711,7 @@ app.post('/api/routine/suggest', optionalAuth, quotaStd, async (req, res) => {
     res.json({ blocks });
   } catch (err) {
     console.error('/api/routine/suggest error:', err);
-    res.status(500).json({ error: 'Could not create a routine right now.' });
+    res.status(500).json({ error: 'Could not create a routine right now.', errorJa: 'ルーティンを今は作れませんでした。', errorEn: 'Could not create a routine right now.' });
   }
 });
 
@@ -872,10 +873,10 @@ app.post('/api/shared-goals/suggest-structure', optionalAuth, quotaStd, async (r
     const locale = resolveLocale(req);
     const deadline = typeof req.body?.deadline === 'string' ? req.body.deadline.trim() : '';
     if (!goal || goal.length > 300) {
-      return res.status(400).json({ error: 'Goal must contain 1–300 characters.' });
+      return res.status(400).json({ error: 'Goal must contain 1–300 characters.', errorJa: '目標は1〜300文字で入力してください。', errorEn: 'Goal must contain 1–300 characters.' });
     }
     if (deadline && !/^\d{4}-\d{2}-\d{2}$/.test(deadline)) {
-      return res.status(400).json({ error: 'Deadline must be YYYY-MM-DD.' });
+      return res.status(400).json({ error: 'Deadline must be YYYY-MM-DD.', errorJa: '期限は YYYY-MM-DD で入力してください。', errorEn: 'Deadline must be YYYY-MM-DD.' });
     }
 
     const fallback = mockSharedGoalStructure(goal, deadline || undefined, locale);
@@ -934,7 +935,7 @@ Examples:
     res.json(sanitizeSharedGoalStructure(parsed, fallback));
   } catch (err) {
     console.error('/api/shared-goals/suggest-structure error:', err);
-    res.status(500).json({ error: 'Could not suggest a goal structure right now.' });
+    res.status(500).json({ error: 'Could not suggest a goal structure right now.', errorJa: '目標の形を今は提案できませんでした。', errorEn: 'Could not suggest a goal structure right now.' });
   }
 });
 
@@ -974,11 +975,11 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
   try {
     const userId = onlineIdentity(req);
     if (!userId || userId.length > 80) {
-      return res.status(400).json({ error: 'Invalid userId' });
+      return res.status(400).json({ error: 'Invalid userId', errorJa: 'ユーザーIDが正しくありません。', errorEn: 'Invalid userId' });
     }
     const goals = Array.isArray(req.body?.goals) ? req.body.goals : [];
     if (goals.length > 30) {
-      return res.status(400).json({ error: 'Too many goals' });
+      return res.status(400).json({ error: 'Too many goals', errorJa: '目標が多すぎます。', errorEn: 'Too many goals' });
     }
     const today = todayJst();
     const { weekDate } = await db.getWeekWindow();
@@ -990,13 +991,13 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
       const actual = Number(g?.actual) || 0;
       const deadline = String(g?.deadline || '');
       if (!Number.isFinite(target) || target <= 0 || target > 100000000) {
-        return res.status(400).json({ error: 'Invalid goal target' });
+        return res.status(400).json({ error: 'Invalid goal target', errorJa: '目標の目標値が正しくありません。', errorEn: 'Invalid goal target' });
       }
       if (!Number.isFinite(actual) || actual < 0 || actual > 100000000) {
-        return res.status(400).json({ error: 'Invalid goal actual' });
+        return res.status(400).json({ error: 'Invalid goal actual', errorJa: '目標の実績値が正しくありません。', errorEn: 'Invalid goal actual' });
       }
       if (!/^\d{4}-\d{2}-\d{2}$/.test(deadline)) {
-        return res.status(400).json({ error: 'Invalid goal deadline' });
+        return res.status(400).json({ error: 'Invalid goal deadline', errorJa: '目標の期限が正しくありません。', errorEn: 'Invalid goal deadline' });
       }
       const startDate = /^\d{4}-\d{2}-\d{2}$/.test(String(g?.startDate || '')) ? String(g.startDate) : weekDate;
       totalActual += actual;
@@ -1013,7 +1014,7 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
     if (typeof req.body?.displayName === 'string' && req.body.displayName.trim()) {
       const name = req.body.displayName.trim().slice(0, 20);
       const s = screenText(name);
-      if (!s.ok) return res.status(422).json({ error: s.error, code: s.code });
+      if (!s.ok) return res.status(422).json({ error: s.error, errorJa: s.error, errorEn: s.errorEn, code: s.code });
       patch.displayName = name;
     }
     if (typeof req.body?.avatarColor === 'string' && db.AVATAR_COLORS.includes(req.body.avatarColor)) {
@@ -1040,7 +1041,7 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
     res.json({ ok: true, weekDate, pacePercent: Math.round(rawPace), achievementPercent: Math.round(achievement) });
   } catch (err) {
     console.error('/api/leaderboard/sync-pace error:', err);
-    res.status(503).json({ error: 'Leaderboard is unavailable' });
+    res.status(503).json({ error: 'Leaderboard is unavailable', errorJa: 'ランキングは利用できません。', errorEn: 'Leaderboard is unavailable' });
   }
 });
 
@@ -1060,7 +1061,7 @@ app.get('/api/league/weekly', optionalAuth, async (req, res) => {
     res.json({ weekStart: weekDate, entries, optedOut, isPlaceholder: false, metric });
   } catch (err) {
     console.error('/api/league/weekly error:', err);
-    res.status(503).json({ error: 'Leaderboard is unavailable' });
+    res.status(503).json({ error: 'Leaderboard is unavailable', errorJa: 'ランキングは利用できません。', errorEn: 'Leaderboard is unavailable' });
   }
 });
 
@@ -1070,7 +1071,7 @@ app.get('/api/league/weekly', optionalAuth, async (req, res) => {
 app.get('/api/online/profile', optionalAuth, async (req, res) => {
   try {
     const userId = onlineIdentity(req);
-    if (!userId) return res.status(400).json({ error: 'Invalid userId' });
+    if (!userId) return res.status(400).json({ error: 'Invalid userId', errorJa: 'ユーザーIDが正しくありません。', errorEn: 'Invalid userId' });
     const profile = await db.getOnlineProfile(userId);
     res.json({
       profile: profile || {
@@ -1083,7 +1084,7 @@ app.get('/api/online/profile', optionalAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('/api/online/profile error:', err);
-    res.status(503).json({ error: 'Profile is unavailable' });
+    res.status(503).json({ error: 'Profile is unavailable', errorJa: 'プロフィールは利用できません。', errorEn: 'Profile is unavailable' });
   }
 });
 
@@ -1091,23 +1092,23 @@ app.put('/api/online/profile', optionalAuth, async (req, res) => {
   try {
     const userId = onlineIdentity(req);
     if (!userId || userId.length > 80) {
-      return res.status(400).json({ error: 'Invalid userId' });
+      return res.status(400).json({ error: 'Invalid userId', errorJa: 'ユーザーIDが正しくありません。', errorEn: 'Invalid userId' });
     }
     const patch = {};
     if (req.body?.displayName !== undefined) {
       if (typeof req.body.displayName !== 'string' || req.body.displayName.trim().length > 20) {
-        return res.status(400).json({ error: '表示名は20文字までです。' });
+        return res.status(400).json({ error: '表示名は20文字までです。', errorJa: '表示名は20文字までです。', errorEn: 'Display names are up to 20 characters.' });
       }
       const name = req.body.displayName.trim();
       if (name) {
         const s = screenText(name);
-        if (!s.ok) return res.status(422).json({ error: s.error, code: s.code });
+        if (!s.ok) return res.status(422).json({ error: s.error, errorJa: s.error, errorEn: s.errorEn, code: s.code });
       }
       patch.displayName = name;
     }
     if (req.body?.avatarColor !== undefined) {
       if (req.body.avatarColor !== null && !db.AVATAR_COLORS.includes(req.body.avatarColor)) {
-        return res.status(400).json({ error: 'Invalid avatarColor' });
+        return res.status(400).json({ error: 'Invalid avatarColor', errorJa: 'アバターの色が正しくありません。', errorEn: 'Invalid avatarColor' });
       }
       patch.avatarColor = req.body.avatarColor;
     }
@@ -1118,7 +1119,7 @@ app.put('/api/online/profile', optionalAuth, async (req, res) => {
     res.json({ profile });
   } catch (err) {
     console.error('PUT /api/online/profile error:', err);
-    res.status(503).json({ error: 'Profile is unavailable' });
+    res.status(503).json({ error: 'Profile is unavailable', errorJa: 'プロフィールは利用できません。', errorEn: 'Profile is unavailable' });
   }
 });
 
@@ -1129,16 +1130,16 @@ app.post('/api/leaderboard/sync', optionalAuth, async (req, res) => {
     // never from a userId supplied by the app.
     const userId = REQUIRE_AUTH ? String(req.userId) : req.body?.userId;
     if (typeof userId !== 'string' || userId.length < 1 || userId.length > 80) {
-      return res.status(400).json({ error: 'Invalid userId' });
+      return res.status(400).json({ error: 'Invalid userId', errorJa: 'ユーザーIDが正しくありません。', errorEn: 'Invalid userId' });
     }
     if (typeof displayName !== 'string' || !displayName.trim() || displayName.length > 40) {
-      return res.status(400).json({ error: 'Invalid displayName' });
+      return res.status(400).json({ error: 'Invalid displayName', errorJa: '表示名が正しくありません。', errorEn: 'Invalid displayName' });
     }
     if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      return res.status(400).json({ error: 'Invalid date' });
+      return res.status(400).json({ error: 'Invalid date', errorJa: '日付が正しくありません。', errorEn: 'Invalid date' });
     }
     if (!Array.isArray(categories) || categories.length > 30) {
-      return res.status(400).json({ error: 'Invalid categories' });
+      return res.status(400).json({ error: 'Invalid categories', errorJa: 'カテゴリーが正しくありません。', errorEn: 'Invalid categories' });
     }
     const normalized = categories.map(item => ({
       name: String(item?.name || '').trim().slice(0, 40),
@@ -1156,7 +1157,7 @@ app.post('/api/leaderboard/sync', optionalAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('/api/leaderboard/sync error:', err);
-    res.status(503).json({ error: 'Leaderboard is unavailable' });
+    res.status(503).json({ error: 'Leaderboard is unavailable', errorJa: 'ランキングは利用できません。', errorEn: 'Leaderboard is unavailable' });
   }
 });
 
@@ -1184,18 +1185,18 @@ app.get('/api/leaderboard', optionalAuth, async (req, res) => {
       ? requestedMetric
       : metric;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to) || !category) {
-      return res.status(400).json({ error: 'from, to and category are required' });
+      return res.status(400).json({ error: 'from, to and category are required', errorJa: 'from、to、categoryが必要です。', errorEn: 'from, to and category are required' });
     }
     const days = (Date.parse(to) - Date.parse(from)) / 86400000;
     if (!(days >= 0 && days <= 6)) {
-      return res.status(400).json({ error: 'Range must be 1 to 7 days' });
+      return res.status(400).json({ error: 'Range must be 1 to 7 days', errorJa: '期間は1〜7日で指定してください。', errorEn: 'Range must be 1 to 7 days' });
     }
     const entries = await db.getCategoryLeaderboard(from, to, category, metric);
     // db が返す各行には value（その指標の値）が既に入っている。unit を付ける。
     res.json({ metric: echoMetric, entries: entries.map((e) => ({ ...e, unit: LEADERBOARD_METRIC_UNITS[echoMetric] || LEADERBOARD_METRIC_UNITS[metric] })) });
   } catch (err) {
     console.error('/api/leaderboard error:', err);
-    res.status(503).json({ error: 'Leaderboard is unavailable' });
+    res.status(503).json({ error: 'Leaderboard is unavailable', errorJa: 'ランキングは利用できません。', errorEn: 'Leaderboard is unavailable' });
   }
 });
 
@@ -1216,18 +1217,18 @@ app.post('/api/shared-decks', auth.requireAuth, async (req, res) => {
     const cards = rawCards
       .map(card => ({ question: cleanText(card?.question, 500), answer: cleanText(card?.answer, 1000) }))
       .filter(card => card.question && card.answer);
-    if (!title) return res.status(400).json({ error: 'タイトルを入力してください。' });
-    if (!categoryName) return res.status(400).json({ error: 'カテゴリーを選んでください。' });
-    if (cards.length < 1 || cards.length > 300) return res.status(400).json({ error: 'カードは1〜300枚で公開してください。' });
+    if (!title) return res.status(400).json({ error: 'タイトルを入力してください。', errorJa: 'タイトルを入力してください。', errorEn: 'Please enter a title.' });
+    if (!categoryName) return res.status(400).json({ error: 'カテゴリーを選んでください。', errorJa: 'カテゴリーを選んでください。', errorEn: 'Please choose a category.' });
+    if (cards.length < 1 || cards.length > 300) return res.status(400).json({ error: 'カードは1〜300枚で公開してください。', errorJa: 'カードは1〜300枚で公開してください。', errorEn: 'Please publish 1-300 cards.' });
     if (await db.countOwnSharedDecks(String(req.userId)) >= 20) {
-      return res.status(400).json({ error: '公開デッキは20個までです。' });
+      return res.status(400).json({ error: '公開デッキは20個までです。', errorJa: '公開デッキは20個までです。', errorEn: 'You can publish up to 20 decks.' });
     }
     // 公開者の名前は出さない（匿名）。ユーザーIDも公開しない
     const deck = await db.createSharedDeck(String(req.userId), '匿名', { title, categoryName, description, cards });
     res.json({ deck });
   } catch (err) {
     console.error('POST /api/shared-decks error:', err);
-    res.status(503).json({ error: '公開に失敗しました。時間をおいて再度お試しください。' });
+    res.status(503).json({ error: '公開に失敗しました。時間をおいて再度お試しください。', errorJa: '公開に失敗しました。時間をおいて再度お試しください。', errorEn: 'Publishing failed. Please try again later.' });
   }
 });
 
@@ -1242,7 +1243,7 @@ app.get('/api/shared-decks', optionalAuth, async (req, res) => {
     res.json({ decks });
   } catch (err) {
     console.error('GET /api/shared-decks error:', err);
-    res.status(503).json({ error: '公開デッキを読み込めませんでした。' });
+    res.status(503).json({ error: '公開デッキを読み込めませんでした。', errorJa: '公開デッキを読み込めませんでした。', errorEn: 'Could not load public decks.' });
   }
 });
 
@@ -1262,7 +1263,7 @@ app.get('/api/shared-decks/categories', optionalAuth, async (req, res) => {
     res.json({ categories: rows });
   } catch (err) {
     console.error('GET /api/shared-decks/categories error:', err);
-    res.status(503).json({ error: 'カテゴリーを読み込めませんでした。' });
+    res.status(503).json({ error: 'カテゴリーを読み込めませんでした。', errorJa: 'カテゴリーを読み込めませんでした。', errorEn: 'Could not load categories.' });
   }
 });
 
@@ -1284,37 +1285,37 @@ app.get('/api/shared-decks/mine', auth.requireAuth, async (req, res) => {
     res.json({ decks: rows.map((d) => ({ ...d, mine: true })) });
   } catch (err) {
     console.error('GET /api/shared-decks/mine error:', err);
-    res.status(503).json({ error: '自分の公開デッキを読み込めませんでした。' });
+    res.status(503).json({ error: '自分の公開デッキを読み込めませんでした。', errorJa: '自分の公開デッキを読み込めませんでした。', errorEn: 'Could not load your public decks.' });
   }
 });
 
 app.get('/api/shared-decks/:id', optionalAuth, async (req, res) => {
   try {
-    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const deck = await db.getSharedDeck(req.params.id);
-    if (!deck) return res.status(404).json({ error: 'デッキが見つかりません。' });
+    if (!deck) return res.status(404).json({ error: 'デッキが見つかりません。', errorJa: 'デッキが見つかりません。', errorEn: 'Deck not found.' });
     const { owner_user_id, ...publicDeck } = deck; // 公開者の内部IDは返さない
     res.json({ deck: publicDeck });
   } catch (err) {
     console.error('GET /api/shared-decks/:id error:', err);
-    res.status(503).json({ error: '公開デッキを読み込めませんでした。' });
+    res.status(503).json({ error: '公開デッキを読み込めませんでした。', errorJa: '公開デッキを読み込めませんでした。', errorEn: 'Could not load public decks.' });
   }
 });
 
 // 取り込み: カード本文を返す。クライアント側で自分のデッキに追加する
 app.post('/api/shared-decks/:id/import', auth.requireAuth, async (req, res) => {
   try {
-    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const deck = await db.getSharedDeck(req.params.id);
-    if (!deck) return res.status(404).json({ error: 'デッキが見つかりません。' });
+    if (!deck) return res.status(404).json({ error: 'デッキが見つかりません。', errorJa: 'デッキが見つかりません。', errorEn: 'Deck not found.' });
     if (deck.owner_user_id === String(req.userId)) {
-      return res.status(400).json({ error: '自分のデッキは取り込めません。' });
+      return res.status(400).json({ error: '自分のデッキは取り込めません。', errorJa: '自分のデッキは取り込めません。', errorEn: 'You cannot import your own deck.' });
     }
     await db.recordSharedDeckImport(req.params.id, String(req.userId));
     res.json({ title: deck.title, categoryName: deck.categoryName, cards: deck.cards });
   } catch (err) {
     console.error('POST /api/shared-decks/:id/import error:', err);
-    res.status(503).json({ error: '取り込みに失敗しました。' });
+    res.status(503).json({ error: '取り込みに失敗しました。', errorJa: '取り込みに失敗しました。', errorEn: 'Could not import.' });
   }
 });
 
@@ -1322,7 +1323,7 @@ app.post('/api/shared-decks/:id/import', auth.requireAuth, async (req, res) => {
 // 公開済みデッキの内容を更新（自動公開の同期用。持ち主だけが更新できる）
 app.put('/api/shared-decks/:id', auth.requireAuth, async (req, res) => {
   try {
-    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const title = cleanText(req.body?.title, 80);
     const categoryName = cleanText(req.body?.categoryName, 40);
     const description = cleanText(req.body?.description, 300);
@@ -1330,42 +1331,42 @@ app.put('/api/shared-decks/:id', auth.requireAuth, async (req, res) => {
     const cards = rawCards
       .map(card => ({ question: cleanText(card?.question, 500), answer: cleanText(card?.answer, 1000) }))
       .filter(card => card.question && card.answer);
-    if (!title) return res.status(400).json({ error: 'タイトルを入力してください。' });
-    if (!categoryName) return res.status(400).json({ error: 'カテゴリーを選んでください。' });
-    if (cards.length < 1 || cards.length > 300) return res.status(400).json({ error: 'カードは1〜300枚で公開してください。' });
+    if (!title) return res.status(400).json({ error: 'タイトルを入力してください。', errorJa: 'タイトルを入力してください。', errorEn: 'Please enter a title.' });
+    if (!categoryName) return res.status(400).json({ error: 'カテゴリーを選んでください。', errorJa: 'カテゴリーを選んでください。', errorEn: 'Please choose a category.' });
+    if (cards.length < 1 || cards.length > 300) return res.status(400).json({ error: 'カードは1〜300枚で公開してください。', errorJa: 'カードは1〜300枚で公開してください。', errorEn: 'Please publish 1-300 cards.' });
     const ok = await db.updateSharedDeck(req.params.id, String(req.userId), { title, categoryName, description, cards });
-    if (!ok) return res.status(404).json({ error: 'デッキが見つかりません。' });
+    if (!ok) return res.status(404).json({ error: 'デッキが見つかりません。', errorJa: 'デッキが見つかりません。', errorEn: 'Deck not found.' });
     res.json({ ok: true });
   } catch (err) {
     console.error('PUT /api/shared-decks error:', err);
-    res.status(503).json({ error: '更新に失敗しました。時間をおいて再度お試しください。' });
+    res.status(503).json({ error: '更新に失敗しました。時間をおいて再度お試しください。', errorJa: '更新に失敗しました。時間をおいて再度お試しください。', errorEn: 'Update failed. Please try again later.' });
   }
 });
 
 app.delete('/api/shared-decks/:id', auth.requireAuth, async (req, res) => {
   try {
-    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const ok = await db.deleteSharedDeck(req.params.id, String(req.userId));
-    if (!ok) return res.status(404).json({ error: 'デッキが見つかりません。' });
+    if (!ok) return res.status(404).json({ error: 'デッキが見つかりません。', errorJa: 'デッキが見つかりません。', errorEn: 'Deck not found.' });
     res.json({ ok: true });
   } catch (err) {
     console.error('DELETE /api/shared-decks/:id error:', err);
-    res.status(503).json({ error: '取り下げに失敗しました。' });
+    res.status(503).json({ error: '取り下げに失敗しました。', errorJa: '取り下げに失敗しました。', errorEn: 'Could not unpublish.' });
   }
 });
 
 // 通報（App Store審査のための報告機能）
 app.post('/api/shared-decks/:id/report', auth.requireAuth, async (req, res) => {
   try {
-    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const reason = cleanText(req.body?.reason, 200) || '不適切な内容';
     const deck = await db.getSharedDeck(req.params.id);
-    if (!deck) return res.status(404).json({ error: 'デッキが見つかりません。' });
+    if (!deck) return res.status(404).json({ error: 'デッキが見つかりません。', errorJa: 'デッキが見つかりません。', errorEn: 'Deck not found.' });
     await db.reportSharedDeck(req.params.id, String(req.userId), reason);
     res.json({ ok: true });
   } catch (err) {
     console.error('POST /api/shared-decks/:id/report error:', err);
-    res.status(503).json({ error: '通報を受け付けられませんでした。' });
+    res.status(503).json({ error: '通報を受け付けられませんでした。', errorJa: '通報を受け付けられませんでした。', errorEn: 'Could not accept the report.' });
   }
 });
 
@@ -1396,7 +1397,7 @@ app.post('/api/reflection/advice', optionalAuth, quotaStd, async (req, res) => {
   try {
     const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
     if (!content || content.length > 2000) {
-      return res.status(400).json({ error: '日記は1〜2000文字で入力してください。' });
+      return res.status(400).json({ error: '日記は1〜2000文字で入力してください。', errorJa: '日記は1〜2000文字で入力してください。', errorEn: 'Please enter a journal entry of 1-2000 characters.' });
     }
     const locale = resolveLocale(req);
     const mood = Number.isFinite(Number(req.body?.mood)) ? Math.max(1, Math.min(5, Math.round(Number(req.body.mood)))) : null;
@@ -1444,7 +1445,7 @@ app.post('/api/reflection/advice', optionalAuth, quotaStd, async (req, res) => {
     res.json(out);
   } catch (err) {
     console.error('/api/reflection/advice error:', err);
-    res.status(500).json({ error: 'アドバイスを作れませんでした。時間をおいてもう一度お試しください。' });
+    res.status(500).json({ error: 'アドバイスを作れませんでした。時間をおいてもう一度お試しください。', errorJa: 'アドバイスを作れませんでした。時間をおいてもう一度お試しください。', errorEn: 'Could not create advice. Please try again later.' });
   }
 });
 
@@ -1474,7 +1475,7 @@ app.post('/api/discover/generate', optionalAuth, quotaStd, async (req, res) => {
     const topic = typeof req.body?.topic === 'string' ? req.body.topic.trim() : '';
     const locale = resolveLocale(req);
     if (!topic || topic.length > 120) {
-      return res.status(400).json({ error: 'テーマは1〜120文字で入力してください。' });
+      return res.status(400).json({ error: 'テーマは1〜120文字で入力してください。', errorJa: 'テーマは1〜120文字で入力してください。', errorEn: 'Please enter a theme of 1-120 characters.' });
     }
     if (MOCK_MODE || !API_KEY) return res.json(MOCK_DISCOVER);
 
@@ -1523,7 +1524,7 @@ app.post('/api/discover/generate', optionalAuth, quotaStd, async (req, res) => {
     res.json(out);
   } catch (err) {
     console.error('/api/discover/generate error:', err);
-    res.status(500).json({ error: 'コンテンツを作れませんでした。時間をおいてもう一度お試しください。' });
+    res.status(500).json({ error: 'コンテンツを作れませんでした。時間をおいてもう一度お試しください。', errorJa: 'コンテンツを作れませんでした。時間をおいてもう一度お試しください。', errorEn: 'Could not create the content. Please try again later.' });
   }
 });
 
@@ -1537,27 +1538,27 @@ app.get('/api/usage', async (req, res) => {
   if (REQUIRE_AUTH) {
     return auth.requireAuth(req, res, async () => {
       try {
-        if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
+        if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable', errorJa: 'アカウントのサービスは利用できません。', errorEn: 'Account service is unavailable' });
         const user = await db.getUserById(req.userId);
-        if (!user) return res.status(404).json({ error: 'Account not found' });
+        if (!user) return res.status(404).json({ error: 'Account not found', errorJa: 'アカウントが見つかりません。', errorEn: 'Account not found' });
         const usage = await buildUsage(user);
         usage.referralCode = await db.ensureReferralCode(user.id);
         res.json({ usage });
       } catch (err) {
         console.error('/api/usage error:', err);
-        res.status(503).json({ error: 'Usage service is unavailable' });
+        res.status(503).json({ error: 'Usage service is unavailable', errorJa: '利用状況のサービスは利用できません。', errorEn: 'Usage service is unavailable' });
       }
     });
   }
   try {
-    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
+    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable', errorJa: 'アカウントのサービスは利用できません。', errorEn: 'Account service is unavailable' });
     const deviceId = resolveDeviceId(req);
-    if (!deviceId) return res.status(400).json({ error: 'X-Device-Id header is required' });
+    if (!deviceId) return res.status(400).json({ error: 'X-Device-Id header is required', errorJa: 'X-Device-Idヘッダーが必要です。', errorEn: 'X-Device-Id header is required' });
     const usage = await buildDeviceUsage(deviceId);
     res.json({ usage });
   } catch (err) {
     console.error('/api/usage error:', err);
-    res.status(503).json({ error: 'Usage service is unavailable' });
+    res.status(503).json({ error: 'Usage service is unavailable', errorJa: '利用状況のサービスは利用できません。', errorEn: 'Usage service is unavailable' });
   }
 });
 
@@ -1566,37 +1567,46 @@ app.get('/api/usage', async (req, res) => {
 // 実際に完了したときだけ呼ぶ。
 app.post('/api/share/claim', auth.requireAuth, async (req, res) => {
   try {
-    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
+    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable', errorJa: 'アカウントのサービスは利用できません。', errorEn: 'Account service is unavailable' });
     const granted = await db.grantShareBonusToday(req.userId, SHARE_BONUS_AMOUNT);
     const user = await db.getUserById(req.userId);
     res.json({ granted, amount: granted ? SHARE_BONUS_AMOUNT : 0, usage: await buildUsage(user) });
   } catch (err) {
     console.error('/api/share/claim error:', err);
-    res.status(503).json({ error: 'Share bonus is unavailable' });
+    res.status(503).json({ error: 'Share bonus is unavailable', errorJa: 'シェア特典は利用できません。', errorEn: 'Share bonus is unavailable' });
   }
 });
 
 // 招待コードの入力: 入力した本人に +REFERRAL_FRIEND_BONUS、コードの持ち主に +REFERRAL_OWNER_BONUS（持ち主は最大 REFERRAL_OWNER_MAX 人分）
 app.post('/api/referral/redeem', auth.requireAuth, async (req, res) => {
   try {
-    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
+    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable', errorJa: 'アカウントのサービスは利用できません。', errorEn: 'Account service is unavailable' });
     const code = typeof req.body?.code === 'string' ? req.body.code.trim().toUpperCase().replace(/[^A-Z0-9]/g, '') : '';
-    if (code.length !== 8) return res.status(400).json({ error: '招待コードは8文字です。', code: 'INVALID_CODE' });
+    if (code.length !== 8) return res.status(400).json({ error: '招待コードは8文字です。', errorJa: '招待コードは8文字です。', errorEn: 'The invite code is 8 characters.', code: 'INVALID_CODE' });
     const r = await db.redeemReferral(req.userId, code, REFERRAL_FRIEND_BONUS, REFERRAL_OWNER_BONUS, REFERRAL_OWNER_MAX);
     if (!r.ok) {
+      // V12.10・B班: 招待コードの失敗理由も日英で返す（error は互換のため日本語のまま）。
       const messages = {
         already_redeemed: 'すでに招待コードを使用済みです。',
         invalid_code: '招待コードが見つかりません。',
         own_code: '自分の招待コードは使えません。',
         not_found: 'アカウントが見つかりません。',
       };
-      return res.status(400).json({ error: messages[r.reason] || '招待コードを使用できませんでした。', code: r.reason.toUpperCase() });
+      const messagesEn = {
+        already_redeemed: 'You have already used this invite code.',
+        invalid_code: 'Invite code not found.',
+        own_code: 'You cannot use your own invite code.',
+        not_found: 'Account not found.',
+      };
+      const msgJa = messages[r.reason] || '招待コードを使用できませんでした。';
+      const msgEn = messagesEn[r.reason] || 'Could not use the invite code.';
+      return res.status(400).json({ error: msgJa, errorJa: msgJa, errorEn: msgEn, code: r.reason.toUpperCase() });
     }
     const user = await db.getUserById(req.userId);
     res.json({ ok: true, bonus: REFERRAL_FRIEND_BONUS, usage: await buildUsage(user) });
   } catch (err) {
     console.error('/api/referral/redeem error:', err);
-    res.status(503).json({ error: 'Referral is unavailable' });
+    res.status(503).json({ error: 'Referral is unavailable', errorJa: '招待は利用できません。', errorEn: 'Referral is unavailable' });
   }
 });
 
@@ -1608,17 +1618,17 @@ app.post('/api/referral/redeem', auth.requireAuth, async (req, res) => {
 // ==========================================================================
 app.post('/api/iap/notifications', async (req, res) => {
   try {
-    if (!db.DB_ENABLED) return res.status(503).json({ error: 'unavailable' });
+    if (!db.DB_ENABLED) return res.status(503).json({ error: 'unavailable', errorJa: '利用できません。', errorEn: 'unavailable' });
     const signedPayload = req.body?.signedPayload;
     if (typeof signedPayload !== 'string' || signedPayload.length > 60000) {
-      return res.status(400).json({ error: 'signedPayload required' });
+      return res.status(400).json({ error: 'signedPayload required', errorJa: 'signedPayloadが必要です。', errorEn: 'signedPayload required' });
     }
     let notification;
     try {
       notification = await iap.verifyNotification(signedPayload);
     } catch (e) {
       console.error('IAP notification verification failed:', e.message);
-      return res.status(400).json({ error: 'invalid payload' }); // 偽の通知は受け付けない
+      return res.status(400).json({ error: 'invalid payload', errorJa: 'ペイロードが正しくありません。', errorEn: 'invalid payload' }); // 偽の通知は受け付けない
     }
     const signedTx = notification?.data?.signedTransactionInfo;
     if (signedTx) {
@@ -1634,20 +1644,20 @@ app.post('/api/iap/notifications', async (req, res) => {
     res.status(200).json({ ok: true });
   } catch (err) {
     console.error('/api/iap/notifications error:', err);
-    res.status(500).json({ error: 'failed' }); // 一時的な障害はAppleが再送する
+    res.status(500).json({ error: 'failed', errorJa: '失敗しました。', errorEn: 'failed' }); // 一時的な障害はAppleが再送する
   }
 });
 
 // 認証（必要時）
 app.post('/api/auth/apple', async (req, res) => {
   try {
-    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
+    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable', errorJa: 'アカウントのサービスは利用できません。', errorEn: 'Account service is unavailable' });
     const { identityToken, displayName } = req.body;
     if (typeof identityToken !== 'string' || identityToken.length > 12000) {
-      return res.status(400).json({ error: 'A valid Apple identity token is required' });
+      return res.status(400).json({ error: 'A valid Apple identity token is required', errorJa: '有効なAppleのIDトークンが必要です。', errorEn: 'A valid Apple identity token is required' });
     }
     if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 40)) {
-      return res.status(400).json({ error: 'displayName must be at most 40 characters' });
+      return res.status(400).json({ error: 'displayName must be at most 40 characters', errorJa: '表示名は40文字までです。', errorEn: 'displayName must be at most 40 characters' });
     }
     const appleUserId = await auth.verifyAppleIdentityToken(identityToken);
     let user = await db.findOrCreateUser(appleUserId);
@@ -1670,7 +1680,7 @@ app.post('/api/auth/apple', async (req, res) => {
 app.get('/api/account', auth.requireAuth, async (req, res) => {
   try {
     const user = await db.getUserById(req.userId);
-    if (!user) return res.status(404).json({ error: 'Account not found' });
+    if (!user) return res.status(404).json({ error: 'Account not found', errorJa: 'アカウントが見つかりません。', errorEn: 'Account not found' });
     res.json({
       user: { id: user.id, displayName: user.display_name || null, accountData: user.account_data || {} },
       isSubscribed: Boolean(user.is_subscribed && user.subscription_expires_at && new Date(user.subscription_expires_at).getTime() > Date.now()),
@@ -1679,7 +1689,7 @@ app.get('/api/account', auth.requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('/api/account error:', err);
-    res.status(503).json({ error: 'Account service is unavailable' });
+    res.status(503).json({ error: 'Account service is unavailable', errorJa: 'アカウントのサービスは利用できません。', errorEn: 'Account service is unavailable' });
   }
 });
 
@@ -1687,51 +1697,51 @@ app.put('/api/account/data', auth.requireAuth, async (req, res) => {
   try {
     const { accountData, displayName } = req.body || {};
     if (!accountData || typeof accountData !== 'object' || Array.isArray(accountData)) {
-      return res.status(400).json({ error: 'accountData must be an object' });
+      return res.status(400).json({ error: 'accountData must be an object', errorJa: 'accountDataはオブジェクトで指定してください。', errorEn: 'accountData must be an object' });
     }
     if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 40)) {
-      return res.status(400).json({ error: 'displayName must be at most 40 characters' });
+      return res.status(400).json({ error: 'displayName must be at most 40 characters', errorJa: '表示名は40文字までです。', errorEn: 'displayName must be at most 40 characters' });
     }
     const user = await db.saveAccountData(req.userId, accountData, displayName?.trim());
-    if (!user) return res.status(404).json({ error: 'Account not found' });
+    if (!user) return res.status(404).json({ error: 'Account not found', errorJa: 'アカウントが見つかりません。', errorEn: 'Account not found' });
     res.json({ ok: true });
   } catch (err) {
     console.error('/api/account/data error:', err);
-    res.status(503).json({ error: 'Account sync is unavailable' });
+    res.status(503).json({ error: 'Account sync is unavailable', errorJa: 'アカウントの同期は利用できません。', errorEn: 'Account sync is unavailable' });
   }
 });
 
 app.delete('/api/account', auth.requireAuth, async (req, res) => {
   try {
-    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
+    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable', errorJa: 'アカウントのサービスは利用できません。', errorEn: 'Account service is unavailable' });
     await db.deleteAccount(req.userId);
     res.json({ ok: true });
   } catch (err) {
     console.error('DELETE /api/account error:', err);
-    res.status(503).json({ error: 'Account deletion is unavailable' });
+    res.status(503).json({ error: 'Account deletion is unavailable', errorJa: 'アカウントの削除は利用できません。', errorEn: 'Account deletion is unavailable' });
   }
 });
 
 app.post('/api/iap/verify', auth.requireAuth, async (req, res) => {
   try {
-    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Purchase verification is unavailable' });
+    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Purchase verification is unavailable', errorJa: '購入の確認は利用できません。', errorEn: 'Purchase verification is unavailable' });
     const { signedTransactionInfo } = req.body || {};
     if (typeof signedTransactionInfo !== 'string' || signedTransactionInfo.length > 30000) {
-      return res.status(400).json({ error: 'A valid signed transaction is required' });
+      return res.status(400).json({ error: 'A valid signed transaction is required', errorJa: '有効な署名付きトランザクションが必要です。', errorEn: 'A valid signed transaction is required' });
     }
     const transaction = await iap.verifyTransaction(signedTransactionInfo);
     if (transaction.bundleId !== process.env.APPLE_BUNDLE_ID) {
-      return res.status(400).json({ error: 'Transaction belongs to a different app' });
+      return res.status(400).json({ error: 'Transaction belongs to a different app', errorJa: 'この取引は別のアプリのものです。', errorEn: 'Transaction belongs to a different app' });
     }
     const currentOwner = await db.getUserByOriginalTransactionId(transaction.originalTransactionId);
     if (currentOwner && String(currentOwner.id) !== String(req.userId)) {
-      return res.status(409).json({ error: 'This purchase is linked to another account' });
+      return res.status(409).json({ error: 'This purchase is linked to another account', errorJa: 'この購入は別のアカウントに紐づいています。', errorEn: 'This purchase is linked to another account' });
     }
     const entitlement = await iap.applyTransactionToUser(req.userId, transaction);
     res.json(entitlement);
   } catch (err) {
     console.error('/api/iap/verify error:', err);
-    res.status(400).json({ error: 'Purchase could not be verified' });
+    res.status(400).json({ error: 'Purchase could not be verified', errorJa: '購入を確認できませんでした。', errorEn: 'Purchase could not be verified' });
   }
 });
 
