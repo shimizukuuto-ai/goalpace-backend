@@ -478,8 +478,8 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.3.0',
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true },
+    version: '7.4.0',
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true },
   });
 });
 
@@ -489,7 +489,7 @@ app.get('/', (req, res) => {
     status: 'running',
     aiProvider: IS_OPENROUTER ? 'OpenRouter' : (API_KEY ? 'Groq (Llama 3)' : 'unconfigured'),
     model: DEFAULT_MODEL,
-    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/activity', '/api/activity/feed', '/api/shared-goals/public', '/api/shared-goals/:id/join-public', '/api/shared-goals/:id/kick', '/api/shared-goals/kicked', '/api/shared-goals/:id/comments', '/health']
+    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/shared-goals/suggest-structure', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/activity', '/api/activity/feed', '/api/shared-goals/public', '/api/shared-goals/:id/join-public', '/api/shared-goals/:id/kick', '/api/shared-goals/kicked', '/api/shared-goals/:id/comments', '/health']
   });
 });
 
@@ -711,6 +711,230 @@ app.post('/api/routine/suggest', optionalAuth, quotaStd, async (req, res) => {
   } catch (err) {
     console.error('/api/routine/suggest error:', err);
     res.status(500).json({ error: 'Could not create a routine right now.' });
+  }
+});
+
+// ---- V12.6・A班: 共有目標のAI構造提案（POST /api/shared-goals/suggest-structure） ----
+// 作成者が言葉で書いた目標を、AIが「測り方・目標値・1日のノルマ・達成の決め方」
+// に落とし込む。作成フロー（B班）で提案→編集・再生成→確定に使う。
+// 失敗ポリシー（一貫させる）：入力の形式不正は 400。AI呼び出し自体の失敗
+// （通信・タイムアウト・APIエラー）は 500（quotaStd の予約分は aiQuota が
+// 4xx/5xx 時に自動返却する。他のAI機能と同じ）。AIが返したJSONが壊れていたり
+// 項目が不正だったりした場合は 400/500 にせず、決定的なフォールバック構造を
+// 200 で返す（note にその旨を書く）。AIの生JSONはそのまま信じない。
+// MOCK_MODE または APIキー未設定時も同じフォールバック構造を返す（空返しにしない）。
+const SHARED_GOAL_STRUCTURE_KINDS = ['count', 'time', 'habit', 'value'];
+const SHARED_GOAL_ACHIEVEMENT_RULES = ['auto', 'deadline', 'declare'];
+
+function sharedGoalDaysUntil(deadline) {
+  if (typeof deadline !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(deadline)) return null;
+  const d = new Date(deadline + 'T00:00:00');
+  if (Number.isNaN(d.getTime())) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return Math.max(1, Math.ceil((d.getTime() - today.getTime()) / 86400000));
+}
+
+// 目標の文から決まる決定的なサンプル構造。MOCK時と、AIのJSONが壊れた時の
+// フォールバックの両方で使う（同じ入力には同じ構造を返す）。
+function mockSharedGoalStructure(goal, deadline, locale) {
+  const en = locale === 'en';
+  const text = String(goal || '');
+  const allNums = [...text.matchAll(/(\d+(?:\.\d+)?)/g)].map((m) => Number(m[1])).filter((n) => n > 0);
+  // V12.6・統括: 最初の数を取ると「1ヶ月で300単語」の「1」が目標数に
+  // なってしまう。単位の直前の数を優先し（300単語→300、1日20問→20）、
+  // 無ければ最大の数を使う。
+  const unitNumMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:単語|語|冊|ページ|回|問|個|こ|words?|vocab)/i);
+  const num = unitNumMatch ? Number(unitNumMatch[1]) : (allNums.length ? Math.max(...allNums) : null);
+  // value は「今95kgで80kg」のように数字が2つある場合、最後の数が目標値のため別扱い。
+  const lastNum = allNums.length ? allNums[allNums.length - 1] : null;
+  const days = sharedGoalDaysUntil(deadline);
+  const title = text.trim().slice(0, 80);
+  const perDay = (target) => (days ? Math.max(1, Math.ceil(target / days)) : Math.max(1, Math.ceil(target / 30)));
+
+  // 体重など「数値そのものが目標」のもの → value（開始値→目標値、毎日記録、申告で達成）
+  if (/体重|weight|kg|痩せ|ダイエット|diet/i.test(text)) {
+    const target = lastNum && lastNum > 0 && lastNum < 1000 ? lastNum : 80;
+    return {
+      kind: 'value', title, target, unit: 'kg',
+      dailyQuota: en ? 'Record your weight every day' : '毎日体重を記録',
+      achievementRule: 'declare',
+      note: en ? 'A target value with daily logging; tap "Achieved" when you reach it.'
+        : '目標値を決めて毎日記録し、到達したら「達成した」で申告する形です。',
+    };
+  }
+  // 資格・試験の合格 → habit（毎日勉強、期日に合否＝deadline）
+  if (/簿記|資格|試験|合格|exam|pass|certif/i.test(text)) {
+    return {
+      kind: 'habit', title, target: 30, unit: '',
+      dailyQuota: en ? 'Study every day' : '毎日勉強する',
+      achievementRule: 'deadline',
+      note: en ? 'A daily study habit; the result is entered on the deadline.'
+        : '毎日勉強する習慣にして、期日に合否を入れる形です。',
+    };
+  }
+  // 恋愛など「行動を積み重ねる」もの → habit（週1回行動、申告で達成）
+  if (/彼女|彼氏|恋人|出会|girlfriend|boyfriend|date|dating/i.test(text)) {
+    return {
+      kind: 'habit', title, target: 30, unit: '',
+      dailyQuota: en ? 'Take one action a week' : '週1回行動する',
+      achievementRule: 'declare',
+      note: en ? 'A weekly-action habit; tap "Achieved" when it works out.'
+        : '週1回行動する習慣にして、うまくいったら「達成した」で申告する形です。',
+    };
+  }
+  // 強くなるなど抽象的な目標 → habit（毎日取り組む、申告で達成）
+  if (/強く|強さ|stronger|muscle|筋肉|鍛え/i.test(text)) {
+    return {
+      kind: 'habit', title, target: 30, unit: '',
+      dailyQuota: en ? 'Train every day' : '毎日トレーニングする',
+      achievementRule: 'declare',
+      note: en ? 'An abstract goal, so it becomes a daily habit you declare as achieved.'
+        : '抽象的な目標なので、毎日の習慣にして「達成した」で申告する形です。',
+    };
+  }
+  // 時間で測るもの → time（合計分数、1日あたりの分数）
+  if (/時間|分|hour|min/i.test(text) && !/単語|words|vocab/i.test(text)) {
+    const target = num && num > 0 && num <= 100000 ? Math.round(num) : 600;
+    const amount = perDay(target);
+    return {
+      kind: 'time', title, target, unit: en ? 'min' : '分',
+      dailyQuota: en ? `${amount} min a day` : `1日${amount}分`,
+      dailyQuotaAmount: amount,
+      achievementRule: 'auto',
+      note: en ? 'Measured in total minutes; reaching the total completes it automatically.'
+        : '合計分数で測り、到達したら自動で達成になる形です。',
+    };
+  }
+  // 個数で測るもの（300単語など）→ count（目標数、1日あたりの個数）
+  const target = num && num > 0 && num <= 1000000 ? Math.round(num) : 100;
+  const amount = perDay(target);
+  return {
+    kind: 'count', title, target, unit: en ? '' : 'こ',
+    dailyQuota: en ? `${amount} a day` : `1日${amount}こ`,
+    dailyQuotaAmount: amount,
+    achievementRule: 'auto',
+    note: en ? 'Measured by count; reaching the target completes it automatically.'
+      : '個数で測り、目標数に到達したら自動で達成になる形です。',
+  };
+}
+
+// AIの生JSONを検証・正規化する。kind不正→'count'、target不正→種類ごとの
+// 既定値、achievementRule不正→種類ごとの既定値。startValue は value の
+// 時のみ残す。不正な項目は黙って既定値に寄せ、エラーにはしない。
+function sanitizeSharedGoalStructure(raw, fallback) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  // V12.6・統括: fallback が null/非オブジェクトでも落ちないよう正規化
+  // （ルートは必ずオブジェクトを渡すが、単体テストや将来の呼び出し元のため）。
+  const fb = fallback && typeof fallback === 'object' ? fallback : {};
+  const kind = SHARED_GOAL_STRUCTURE_KINDS.includes(src.kind) ? src.kind : 'count';
+  const defaultTarget = { count: 100, time: 600, habit: 30, value: 100 }[kind];
+  const targetNum = Number(src.target);
+  const target = Number.isFinite(targetNum) && targetNum > 0 && targetNum <= 1000000
+    ? Math.round(targetNum)
+    : defaultTarget;
+  const defaultRule = kind === 'count' || kind === 'time' ? 'auto' : 'declare';
+  const achievementRule = SHARED_GOAL_ACHIEVEMENT_RULES.includes(src.achievementRule)
+    ? src.achievementRule
+    : defaultRule;
+  const title = typeof src.title === 'string' && src.title.trim()
+    ? src.title.trim().slice(0, 80)
+    : (typeof fb.title === 'string' ? fb.title : '');
+  const unit = typeof src.unit === 'string' ? src.unit.trim().slice(0, 10) : (typeof fb.unit === 'string' ? fb.unit : '');
+  const dailyQuota = typeof src.dailyQuota === 'string' && src.dailyQuota.trim()
+    ? src.dailyQuota.trim().slice(0, 120)
+    : (typeof fb.dailyQuota === 'string' ? fb.dailyQuota : '');
+  const quotaNum = Number(src.dailyQuotaAmount);
+  const out = {
+    kind,
+    title,
+    target,
+    unit,
+    dailyQuota,
+    achievementRule,
+    note: typeof src.note === 'string' && src.note.trim()
+      ? src.note.trim().slice(0, 200)
+      : (typeof fb.note === 'string' ? fb.note : ''),
+  };
+  if (kind === 'value') {
+    const startNum = Number(src.startValue);
+    if (Number.isFinite(startNum)) out.startValue = startNum;
+    else if (typeof fb.startValue === 'number') out.startValue = fb.startValue;
+  }
+  if (Number.isFinite(quotaNum) && quotaNum > 0) out.dailyQuotaAmount = quotaNum;
+  else if (typeof fb.dailyQuotaAmount === 'number') out.dailyQuotaAmount = fb.dailyQuotaAmount;
+  return out;
+}
+
+app.post('/api/shared-goals/suggest-structure', optionalAuth, quotaStd, async (req, res) => {
+  try {
+    const goal = typeof req.body?.goal === 'string' ? req.body.goal.trim() : '';
+    const locale = resolveLocale(req);
+    const deadline = typeof req.body?.deadline === 'string' ? req.body.deadline.trim() : '';
+    if (!goal || goal.length > 300) {
+      return res.status(400).json({ error: 'Goal must contain 1–300 characters.' });
+    }
+    if (deadline && !/^\d{4}-\d{2}-\d{2}$/.test(deadline)) {
+      return res.status(400).json({ error: 'Deadline must be YYYY-MM-DD.' });
+    }
+
+    const fallback = mockSharedGoalStructure(goal, deadline || undefined, locale);
+    if (MOCK_MODE || !API_KEY) {
+      console.log('[MOCK] /api/shared-goals/suggest-structure');
+      return res.json(fallback);
+    }
+
+    const system = `You are a goal-structure designer for a shared-goal app. The user describes a goal in plain words. Propose how to measure it, the target, the daily quota, and how achievement is decided.
+
+Return ONLY the following JSON (no other text, no markdown):
+{
+  "kind": "count" | "time" | "habit" | "value",
+  "title": "a cleaned-up goal title (under 40 characters)",
+  "target": 0,
+  "unit": "unit such as '' or 'kg' or 'min'",
+  "startValue": 0,
+  "dailyQuota": "a human-readable daily quota, e.g. '1日20問' or '毎日体重を記録' or '週3回'",
+  "dailyQuotaAmount": 0,
+  "achievementRule": "auto" | "deadline" | "declare",
+  "note": "one line explaining why this shape fits (under 100 characters)"
+}
+
+Rules:
+- kind: 'count' = measured by number of items (e.g. 300 words). 'time' = measured in minutes. 'habit' = a repeated action with no meaningful number (abstract goals, studying, dating actions). 'value' = a target value to reach from a starting value (e.g. body weight).
+- target: for count/time, the total number; for value, the target value; for habit, the number of days in the period (e.g. 30).
+- startValue: ONLY for kind 'value' (the starting value, e.g. current weight). Omit it for other kinds.
+- unit: for count use '' unless the user named a unit; for time use 'min'; for value use the unit of the value (e.g. 'kg'); for habit use ''.
+- dailyQuotaAmount: the per-day amount as a number, only when it can be counted. Omit it when the quota is not countable (e.g. 'record every day').
+- achievementRule: 'auto' = completed automatically when the number is reached; 'deadline' = the result is entered on the deadline (e.g. exam pass/fail); 'declare' = the user taps an "Achieved" button to declare it.
+- dailyQuota should use the deadline to size the daily amount when one is given (target divided by days left, rounded up).
+
+Examples:
+- "体重80kgになりたい" -> kind 'value', target 80, unit 'kg', dailyQuota '毎日体重を記録', achievementRule 'declare'.
+- "簿記2級に合格したい" -> kind 'habit', target 30, dailyQuota '毎日勉強する', achievementRule 'deadline'.
+- "彼女を作りたい" -> kind 'habit', target 30, dailyQuota '週1回行動する', achievementRule 'declare'.
+- "強くなりたい" -> kind 'habit', target 30, dailyQuota '毎日トレーニングする', achievementRule 'declare'.
+- "300単語を覚えたい" -> kind 'count', target 300, dailyQuota '1日20問', dailyQuotaAmount 20, achievementRule 'auto'.` + localeSuffix(locale);
+
+    const userText = deadline
+      ? `【目標】: ${goal}\n【期日】: ${deadline}`
+      : `【目標】: ${goal}`;
+    let parsed;
+    try {
+      const text = await callGroqLlama({ system, userText, locale });
+      parsed = parseJson(text);
+    } catch (err) {
+      // AIのJSONが壊れていた場合：500にせずフォールバック構造を返す
+      // （note にその旨を書く。上の失敗ポリシー参照）。
+      console.error('/api/shared-goals/suggest-structure parse error:', err);
+      const note = locale === 'en'
+        ? 'The AI suggestion could not be read, so a standard structure is shown instead.'
+        : 'AIの提案を読み取れなかったため、標準の形でお届けします。';
+      return res.json({ ...fallback, note });
+    }
+    res.json(sanitizeSharedGoalStructure(parsed, fallback));
+  } catch (err) {
+    console.error('/api/shared-goals/suggest-structure error:', err);
+    res.status(500).json({ error: 'Could not suggest a goal structure right now.' });
   }
 });
 

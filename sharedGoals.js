@@ -57,6 +57,21 @@ const { screenText } = require('./community');
 //   habit は1日1回のチェックで100%。旧クライアント互換のため
 //   新フィールドはオプショナル（無ければクライアントが計算する）。
 //   共有目標の公開範囲とコメントは V12.2・A班を参照。
+// V12.6・C班: 数値タイプ（kind='value'）と達成の決め方。
+//   value=目標値ベース（開始値→目標値。例：体重 95kg→80kg）。
+//   start_value（NULL可。無い場合は target を開始値扱いにしない＝
+//   進捗は記録待ち）と achievement_rule（'auto'|'deadline'|'declare'、
+//   既定 'auto'）を shared_goals に後付けする（kind・visibility と
+//   同じ ADD COLUMN IF NOT EXISTS パターン）。
+//   現在値は POST /:id/contribute の body { value } で記録し、
+//   shared_goal_values（goal_id, user_id, value, logged_at）に毎回
+//   1行残す。最新の1件が現在値。contributions にはその日初回だけ
+//   amount=1 を入れる（habit と同じ1日1回の形でペース%・ストリーク・
+//   今日のノルマ達成率の「今日記録したか」を保つ。2回目以降は値の
+//   修正のみで貢献は増えない）。全体の達成率はクライアントの
+//   sharedGoalOverallRate が開始値→目標値の近づき具合で出す。
+//   達成の決め方（achievementRule）は保存だけ行い、達成判定の
+//   実行（「達成した」申告ボタン・期日の合否入力）は未実装（I12.6-6）。
 // V12.2・A班: 共有目標の公開範囲（visibility: private/public。未指定・
 //   旧データは 'private'）とコメント（shared_goal_comments）。
 //   公開目標は GET /api/shared-goals/public で一覧でき、
@@ -93,6 +108,12 @@ ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'co
 --   'private'=招待コードのみ（既定・旧データもこれ）/ 'public'=一覧に出て
 --   コード無しで参加できる。旧データは ALTER の DEFAULT で 'private' になる。
 ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'private';
+-- V12.6・C班: 数値タイプの開始値（value のときだけ使う。NULL可。
+--   無い場合は target を開始値扱いにしない＝進捗は記録待ち）と
+--   達成の決め方（'auto'|'deadline'|'declare'。既定 'auto'）。
+--   kind・visibility と同じ後付けパターン。
+ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS start_value NUMERIC;
+ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS achievement_rule TEXT NOT NULL DEFAULT 'auto';
 CREATE INDEX IF NOT EXISTS idx_shared_goals_public ON shared_goals (visibility, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_shared_goals_owner ON shared_goals (owner_user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_shared_goals_code ON shared_goals (invite_code);
@@ -113,6 +134,17 @@ CREATE TABLE IF NOT EXISTS shared_goal_contributions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_shared_goal_contrib ON shared_goal_contributions (goal_id, user_id, contributed_date);
+-- V12.6・C班: 数値タイプの現在値の記録。1回の記録で1行（上書きしない。
+--   最新の1件が現在値で、履歴も残る）。contributions とは別物で、
+--   個数・時間・習慣の記録は変えない。目標が消えたら CASCADE で消える。
+CREATE TABLE IF NOT EXISTS shared_goal_values (
+  id BIGSERIAL PRIMARY KEY,
+  goal_id BIGINT NOT NULL REFERENCES shared_goals(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  value NUMERIC NOT NULL,
+  logged_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_shared_goal_values ON shared_goal_values (goal_id, user_id, logged_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS shared_goal_stamps (
   id BIGSERIAL PRIMARY KEY,
   goal_id BIGINT NOT NULL REFERENCES shared_goals(id) ON DELETE CASCADE,
@@ -194,16 +226,22 @@ const anonName = (uid) => 'プレイヤー-' + crypto.createHash('sha256').updat
 const INVITE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 紛らわしい文字(0/O, 1/I/L)を除外（db.js の招待コードと同じ）
 
 // V12・D班: 共有目標の種類。count=個数 / time=時間（分）/ habit=習慣チェック（日数）。
-const SHARED_GOAL_KINDS = ['count', 'time', 'habit'];
+// V12.6・C班: value=目標値（開始値→目標値を追う。例：体重 95kg→80kg）。
+const SHARED_GOAL_KINDS = ['count', 'time', 'habit', 'value'];
 // V12.4・A班: 共有目標のメンバー上限。v12.2 までは 30人だった。
 // 既存の10人超の目標は追い出さない（新規参加だけ止める）。
 const SHARED_GOAL_MAX_MEMBERS = 10;
 const normalizeKind = (v) => (SHARED_GOAL_KINDS.includes(v) ? v : 'count');
+// V12.6・C班: 共有目標の達成の決め方。auto=数字到達で自動 /
+// deadline=期日に結果を入れる / declare=「達成した」で申告する。
+// 未指定・不正値は 'auto'（旧データも 'auto' 扱い）。
+const SHARED_GOAL_ACHIEVEMENT_RULES = ['auto', 'deadline', 'declare'];
+const normalizeAchievementRule = (v) => (SHARED_GOAL_ACHIEVEMENT_RULES.includes(v) ? v : 'auto');
 // V12.2・A班: 共有目標の公開範囲。'public' のときだけ公開、
 // 未指定・不正値は 'private'（旧データも 'private' 扱い）。
 const SHARED_GOAL_VISIBILITIES = ['private', 'public'];
 const normalizeVisibility = (v) => (v === 'public' ? 'public' : 'private');
-// 種類ごとの単位（time は「分」固定、habit は単位なし、count は入力通り）。
+// 種類ごとの単位（time は「分」固定、habit は単位なし、count・value は入力通り）。
 const unitForKind = (kind, unit) => {
   if (kind === 'time') return '分';
   if (kind === 'habit') return '';
@@ -363,6 +401,7 @@ function register({ app, db, auth }) {
   async function loadGoalDetailInner(goalId, viewerUserId) {
     const g = await q(
       `SELECT id, owner_user_id, title, target, unit, kind, visibility,
+              start_value, achievement_rule,
               to_char(deadline, 'YYYY-MM-DD') AS deadline,
               to_char(start_date, 'YYYY-MM-DD') AS start_date,
               invite_code, created_at,
@@ -385,6 +424,13 @@ function register({ app, db, auth }) {
     const stamps = await q(
       `SELECT id, user_id, emoji, target_user_id, created_at
        FROM shared_goal_stamps WHERE goal_id = $1 ORDER BY created_at DESC LIMIT 100`,
+      [goalId]);
+    // V12.6・C班: 数値タイプの値の記録（新しい順。1人の最新値と
+    // 全体の最新値・今日記録したかをここから導く）。
+    const values = await q(
+      `SELECT user_id, value, logged_at,
+              to_char(logged_at, 'YYYY-MM-DD') AS logged_date
+       FROM shared_goal_values WHERE goal_id = $1 ORDER BY logged_at DESC, id DESC LIMIT 500`,
       [goalId]);
 
     const memberCount = members.rows.length;
@@ -438,6 +484,18 @@ function register({ app, db, auth }) {
       sharedWinDates = [...all].filter((d) => members.rows.every((m) => (byUser[m.user_id] || { winDates: new Set() }).winDates.has(d))).sort();
     }
 
+    // V12.6・C班: 数値タイプの最新値（メンバーごと＋全体）。
+    // values は logged_at DESC 順なので、最初に出てきた行がその人の最新値。
+    // logged_date は DB の当日（CURRENT_DATE と同じタイムゾーン）で見る
+    // ため、同じリクエストで入る contributions の当日と一致する。
+    const latestValueByUser = {};
+    const valueLoggedTodayByUser = {};
+    for (const v of values.rows) {
+      if (latestValueByUser[v.user_id] === undefined) latestValueByUser[v.user_id] = Number(v.value);
+      if (v.logged_date === goal.today) valueLoggedTodayByUser[v.user_id] = true;
+    }
+    const latestValueOverall = values.rows.length ? Number(values.rows[0].value) : null;
+
     const memberList = members.rows.map((m) => {
       const u = byUser[m.user_id] || { total: 0, today: 0, winDates: new Set() };
       const memberPlanned = memberCount > 0 ? planned / memberCount : 0;
@@ -448,12 +506,17 @@ function register({ app, db, auth }) {
       // habit は今日1回チェックしたら 100%）。ノルマが 0 の
       // ときは貢献があれば 100%、無ければ 0%。
       const isHabit = normalizeKind(goal.kind) === 'habit';
-      const todayQuota = isHabit ? 1 : dailyTarget;
+      // V12.6・C班: 数値タイプの今日のノルマは「今日値を1回記録する」
+      // こと。todayQuota=1（1回の記録）、達成率は記録済み100%・未記録0%。
+      const isValue = normalizeKind(goal.kind) === 'value';
+      const todayQuota = isHabit || isValue ? 1 : dailyTarget;
       const todayQuotaRate = isHabit
         ? (u.today > 0 ? 100 : 0)
-        : (todayQuota > 0
-            ? Math.min(100, Math.round((u.today / todayQuota) * 100))
-            : (u.today > 0 ? 100 : 0));
+        : isValue
+          ? (valueLoggedTodayByUser[m.user_id] ? 100 : 0)
+          : (todayQuota > 0
+              ? Math.min(100, Math.round((u.today / todayQuota) * 100))
+              : (u.today > 0 ? 100 : 0));
       return {
         userId: m.user_id,
         displayName: m.display_name || anonName(m.user_id),
@@ -464,6 +527,10 @@ function register({ app, db, auth }) {
         // オプショナル。無ければクライアントが同じ式で計算する）。
         todayQuota,
         todayQuotaRate,
+        // V12.6・C班: 数値タイプのその人の最新値と今日記録したか
+        // （count/time/habit では null/false のまま）。
+        currentValue: latestValueByUser[m.user_id] ?? null,
+        valueLoggedToday: Boolean(valueLoggedTodayByUser[m.user_id]),
         wonToday: u.winDates.has(goal.today),
         // V12.2・A班: 直近の活動日時（貢献・タスク完了の最新。無ければ参加日時）。
         lastActiveAt: lastActiveByUser[m.user_id] || m.joined_at,
@@ -523,6 +590,14 @@ function register({ app, db, auth }) {
       kind: normalizeKind(goal.kind),
       // V12.2・A班: 公開範囲。旧データは 'private'（DB の DEFAULT と同じ）。
       visibility: normalizeVisibility(goal.visibility),
+      // V12.6・C班: 数値タイプの開始値と達成の決め方。旧データは
+      // startValue=null・achievementRule='auto'（DB の DEFAULT と同じ）。
+      // currentValue はメンバー全員の記録のうち最新の1件（無ければ
+      // null＝記録待ち）。myCurrentValue は閲覧者本人の最新値。
+      startValue: goal.start_value == null ? null : Number(goal.start_value),
+      achievementRule: normalizeAchievementRule(goal.achievement_rule),
+      currentValue: latestValueOverall,
+      myCurrentValue: viewerUserId ? (latestValueByUser[String(viewerUserId)] ?? null) : null,
       deadline: dayString(goal.deadline),
       startDate: dayString(goal.start_date),
       inviteCode: goal.invite_code,
@@ -564,6 +639,8 @@ function register({ app, db, auth }) {
         const uid = String(req.userId);
         const owned = await q('SELECT id FROM shared_goals WHERE owner_user_id = $1', [uid]);
         await q('DELETE FROM shared_goal_contributions WHERE user_id = $1', [uid]);
+        // V12.6・C班: 数値タイプの値の記録も消す（貢献と同じ扱い）。
+        await q('DELETE FROM shared_goal_values WHERE user_id = $1', [uid]);
         await q('DELETE FROM shared_goal_comments WHERE user_id = $1', [uid]);
         await q('DELETE FROM shared_goal_stamps WHERE user_id = $1 OR target_user_id = $1', [uid]);
         await q('DELETE FROM shared_goal_task_completions WHERE user_id = $1', [uid]);
@@ -594,10 +671,20 @@ function register({ app, db, auth }) {
     // V12.2・A班: visibility（private/public。未指定・不正値は 'private'）。
     const visibility = normalizeVisibility(b.visibility);
     const unit = unitForKind(kind, oneLine(b.unit, 20));
+    // V12.6・C班: startValue（valueタイプの開始値）と achievementRule
+    // （'auto'|'deadline'|'declare'。未指定・不正値は 'auto'）。
+    // valueタイプ以外では startValue は使わないため NULL にする。
+    // valueタイプで startValue が無い場合は target を開始値扱いにしない
+    // （開始値なし＝進捗は記録待ち。全体の達成率は null を返す）。
+    const startValueRaw = Number(b.startValue);
+    const startValue = kind === 'value' && Number.isFinite(startValueRaw) ? startValueRaw : null;
+    const achievementRule = normalizeAchievementRule(b.achievementRule);
     const deadline = String(b.deadline || '');
     if (!title) return res.status(400).json({ error: 'タイトルを入力してください。' });
     if (!Number.isFinite(target) || target <= 0 || target > 100000000) return res.status(400).json({ error: '目標量は 0 より大きい数で入力してください。' });
     if (kind === 'habit' && target > 365) return res.status(400).json({ error: '習慣の目標日数は 365日までです。' });
+    if (startValue !== null && Math.abs(startValue) > 100000000) return res.status(400).json({ error: '開始値は 1億以内の数で入力してください。' });
+    if (kind === 'value' && startValue !== null && startValue === target) return res.status(400).json({ error: '開始値と目標値は違う値にしてください。' });
     if (!parseDay(deadline)) return res.status(400).json({ error: '期限は YYYY-MM-DD で入力してください。' });
     if (parseDay(deadline) < parseDay(new Date().toISOString().slice(0, 10))) return res.status(400).json({ error: '期限は今日以降にしてください。' });
     const mine = await q('SELECT COUNT(*)::int AS n FROM shared_goals WHERE owner_user_id = $1', [uid]);
@@ -615,9 +702,9 @@ function register({ app, db, auth }) {
       try {
         await client.query('BEGIN');
         const ins = await client.query(
-          `INSERT INTO shared_goals (owner_user_id, title, target, unit, kind, visibility, deadline, invite_code)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-          [uid, title, target, unit, kind, visibility, deadline, code]);
+          `INSERT INTO shared_goals (owner_user_id, title, target, unit, kind, visibility, deadline, invite_code, start_value, achievement_rule)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+          [uid, title, target, unit, kind, visibility, deadline, code, startValue, achievementRule]);
         goalId = ins.rows[0].id;
         await client.query('INSERT INTO shared_goal_members (goal_id, user_id, display_name) VALUES ($1, $2, $3)',
           [goalId, uid, creatorName]);
@@ -697,6 +784,7 @@ function register({ app, db, auth }) {
     const offset = Math.max(0, Math.floor(Number(req.query.offset) || 0));
     const rows = await q(
       `SELECT g.id, g.owner_user_id, g.title, g.target, g.unit, g.kind,
+              g.start_value, g.achievement_rule,
               to_char(g.deadline, 'YYYY-MM-DD') AS deadline,
               to_char(g.start_date, 'YYYY-MM-DD') AS start_date,
               g.created_at,
@@ -722,6 +810,9 @@ function register({ app, db, auth }) {
         id: String(r.id),
         title: r.title,
         kind: normalizeKind(r.kind),
+        // V12.6・C班: 数値タイプの開始値と達成の決め方（公開一覧でも見える）。
+        startValue: r.start_value == null ? null : Number(r.start_value),
+        achievementRule: normalizeAchievementRule(r.achievement_rule),
         unit: r.unit || '',
         target,
         deadline: dayString(r.deadline),
@@ -920,13 +1011,41 @@ function register({ app, db, auth }) {
     const uid = String(req.userId);
     if (limited('sg:contrib:' + uid, 60, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。' });
     if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
-    const amount = Number(req.body && req.body.amount);
     const note = clean(req.body && req.body.note, 100);
-    if (!Number.isFinite(amount) || amount <= 0 || amount > 100000000) return res.status(400).json({ error: '記録する量は 0 より大きい数で入力してください。' });
     // V12・D班: 習慣チェックは 1日1回・amount=1 だけ（チェック＝1日達成）。
     // 複数回・まとめての記録で日数を水増しできないようにする。
     const gKind = await q('SELECT kind FROM shared_goals WHERE id = $1', [req.params.id]);
-    if (gKind.rowCount && normalizeKind(gKind.rows[0].kind) === 'habit') {
+    const goalKind = gKind.rowCount ? normalizeKind(gKind.rows[0].kind) : 'count';
+    // V12.6・C班: 数値タイプは「現在の値」の記録。body は { value }。
+    // amount は使わない（送られてきても無視する）。値は
+    // shared_goal_values に毎回1行残し、最新の1件が現在値になる。
+    // contributions にはその日初回だけ amount=1 を入れる（habit と同じ
+    // 1日1回の形で、ペース%・共有ストリーク・今日のノルマ達成率の
+    // 「今日記録したか」を保つ。2回目以降の記録は値の修正のみで
+    // 貢献は増えない）。値が無い・数値でない場合は 400。
+    if (goalKind === 'value') {
+      const value = Number(req.body && req.body.value);
+      if (!Number.isFinite(value) || Math.abs(value) > 100000000) return res.status(400).json({ error: '現在の値を入力してください。' });
+      const today = await q(
+        `SELECT COUNT(*)::int AS n FROM shared_goal_contributions
+         WHERE goal_id = $1 AND user_id = $2 AND contributed_date = CURRENT_DATE`,
+        [req.params.id, uid]);
+      await q(
+        `INSERT INTO shared_goal_values (goal_id, user_id, value) VALUES ($1, $2, $3)`,
+        [req.params.id, uid, value]);
+      if (today.rows[0].n === 0) {
+        await q(
+          `INSERT INTO shared_goal_contributions (goal_id, user_id, amount, note) VALUES ($1, $2, 1, $3)`,
+          [req.params.id, uid, note]);
+      }
+      const detail = await loadGoalDetail(req.params.id, uid);
+      if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
+      detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+      return res.json({ goal: detail });
+    }
+    const amount = Number(req.body && req.body.amount);
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 100000000) return res.status(400).json({ error: '記録する量は 0 より大きい数で入力してください。' });
+    if (goalKind === 'habit') {
       if (amount !== 1) return res.status(400).json({ error: '習慣チェックは1日1回です。' });
       const today = await q(
         `SELECT COUNT(*)::int AS n FROM shared_goal_contributions
@@ -1162,6 +1281,35 @@ module.exports = { register, parseDay, daysBetween, plannedByToday, formatDay };
  *    - habit のメンバーが今日チェックしたら todayQuotaRate=100、してなければ 0
  *    - GET /api/version → { version: '7.3.0', features: { sharedGoalKick: true,
  *      dailyQuotaRate: true, sharedGoalFinder: true, ... } }
+ * 11. 数値タイプとAI作成（V12.6・C班。バージョンは 7.4.0 に上がる。
+ *    AI提案エンドポイント自体は server.js の A班分。ここは保存と記録の確認）:
+ *    - POST /api/shared-goals（kind: 'value', target: 80, unit: 'kg',
+ *      startValue: 95, achievementRule: 'declare'）→ goal.kind='value'、
+ *      goal.startValue=95、goal.achievementRule='declare'、unit='kg'
+ *    - POST /api/shared-goals（kind: 'value', startValue なし）→
+ *      goal.startValue=null（target を開始値扱いにしない。全体の達成率は
+ *      クライアントで null＝表示なしになる）
+ *    - POST /api/shared-goals（kind: 'value', startValue と target が同じ）
+ *      → 400「開始値と目標値は違う値にしてください。」
+ *    - POST /api/shared-goals（kind: 'value', achievementRule: 'xxx'）
+ *      → goal.achievementRule='auto'（不正値は既定値）
+ *    - POST /api/shared-goals（kind: 'count' に startValue を付けても）
+ *      → goal.startValue=null（value 以外では使わない）
+ *    - kind 未指定・旧データの作成 → goal.kind='count'、startValue=null、
+ *      achievementRule='auto'（従来通り。旧共有目標は壊れない）
+ *    - POST /api/shared-goals/:id/contribute（value タイプ、{ value: 94 }）
+ *      → { goal } が返り、goal.currentValue=94、myCurrentValue=94、
+ *      members[] の自分の todayQuotaRate=100、contribution が 1 増える
+ *    - 同じ日に2回目（{ value: 93.5 }）→ goal.currentValue=93.5 に
+ *      更新されるが contribution は増えない（値の修正のみ）
+ *    - POST /api/shared-goals/:id/contribute（value タイプ、value なし）
+ *      → 400「現在の値を入力してください。」（amount だけ送っても同じ）
+ *    - POST /api/shared-goals/:id/contribute（count タイプ、{ value: 5 }）
+ *      → value は無視され、従来通り amount が要る（amount なしは 400）
+ *    - GET /api/shared-goals/public?kind=value → 数値タイプだけが返る。
+ *      各行に startValue・achievementRule が付くこと
+ *    - GET /api/version → { version: '7.4.0', features: {
+ *      aiSharedGoalCreation: true, ... } }
  * 10. 503 が出たときの切り分け（v5）: Render → Logs で
  *    `[shared-goals] requestId=... POST /api/shared-goals user=... step=... error=...`
  *    を探す。step=loadGoalDetail なら集計の例外、step=ensure-schema なら
