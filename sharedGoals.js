@@ -127,12 +127,42 @@ function randomInviteCode() {
 }
 
 function parseDay(s) {
+  // node-postgres は DATE カラムを JS の Date オブジェクトとして返す。
+  // そのまま String() すると 'Mon Nov 23 2026 ...' になり正規表現に
+  // 一致せず null になるため、Date も受け取れるようにする（v5 修正）。
+  // 文字列は従来通り 'YYYY-MM-DD' の厳密な形式のみ受け付ける
+  // （クライアントからの deadline バリデーション用途を維持するため、
+  //  'YYYY-MM-DDTHH...' のような ISO 文字列はここでは通さない）。
+  if (s instanceof Date) {
+    if (Number.isNaN(s.getTime())) return null;
+    return new Date(s.getFullYear(), s.getMonth(), s.getDate());
+  }
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || ''));
   if (!m) return null;
   const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
   return Number.isNaN(d.getTime()) ? null : d;
 }
+// Date -> 'YYYY-MM-DD'（返却値用。クライアントの pace.ts の parseDay は
+// この形式しか読めないため、deadline / startDate に ISO 文字列は返さない）。
+function formatDay(d) {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) return null;
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${mo}-${day}`;
+}
+// 'YYYY-MM-DD' 文字列はそのまま、Date は formatDay で文字列化する。
+// SQL 側で to_char 済みなら文字列が来るので、そのまま通る。
+function dayString(v) {
+  if (typeof v === 'string') return v;
+  if (v instanceof Date) return formatDay(v);
+  return null;
+}
 function daysBetween(a, b) {
+  // null / 不正な値が来ても例外にしない（v5 修正。修正前は
+  // daysBetween(null, null) が a.getFullYear() で TypeError になり、
+  // wrap が 503 を返していた）。呼び出し側は 0 日として扱う。
+  if (!(a instanceof Date) || !(b instanceof Date)) return 0;
+  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return 0;
   const utcA = Date.UTC(a.getFullYear(), a.getMonth(), a.getDate());
   const utcB = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate());
   return Math.round((utcB - utcA) / 86400000);
@@ -161,11 +191,39 @@ function register({ app, db, auth }) {
   }
   const q = (text, params) => db.pool.query(text, params);
 
+  // リクエストID: 503 の原因追及用。レスポンスに含め、ログにも出す。
+  // crypto.randomUUID() は Node 14.17+ で利用可。
+  function newRequestId() {
+    return typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : crypto.randomBytes(16).toString('hex');
+  }
+
   const wrap = (fn) => async (req, res) => {
-    try { await ensure(); await fn(req, res); }
+    const requestId = newRequestId();
+    req.requestId = requestId;
+    try {
+      try { await ensure(); } catch (e) { e.step = e.step || 'ensure-schema'; throw e; }
+      await fn(req, res);
+    }
     catch (e) {
-      console.error('[shared-goals]', req.method, req.path, e.message);
-      if (!res.headersSent) res.status(503).json({ error: 'いま利用できません。時間をおいて再度お試しください。' });
+      // 失敗箇所: e.step が付いていればそれを使う（loadGoalDetail /
+      // 作成トランザクションなどが設定する）。無ければハンドラ名。
+      const step = e.step || fn.name || 'handler';
+      const userId = req.userId ? String(req.userId) : 'unknown';
+      // 内部詳細（スタック・SQL）はログだけに出し、レスポンスには出さない。
+      console.error('[shared-goals] requestId=%s %s %s user=%s step=%s error=%s',
+        requestId, req.method, req.path, userId, step, e.message);
+      if (e.stack) console.error('[shared-goals] requestId=%s stack: %s', requestId, e.stack);
+      if (!res.headersSent) {
+        // DB 自体が無効/未接続なら種別を分ける（再試行しても直らない系）。
+        const code = e.message === 'DB disabled' ? 'DB_UNAVAILABLE' : 'SERVER_ERROR';
+        res.status(503).json({
+          error: 'いま利用できません。時間をおいて再度お試しください。',
+          code,
+          requestId,
+        });
+      }
     }
   };
 
@@ -179,9 +237,22 @@ function register({ app, db, auth }) {
   // 計算するルールだが、target は不変のため当日分でそのまま満たされる。
   // viewerUserId（任意）：タスクの doneToday（閲覧者が今日完了したか）を
   // 付けるために使う。未指定なら全タスク doneToday=false。
+  // loadGoalDetail で例外が起きたとき、wrap のログに失敗箇所が出るよう
+  // step を付けて投げ直す（v5 修正）。
   async function loadGoalDetail(goalId, viewerUserId) {
+    try {
+      return await loadGoalDetailInner(goalId, viewerUserId);
+    } catch (e) {
+      e.step = e.step || 'loadGoalDetail';
+      throw e;
+    }
+  }
+
+  async function loadGoalDetailInner(goalId, viewerUserId) {
     const g = await q(
-      `SELECT id, owner_user_id, title, target, unit, deadline, start_date,
+      `SELECT id, owner_user_id, title, target, unit,
+              to_char(deadline, 'YYYY-MM-DD') AS deadline,
+              to_char(start_date, 'YYYY-MM-DD') AS start_date,
               invite_code, created_at,
               to_char(CURRENT_DATE, 'YYYY-MM-DD') AS today
        FROM shared_goals WHERE id = $1`,
@@ -194,7 +265,9 @@ function register({ app, db, auth }) {
        WHERE goal_id = $1 ORDER BY joined_at ASC`,
       [goalId]);
     const contribs = await q(
-      `SELECT id, user_id, amount, note, contributed_date, created_at
+      `SELECT id, user_id, amount, note,
+              to_char(contributed_date, 'YYYY-MM-DD') AS contributed_date,
+              created_at
        FROM shared_goal_contributions WHERE goal_id = $1 ORDER BY contributed_date DESC, created_at DESC LIMIT 200`,
       [goalId]);
     const stamps = await q(
@@ -203,8 +276,16 @@ function register({ app, db, auth }) {
       [goalId]);
 
     const memberCount = members.rows.length;
+    const startDay = parseDay(goal.start_date);
+    const endDay = parseDay(goal.deadline);
     const planned = plannedByToday(target, goal.start_date, goal.deadline, goal.today);
-    const totalDays = Math.max(1, daysBetween(parseDay(goal.start_date), parseDay(goal.deadline)) + 1);
+    // start/end が読めない（想定外の値の）ときは totalDays=1 に倒す。
+    // 修正前はここで daysBetween(parseDay(...), parseDay(...)) を
+    // ガード無しに呼び、node-postgres が返す Date オブジェクトが
+    // parseDay で null になって TypeError → 全エンドポイント 503 だった。
+    const totalDays = startDay && endDay
+      ? Math.max(1, daysBetween(startDay, endDay) + 1)
+      : 1;
     const dailyTarget = memberCount > 0 ? target / memberCount / totalDays : 0;
 
     // メンバー別: 貢献合計・今日の貢献・ペース%
@@ -290,8 +371,8 @@ function register({ app, db, auth }) {
       title: goal.title,
       target,
       unit: goal.unit || '',
-      deadline: goal.deadline,
-      startDate: goal.start_date,
+      deadline: dayString(goal.deadline),
+      startDate: dayString(goal.start_date),
       inviteCode: goal.invite_code,
       createdAt: goal.created_at,
       isOwner: false, // 呼び出し側で上書きする（自分の行かどうかはここでは分からない）
@@ -306,7 +387,7 @@ function register({ app, db, auth }) {
       members: memberList,
       contributions: contribs.rows.map((c) => ({
         id: String(c.id), userId: c.user_id, amount: Number(c.amount), note: c.note || '',
-        date: c.contributed_date, createdAt: c.created_at,
+        date: dayString(c.contributed_date), createdAt: c.created_at,
       })),
       stamps: stamps.rows.map((s) => ({
         id: String(s.id), userId: s.user_id, emoji: s.emoji,
@@ -359,24 +440,60 @@ function register({ app, db, auth }) {
     if (parseDay(deadline) < parseDay(new Date().toISOString().slice(0, 10))) return res.status(400).json({ error: '期限は今日以降にしてください。' });
     const mine = await q('SELECT COUNT(*)::int AS n FROM shared_goals WHERE owner_user_id = $1', [uid]);
     if (mine.rows[0].n >= 20) return res.status(400).json({ error: '作れる共有目標は20個までです。' });
-    let code = '';
+    // 目標＋メンバーの INSERT は1トランザクションにする（v5 修正）。
+    // 修正前は INSERT 成功後に loadGoalDetail が例外を投げると目標だけ
+    // DB に残り、次回作成時も20個上限のカウントに入る「ゴミ目標」に
+    // なっていた。leave ハンドラと同じ client.query('BEGIN') の流儀。
+    let goalId = null;
     for (let attempt = 0; attempt < 5; attempt++) {
-      code = randomInviteCode();
+      const code = randomInviteCode();
+      const client = await db.pool.connect();
       try {
-        const ins = await q(
+        await client.query('BEGIN');
+        const ins = await client.query(
           `INSERT INTO shared_goals (owner_user_id, title, target, unit, deadline, invite_code)
            VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
           [uid, title, target, unit, deadline, code]);
-        await q('INSERT INTO shared_goal_members (goal_id, user_id, display_name) VALUES ($1, $2, $3)',
-          [ins.rows[0].id, uid, anonName(uid)]);
-        const detail = await loadGoalDetail(ins.rows[0].id, uid);
-        detail.isOwner = true;
-        return res.json({ goal: detail });
+        goalId = ins.rows[0].id;
+        await client.query('INSERT INTO shared_goal_members (goal_id, user_id, display_name) VALUES ($1, $2, $3)',
+          [goalId, uid, anonName(uid)]);
+        await client.query('COMMIT');
+        break;
       } catch (e) {
-        if (e.code !== '23505') throw e; // 招待コード重複だけ再試行
+        await client.query('ROLLBACK').catch(() => {});
+        goalId = null;
+        if (e.code !== '23505') { e.step = 'create-insert'; throw e; } // 招待コード重複だけ再試行
+      } finally {
+        client.release();
       }
     }
-    return res.status(503).json({ error: '招待コードを作れませんでした。もう一度お試しください。' });
+    if (!goalId) {
+      return res.status(503).json({
+        error: '招待コードを作れませんでした。もう一度お試しください。',
+        code: 'SERVER_ERROR',
+        requestId: req.requestId,
+      });
+    }
+    // 集計（loadGoalDetail）が失敗したら、作った目標を消してから 503 に
+    // する。残すと「作れませんでした」と言われながら DB に目標だけ残り、
+    // 20個上限のカウントに入り続けるため。
+    let detail;
+    try {
+      detail = await loadGoalDetail(goalId, uid);
+    } catch (e) {
+      await q('DELETE FROM shared_goals WHERE id = $1', [goalId]).catch(() => {});
+      throw e;
+    }
+    if (!detail) {
+      await q('DELETE FROM shared_goals WHERE id = $1', [goalId]).catch(() => {});
+      return res.status(503).json({
+        error: 'いま利用できません。時間をおいて再度お試しください。',
+        code: 'SERVER_ERROR',
+        requestId: req.requestId,
+      });
+    }
+    detail.isOwner = true;
+    return res.json({ goal: detail });
   }));
 
   // 自分が参加している共有目標の一覧（ペース%・共有ストリーク付き）
@@ -419,6 +536,7 @@ function register({ app, db, auth }) {
     const goalId = g.rows[0].id;
     if (await isMember(goalId, uid)) {
       const detail = await loadGoalDetail(goalId, uid);
+      if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
       detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
       return res.json({ goal: detail, alreadyMember: true });
     }
@@ -427,6 +545,7 @@ function register({ app, db, auth }) {
     await q('INSERT INTO shared_goal_members (goal_id, user_id, display_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
       [goalId, uid, anonName(uid)]);
     const detail = await loadGoalDetail(goalId, uid);
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
     detail.isOwner = false;
     res.json({ goal: detail, alreadyMember: false });
   }));
@@ -445,6 +564,7 @@ function register({ app, db, auth }) {
       `INSERT INTO shared_goal_contributions (goal_id, user_id, amount, note) VALUES ($1, $2, $3, $4)`,
       [req.params.id, uid, amount, note]);
     const detail = await loadGoalDetail(req.params.id, uid);
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
     res.json({ goal: detail });
   }));
@@ -466,6 +586,7 @@ function register({ app, db, auth }) {
     await q('INSERT INTO shared_goal_tasks (goal_id, title, created_by) VALUES ($1, $2, $3)',
       [req.params.id, title, uid]);
     const detail = await loadGoalDetail(req.params.id, uid);
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
     res.json({ goal: detail });
   }));
@@ -489,6 +610,7 @@ function register({ app, db, auth }) {
         [req.params.taskId, uid]);
     }
     const detail = await loadGoalDetail(req.params.id, uid);
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
     res.json({ goal: detail });
   }));
@@ -504,6 +626,7 @@ function register({ app, db, auth }) {
     const del = await q('DELETE FROM shared_goal_tasks WHERE id = $1 AND goal_id = $2', [req.params.taskId, req.params.id]);
     if (!del.rowCount) return res.status(404).json({ error: 'タスクが見つかりません。' });
     const detail = await loadGoalDetail(req.params.id, uid);
+    if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
     detail.isOwner = true;
     res.json({ goal: detail });
   }));
@@ -555,7 +678,7 @@ function register({ app, db, auth }) {
   }));
 }
 
-module.exports = { register, STAMP_EMOJIS };
+module.exports = { register, STAMP_EMOJIS, parseDay, daysBetween, plannedByToday, formatDay };
 
 /*
  * ── Render での確認手順（Postgres がこの環境に無いため未検証） ──
@@ -566,7 +689,7 @@ module.exports = { register, STAMP_EMOJIS };
  * 3. デプロイ後、Render のログで "Database initialization failed" が無いことと、
  *    初回の共有目標作成時に shared_goals 等のテーブルが作られることを確認。
  * 4. 動作確認（2アカウント推奨）:
- *    - POST /api/shared-goals（title/target/unit/deadline）→ 201 相当で goal が返る
+ *    - POST /api/shared-goals（title/target/unit/deadline）→ 200 で goal が返る
  *    - 返った inviteCode（8文字）で別アカウントが POST /api/shared-goals/join
  *    - 両者が POST /api/shared-goals/:id/contribute（amount）→ pacePercent が
  *      150% で頭打ちになること（大量に contribute して確認）
@@ -583,6 +706,13 @@ module.exports = { register, STAMP_EMOJIS };
  *      （タスクは貢献量に換算しない＝順位はペース%のまま）
  *    - DELETE /api/shared-goals/:id/tasks/:taskId はオーナー以外 403
  *    - 31件目のタスク作成は 400（上限30件）
- * 6. GET /api/version → { version: '4.0.0', features: { sharedGoals: true, ... } }
+ * 6. GET /api/version → { version: '5.0.0', features: { sharedGoals: true, ... } }
  *    が返ること（server.js に追加済み。旧サーバーでは 404 になる）。
+ * 7. 503 が出たときの切り分け（v5）: Render → Logs で
+ *    `[shared-goals] requestId=... POST /api/shared-goals user=... step=... error=...`
+ *    を探す。step=loadGoalDetail なら集計の例外、step=ensure-schema なら
+ *    テーブル作成の失敗、step=create-insert なら INSERT の失敗。
+ *    クライアントが受け取った requestId とログの requestId を突き合わせる。
+ *    code=DB_UNAVAILABLE なら DATABASE_URL 未設定/DB未接続を疑う
+ *    （db.js で pool が null だと ensure() が 'DB disabled' で失敗する）。
  */

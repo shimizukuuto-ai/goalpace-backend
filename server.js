@@ -463,7 +463,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '4.0.0',
+    version: '5.0.0',
     features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true },
   });
 });
