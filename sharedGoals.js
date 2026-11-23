@@ -42,7 +42,14 @@ const crypto = require('crypto');
 // V6: スタンプ機能は廃止した（POST /api/shared-goals/:id/stamp を削除）。
 // shared_goal_stamps テーブルと loadGoalDetail の stamps 読み取りは残置
 // （旧データの CASCADE 削除と互換性のため。v6クライアントは表示しない）。
-// V11: ペース% は生値（キャップなし）。rawPace() を参照。
+// V12・D班: 共有目標の種類（kind）。
+//   count=個数ベース（従来通り。unit は自由入力）/ time=時間ベース
+//   （target は分。unit は「分」固定）/ habit=習慣チェックベース
+//   （target は目標日数。1日1回のチェックで amount=1 を積む。
+//   進捗は「5日達成／30日」）。kind は新規オプションフィールドで、
+//   未指定・旧データは 'count' として扱う（既存の共有目標は壊さない）。
+//   ペース% の計算は種類によらず同じ（貢献合計 ÷ 今日までの計画量）。
+//   習慣は contribute で amount=1・1日1回までをサーバーで強制する。
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS shared_goals (
@@ -56,6 +63,9 @@ CREATE TABLE IF NOT EXISTS shared_goals (
   invite_code TEXT NOT NULL UNIQUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- V12・D班: kind は既存テーブルにも後付けする（CREATE TABLE IF NOT EXISTS
+-- だけでは既存行に列が増えないため ALTER を併記する）。
+ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'count';
 CREATE INDEX IF NOT EXISTS idx_shared_goals_owner ON shared_goals (owner_user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_shared_goals_code ON shared_goals (invite_code);
 CREATE TABLE IF NOT EXISTS shared_goal_members (
@@ -127,6 +137,16 @@ const isId = (v) => /^\d{1,18}$/.test(String(v));
 const anonName = (uid) => 'プレイヤー-' + crypto.createHash('sha256').update(String(uid)).digest('hex').slice(0, 4);
 
 const INVITE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 紛らわしい文字(0/O, 1/I/L)を除外（db.js の招待コードと同じ）
+
+// V12・D班: 共有目標の種類。count=個数 / time=時間（分）/ habit=習慣チェック（日数）。
+const SHARED_GOAL_KINDS = ['count', 'time', 'habit'];
+const normalizeKind = (v) => (SHARED_GOAL_KINDS.includes(v) ? v : 'count');
+// 種類ごとの単位（time は「分」固定、habit は単位なし、count は入力通り）。
+const unitForKind = (kind, unit) => {
+  if (kind === 'time') return '分';
+  if (kind === 'habit') return '';
+  return unit || '';
+};
 function randomInviteCode() {
   let out = '';
   for (let i = 0; i < 8; i++) out += INVITE_ALPHABET[Math.floor(Math.random() * INVITE_ALPHABET.length)];
@@ -270,7 +290,7 @@ function register({ app, db, auth }) {
 
   async function loadGoalDetailInner(goalId, viewerUserId) {
     const g = await q(
-      `SELECT id, owner_user_id, title, target, unit,
+      `SELECT id, owner_user_id, title, target, unit, kind,
               to_char(deadline, 'YYYY-MM-DD') AS deadline,
               to_char(start_date, 'YYYY-MM-DD') AS start_date,
               invite_code, created_at,
@@ -386,11 +406,18 @@ function register({ app, db, auth }) {
     }
 
     const totalContribution = memberList.reduce((s, m) => s + m.contribution, 0);
+    // V12・D班: 閲覧者（自分）の今日の貢献量。習慣チェックの「今日やった」
+    // 表示（済みならボタンを押せない）に使う。未指定なら 0。
+    const myTodayContribution = viewerUserId
+      ? (byUser[String(viewerUserId)] || { today: 0 }).today
+      : 0;
     return {
       id: String(goal.id),
       title: goal.title,
       target,
       unit: goal.unit || '',
+      // V12・D班: 種類。旧データは 'count'（DB の DEFAULT と同じ）。
+      kind: normalizeKind(goal.kind),
       deadline: dayString(goal.deadline),
       startDate: dayString(goal.start_date),
       inviteCode: goal.invite_code,
@@ -398,6 +425,7 @@ function register({ app, db, auth }) {
       isOwner: false, // 呼び出し側で上書きする（自分の行かどうかはここでは分からない）
       memberCount,
       totalContribution,
+      myTodayContribution,
       plannedByToday: planned,
       pacePercent: planned > 0 ? rawPace((totalContribution / planned) * 100) : (totalContribution > 0 ? 100 : 0),
       dailyTargetPerMember: dailyTarget,
@@ -452,10 +480,14 @@ function register({ app, db, auth }) {
     const b = req.body || {};
     const title = oneLine(b.title, 80);
     const target = Number(b.target);
-    const unit = oneLine(b.unit, 20);
+    // V12・D班: kind（count/time/habit。未指定・不正値は 'count'）。
+    // time は unit「分」固定、habit は unit なし・target は目標日数（1〜365）。
+    const kind = normalizeKind(b.kind);
+    const unit = unitForKind(kind, oneLine(b.unit, 20));
     const deadline = String(b.deadline || '');
     if (!title) return res.status(400).json({ error: 'タイトルを入力してください。' });
     if (!Number.isFinite(target) || target <= 0 || target > 100000000) return res.status(400).json({ error: '目標量は 0 より大きい数で入力してください。' });
+    if (kind === 'habit' && target > 365) return res.status(400).json({ error: '習慣の目標日数は 365日までです。' });
     if (!parseDay(deadline)) return res.status(400).json({ error: '期限は YYYY-MM-DD で入力してください。' });
     if (parseDay(deadline) < parseDay(new Date().toISOString().slice(0, 10))) return res.status(400).json({ error: '期限は今日以降にしてください。' });
     const mine = await q('SELECT COUNT(*)::int AS n FROM shared_goals WHERE owner_user_id = $1', [uid]);
@@ -473,9 +505,9 @@ function register({ app, db, auth }) {
       try {
         await client.query('BEGIN');
         const ins = await client.query(
-          `INSERT INTO shared_goals (owner_user_id, title, target, unit, deadline, invite_code)
-           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-          [uid, title, target, unit, deadline, code]);
+          `INSERT INTO shared_goals (owner_user_id, title, target, unit, kind, deadline, invite_code)
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+          [uid, title, target, unit, kind, deadline, code]);
         goalId = ins.rows[0].id;
         await client.query('INSERT INTO shared_goal_members (goal_id, user_id, display_name) VALUES ($1, $2, $3)',
           [goalId, uid, creatorName]);
@@ -582,6 +614,17 @@ function register({ app, db, auth }) {
     const amount = Number(req.body && req.body.amount);
     const note = clean(req.body && req.body.note, 100);
     if (!Number.isFinite(amount) || amount <= 0 || amount > 100000000) return res.status(400).json({ error: '記録する量は 0 より大きい数で入力してください。' });
+    // V12・D班: 習慣チェックは 1日1回・amount=1 だけ（チェック＝1日達成）。
+    // 複数回・まとめての記録で日数を水増しできないようにする。
+    const gKind = await q('SELECT kind FROM shared_goals WHERE id = $1', [req.params.id]);
+    if (gKind.rowCount && normalizeKind(gKind.rows[0].kind) === 'habit') {
+      if (amount !== 1) return res.status(400).json({ error: '習慣チェックは1日1回です。' });
+      const today = await q(
+        `SELECT COUNT(*)::int AS n FROM shared_goal_contributions
+         WHERE goal_id = $1 AND user_id = $2 AND contributed_date = CURRENT_DATE`,
+        [req.params.id, uid]);
+      if (today.rows[0].n > 0) return res.status(400).json({ error: '今日はすでにチェック済みです。' });
+    }
     await q(
       `INSERT INTO shared_goal_contributions (goal_id, user_id, amount, note) VALUES ($1, $2, $3, $4)`,
       [req.params.id, uid, amount, note]);
@@ -711,8 +754,16 @@ module.exports = { register, parseDay, daysBetween, plannedByToday, formatDay };
  *      （タスクは貢献量に換算しない＝順位はペース%のまま）
  *    - DELETE /api/shared-goals/:id/tasks/:taskId はオーナー以外 403
  *    - 31件目のタスク作成は 400（上限30件）
- * 6. GET /api/version → { version: '7.0.0', features: { sharedGoals: true, ... } }
+ * 6. GET /api/version → { version: '7.1.0', features: { sharedGoals: true, ... } }
  *    が返ること（server.js に追加済み。旧サーバーでは 404 になる）。
+ *    V12・D班: バージョンは 7.1.0 に上がる（activity feed のページングと
+ *    共有目標 kind の追加のため。Render の再デプロイが必要）。
+ * 7. 共有目標の種類（V12・D班）:
+ *    - POST /api/shared-goals（kind: 'time'）→ goal.kind='time'、unit='分'
+ *    - POST /api/shared-goals（kind: 'habit', target: 30）→ goal.kind='habit'、unit=''
+ *    - kind 未指定の作成 → goal.kind='count'（従来通り）
+ *    - habit の contribute は amount=1 のみ、同じ日に2回目は 400
+ *    - 旧データ（kind 列が無い頃の目標）→ GET で kind='count' が返ること
  * 7. 503 が出たときの切り分け（v5）: Render → Logs で
  *    `[shared-goals] requestId=... POST /api/shared-goals user=... step=... error=...`
  *    を探す。step=loadGoalDetail なら集計の例外、step=ensure-schema なら

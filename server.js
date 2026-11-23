@@ -37,7 +37,7 @@ const REQUIRE_AUTH = process.env.REQUIRE_AUTH === 'true';
 // ==========================================================================
 // AI利用枠（週単位・毎週月曜0:00 JSTにリセット）
 //   無料 : 週10回（利用開始から7日間は週50回） / Premium : 週300回
-//   特典 : シェアで今週だけ +3（週1回） / 友達招待で双方に +10（ボーナス残高・期限なし）
+//   特典 : シェアで1日1回 +10（日付キー・JST。V12・E班【10】で週1回+3から変更） / 友達招待で双方に +10（ボーナス残高・期限なし）
 // 値はすべて環境変数で上書きできる。コードを触らずに調整可能。
 // ==========================================================================
 const FREE_WEEKLY_LIMIT = parseInt(process.env.FREE_WEEKLY_LIMIT || '10', 10);
@@ -45,7 +45,7 @@ const PAID_WEEKLY_LIMIT = parseInt(process.env.PAID_WEEKLY_LIMIT || '300', 10);
 // お試し期間: アカウント作成（初回サインイン）から FREE_TRIAL_DAYS 日間は、無料でも週 FREE_TRIAL_WEEKLY_LIMIT 回まで使える
 const FREE_TRIAL_DAYS = parseInt(process.env.FREE_TRIAL_DAYS || '7', 10);
 const FREE_TRIAL_WEEKLY_LIMIT = parseInt(process.env.FREE_TRIAL_WEEKLY_LIMIT || '50', 10);
-const SHARE_BONUS_AMOUNT = parseInt(process.env.SHARE_BONUS_AMOUNT || '3', 10);
+const SHARE_BONUS_AMOUNT = parseInt(process.env.SHARE_BONUS_AMOUNT || '10', 10);
 const REFERRAL_FRIEND_BONUS = parseInt(process.env.REFERRAL_FRIEND_BONUS || '10', 10);
 const REFERRAL_OWNER_BONUS = parseInt(process.env.REFERRAL_OWNER_BONUS || '10', 10);
 const REFERRAL_OWNER_MAX = parseInt(process.env.REFERRAL_OWNER_MAX || '5', 10);
@@ -242,7 +242,7 @@ async function buildUsage(user) {
   const [window, used, shareBonus, fresh, referralCount] = await Promise.all([
     db.getWeekWindow(),
     db.getWeeklyUsed(user.id),
-    db.getShareBonusThisWeek(user.id),
+    db.getShareBonusToday(user.id),
     db.getUserById(user.id),
     db.countReferrals(user.id),
   ]);
@@ -268,6 +268,10 @@ async function buildUsage(user) {
     remaining: remainingWeekly + bonusCredits,
     resetsAt: window.nextReset,
     shareBonusAmount: SHARE_BONUS_AMOUNT,
+    // V12・E班【10】：シェア特典は1日1回。shareClaimedToday が正しいフラグ。
+    // shareClaimedThisWeek は旧クライアント互換の別名（同じ値。旧アプリは
+    // 「今週受け取り済み」と読むが、明日には false に戻るため安全）。
+    shareClaimedToday: shareBonus > 0,
     shareClaimedThisWeek: shareBonus > 0,
     referralBonus: { friend: REFERRAL_FRIEND_BONUS, owner: REFERRAL_OWNER_BONUS, ownerMax: REFERRAL_OWNER_MAX },
     referralCount,
@@ -328,6 +332,7 @@ async function buildDeviceUsage(deviceId) {
     remaining: remainingWeekly + d.bonusCredits,
     resetsAt: d.nextReset,
     shareBonusAmount: SHARE_BONUS_AMOUNT,
+    shareClaimedToday: false,
     shareClaimedThisWeek: false,
     referralBonus: { friend: REFERRAL_FRIEND_BONUS, owner: REFERRAL_OWNER_BONUS, ownerMax: REFERRAL_OWNER_MAX },
     referralCount: 0,
@@ -473,8 +478,8 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.0.0',
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true },
+    version: '7.1.0',
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true },
   });
 });
 
@@ -997,7 +1002,9 @@ app.get('/api/shared-decks', optionalAuth, async (req, res) => {
 });
 
 // ---- 公開デッキのカテゴリー（教科）一覧：デッキが1件以上あるカテゴリーだけを件数付きで返す ----
-// カテゴリー名はユーザーが作ったタスクカテゴリー由来の自由入力で、固定の教科一覧は無い。
+// v11.1 からクライアントは6個の固定プリセット（英語／数学・理科／資格・試験／仕事／趣味／その他）の
+// 日本語名だけを categoryName として送る。v11.1 より前に公開されたデッキにはタスクカテゴリー由来の
+// 自由入力名が残っているため、この一覧はサーバー側の実在名をそのまま返す（固定一覧にはしない）。
 // そのため「カテゴリーごと」の絞り込みは、実際にデッキがある名前だけを出すこの一覧を使う。
 // NOTE: /api/shared-decks/:id より前に置くこと（'categories' が :id に取られないように）。
 app.get('/api/shared-decks/categories', optionalAuth, async (req, res) => {
@@ -1309,11 +1316,13 @@ app.get('/api/usage', async (req, res) => {
   }
 });
 
-// シェア特典: 今週分(+SHARE_BONUS_AMOUNT)。1人・1週1回。アプリ側はシェア画面が実際に完了したときだけ呼ぶ。
+// シェア特典: 今日分(+SHARE_BONUS_AMOUNT)。1人・1日1回（V12・E班【10】で週1回から変更）。
+// 日付キーは JST・DBの時計（db.grantShareBonusToday）。アプリ側はシェア画面が
+// 実際に完了したときだけ呼ぶ。
 app.post('/api/share/claim', auth.requireAuth, async (req, res) => {
   try {
     if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable' });
-    const granted = await db.grantShareBonusThisWeek(req.userId, SHARE_BONUS_AMOUNT);
+    const granted = await db.grantShareBonusToday(req.userId, SHARE_BONUS_AMOUNT);
     const user = await db.getUserById(req.userId);
     res.json({ granted, amount: granted ? SHARE_BONUS_AMOUNT : 0, usage: await buildUsage(user) });
   } catch (err) {

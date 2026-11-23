@@ -229,6 +229,8 @@ async function getWeeklyUsed(userId) {
 }
 
 // 今週のシェア特典（付与済みならその量、未付与なら0）
+// V12 で日次に移行したため旧・週1回版は使わない（互換のため残置）。
+// 新規の付与・照会は getShareBonusToday / grantShareBonusToday を使うこと。
 async function getShareBonusThisWeek(userId) {
   const { weekDate } = await getWeekWindow();
   const { rows } = await pool.query(
@@ -240,6 +242,7 @@ async function getShareBonusThisWeek(userId) {
 
 // 今週分のシェア特典を付与する。(user_id, bonus_date)の主キーで「1人・1週1回」をDBが保証する。
 // 付与できたら true、すでに付与済みなら false。
+// V12 で日次に移行したため旧・週1回版は使わない（互換のため残置）。
 async function grantShareBonusThisWeek(userId, amount) {
   const { weekDate } = await getWeekWindow();
   const { rowCount } = await pool.query(
@@ -247,6 +250,41 @@ async function grantShareBonusThisWeek(userId, amount) {
      VALUES ($1, $2, $3)
      ON CONFLICT (user_id, bonus_date) DO NOTHING`,
     [userId, weekDate, amount]
+  );
+  return rowCount > 0;
+}
+
+// V12・E班【10】：今日の日付（JST・DBの時計）。シェア特典の1日1回の日付キー。
+// 端末の時計は変えられるため使わない。週の区切り（getWeekWindow）と同じく DB の now() が起点。
+async function getTodayDateJST() {
+  const { rows } = await pool.query(
+    `SELECT to_char(now() AT TIME ZONE $1, 'YYYY-MM-DD') AS today`,
+    [WEEK_TZ]
+  );
+  return rows[0].today;
+}
+
+// V12・E班【10】：今日のシェア特典（付与済みならその量、未付与なら0）。
+// share_bonuses テーブルはそのまま使い、bonus_date に「今日の日付」を入れる
+// （週版は月曜の日付を入れていた。テーブル・主キー・制約の変更なし）。
+async function getShareBonusToday(userId) {
+  const today = await getTodayDateJST();
+  const { rows } = await pool.query(
+    'SELECT amount FROM share_bonuses WHERE user_id = $1 AND bonus_date = $2',
+    [userId, today]
+  );
+  return rows[0] ? parseInt(rows[0].amount, 10) : 0;
+}
+
+// V12・E班【10】：今日分のシェア特典を付与する。(user_id, bonus_date)の主キーで
+// 「1人・1日1回」をDBが保証する。付与できたら true、今日すでに付与済みなら false。
+async function grantShareBonusToday(userId, amount) {
+  const today = await getTodayDateJST();
+  const { rowCount } = await pool.query(
+    `INSERT INTO share_bonuses (user_id, bonus_date, amount)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, bonus_date) DO NOTHING`,
+    [userId, today, amount]
   );
   return rowCount > 0;
 }
@@ -933,6 +971,8 @@ module.exports = {
   getUserByOriginalTransactionId,
   getShareBonusThisWeek,
   grantShareBonusThisWeek,
+  getShareBonusToday,
+  grantShareBonusToday,
   upsertDailyCategoryScores,
   getCategoryLeaderboard,
   getOnlineProfile,

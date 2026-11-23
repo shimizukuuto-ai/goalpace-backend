@@ -5,7 +5,11 @@
 //   投稿はクライアントの完了フックから POST /api/activity で送る
 //   （App.tsx 側の配線は iteration11_notes/integration-b.md を参照。
 //   このモジュール自体は App.tsx を触らない）。
-//   表示は GET /api/activity/feed（直近7日・新しい順・最大30件）。
+//   表示は GET /api/activity/feed（直近7日・新しい順）。
+//   V12・D班: 無限に長くならないようページング付き。
+//   ?limit=（既定20・最大50）&offset=（既定0）。limit+1 件読んで
+//   hasMore を判定し、nextOffset を返す。クライアントは初回20件＋
+//   「もっと見る」で追加読み込みする。
 //
 // 方針（community.js と同じ流儀）:
 // - 匿名IDベース。認証オン時はセッションの userId、認証オフ時は
@@ -152,22 +156,27 @@ function register({ app, db, auth }) {
     res.json({ ok: true, id: String(ins.rows[0].id), hidden, createdAt: ins.rows[0].created_at });
   }));
 
-  // ================= フィード（直近7日・新しい順・最大30件） =================
+  // ================= フィード（直近7日・新しい順・ページング付き） =================
   // ?userId= で自分の行に mine が付く。通報で非表示になったものは出ない。
+  // V12・D班: ?limit=（既定20・1〜50）&offset=（既定0）。limit+1 件読んで
+  // hasMore を判定する（余分な1件は返さない）。nextOffset は次の offset。
   app.get('/api/activity/feed', wrap(async (req, res) => {
     const uid = resolveIdentity(req);
-    const limit = Math.max(1, Math.min(30, Math.floor(Number(req.query.limit) || 30)));
+    const limit = Math.max(1, Math.min(50, Math.floor(Number(req.query.limit) || 20)));
+    const offset = Math.max(0, Math.floor(Number(req.query.offset) || 0));
     const r = await q(
       `SELECT id, author_name, kind, text, created_at,
               (owner_user_id = $1) AS mine
        FROM activity_events
        WHERE hidden = FALSE AND created_at > NOW() - INTERVAL '7 days'
        ORDER BY created_at DESC, id DESC
-       LIMIT $2`,
-      [uid, limit]
+       LIMIT $2 OFFSET $3`,
+      [uid, limit + 1, offset]
     );
+    const hasMore = r.rows.length > limit;
+    const rows = hasMore ? r.rows.slice(0, limit) : r.rows;
     res.json({
-      events: r.rows.map((x) => ({
+      events: rows.map((x) => ({
         id: String(x.id),
         authorName: x.author_name,
         kind: x.kind,
@@ -175,6 +184,10 @@ function register({ app, db, auth }) {
         createdAt: x.created_at,
         mine: !!x.mine,
       })),
+      hasMore,
+      nextOffset: offset + rows.length,
+      limit,
+      offset,
     });
   }));
 
