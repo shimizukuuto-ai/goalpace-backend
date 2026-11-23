@@ -88,6 +88,20 @@ const { screenText } = require('./community');
 //   achievementStatus / achievedAt / deadlineResult / declaredCount /
 //   myDeclared / deadlinePassed とメンバーごとの declared を返す。
 //   旧データは全て 'active'・申告なし（表示・判定とも従来通り）。
+// V12.8・C班: 共有目標のチーム管理（メンバーごとの週間統計と最近の記録）。
+//   - 週間統計: loadGoalDetail が members[] の各行に weeklyStats
+//     { pomodoro, memorized, tasksDone, weekStart } を付ける。出所は
+//     POST /api/leaderboard/sync-pace が今週分として保存する pace_scores
+//     （db.getWeekWindow と同じ月曜 0:00 JST の週）。新規テーブル・列は
+//     作らない（pace_scores は V11 からある）。統計を送っていない
+//     メンバーは 0（未送信と 0 回は区別しない）。pace_scores が無い
+//     環境でも詳細が 503 にならないよう、読み取り失敗時は 0 扱いにする。
+//   - 最近の記録: 新規 GET /api/shared-goals/:id/members/:userId/activity。
+//     /api/activity/feed の activity_events（task/card/pomodoro/goal、
+//     hidden のものは出さない）と、この共有目標への貢献記録
+//     （shared_goal_contributions）を新しい順に混ぜて返す（既定10件・
+//     最大20件）。閲覧者・対象ともメンバー限定（非メンバーは 403、
+//     対象がメンバーでなければ 404）。
 // V12.2・A班: 共有目標の公開範囲（visibility: private/public。未指定・
 //   旧データは 'private'）とコメント（shared_goal_comments）。
 //   公開目標は GET /api/shared-goals/public で一覧でき、
@@ -535,6 +549,33 @@ function register({ app, db, auth }) {
     }
     const latestValueOverall = values.rows.length ? Number(values.rows[0].value) : null;
 
+    // V12.8・C班: メンバーごとの今週の統計（暗記したカード枚数・
+    // ポモドーロ回数・完了タスク数）。出所は sync-pace が保存する
+    // pace_scores。週の区切りは sync-pace と同じ月曜 0:00 JST
+    // （db.getWeekWindow と同じ式を SQL で再現する）。
+    // pace_scores が無い環境でも詳細が壊れないよう、読み取りに
+    // 失敗したら 0 扱いにする（ここで例外を投げない）。
+    let weeklyStatsByUser = {};
+    let weekStart = null;
+    try {
+      const weekRow = await q(
+        `SELECT to_char(date_trunc('week', now() AT TIME ZONE 'Asia/Tokyo'), 'YYYY-MM-DD') AS week_start`);
+      weekStart = (weekRow.rows[0] && weekRow.rows[0].week_start) || null;
+      if (weekStart && members.rows.length > 0) {
+        const statsRows = await q(
+          `SELECT user_id, pomodoro, memorized, tasks_done FROM pace_scores
+           WHERE user_id = ANY($1::text[]) AND week_date = $2::date`,
+          [members.rows.map((m) => m.user_id), weekStart]);
+        for (const r of statsRows.rows) {
+          weeklyStatsByUser[r.user_id] = {
+            pomodoro: Math.max(0, Number(r.pomodoro) || 0),
+            memorized: Math.max(0, Number(r.memorized) || 0),
+            tasksDone: Math.max(0, Number(r.tasks_done) || 0),
+          };
+        }
+      }
+    } catch (_) { weeklyStatsByUser = {}; }
+
     const memberList = members.rows.map((m) => {
       const u = byUser[m.user_id] || { total: 0, today: 0, winDates: new Set() };
       const memberPlanned = memberCount > 0 ? planned / memberCount : 0;
@@ -577,6 +618,14 @@ function register({ app, db, auth }) {
         wonToday: u.winDates.has(goal.today),
         // V12.2・A班: 直近の活動日時（貢献・タスク完了の最新。無ければ参加日時）。
         lastActiveAt: lastActiveByUser[m.user_id] || m.joined_at,
+        // V12.8・C班: 今週の統計（暗記枚数・ポモドーロ回数・完了タスク数。
+        // sync-pace の pace_scores 由来。統計を送っていないメンバーは 0）。
+        weeklyStats: {
+          pomodoro: (weeklyStatsByUser[m.user_id] || {}).pomodoro || 0,
+          memorized: (weeklyStatsByUser[m.user_id] || {}).memorized || 0,
+          tasksDone: (weeklyStatsByUser[m.user_id] || {}).tasksDone || 0,
+          weekStart,
+        },
         // 共通タスク：そのメンバーが今日完了したタスク数（後で tasks から数えて入れる）
         tasksDoneToday: 0,
         isOwner: m.user_id === goal.owner_user_id,
@@ -664,6 +713,8 @@ function register({ app, db, auth }) {
       memberCount,
       // V12.4・A班: メンバー上限（10人）。クライアントは満員表示に使う。
       maxMembers: SHARED_GOAL_MAX_MEMBERS,
+      // V12.8・C班: 今週の月曜（weeklyStats の週の区切り。sync-pace と同じ）。
+      weekStart,
       totalContribution,
       myTodayContribution,
       plannedByToday: planned,
@@ -926,6 +977,61 @@ function register({ app, db, auth }) {
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
     res.json({ goal: detail });
+  }));
+
+  // ================= メンバーの最近の記録（V12.8・C班） =================
+  // GET /api/shared-goals/:id/members/:userId/activity
+  //   ?limit=（既定10・1〜20）。閲覧者・対象ともメンバー限定。
+  //   /api/activity/feed の activity_events（task/card/pomodoro/goal。
+  //   公開オフ・通報で hidden のものは出さない）と、この共有目標への
+  //   貢献記録（shared_goal_contributions）を新しい順に混ぜて返す
+  //   （直近7日分。貢献の text が空のときはクライアントが量から作る）。
+  //   どちらかのテーブルが無い環境でも空の一覧を返す（503 にしない）。
+  app.get('/api/shared-goals/:id/members/:userId/activity', auth.requireAuth, wrap(async (req, res) => {
+    if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。' });
+    const targetUserId = String(req.params.userId || '');
+    if (!targetUserId || targetUserId.length > 80) return res.status(400).json({ error: '不正なIDです。' });
+    const uid = String(req.userId);
+    if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。' });
+    if (!(await isMember(req.params.id, targetUserId))) return res.status(404).json({ error: 'メンバーが見つかりません。' });
+    const limit = Math.max(1, Math.min(20, Math.floor(Number(req.query.limit) || 10)));
+    const events = [];
+    try {
+      const feedRows = await q(
+        `SELECT id, kind, text, created_at FROM activity_events
+         WHERE owner_user_id = $1 AND hidden = FALSE AND created_at > NOW() - INTERVAL '7 days'
+         ORDER BY created_at DESC, id DESC LIMIT $2`,
+        [targetUserId, limit]);
+      for (const r of feedRows.rows) {
+        events.push({
+          id: `a-${r.id}`, kind: r.kind, text: r.text || '',
+          createdAt: r.created_at,
+        });
+      }
+    } catch (_) { /* activity_events が無い環境では貢献記録だけ返す */ }
+    try {
+      const contribRows = await q(
+        `SELECT id, amount, note, created_at FROM shared_goal_contributions
+         WHERE goal_id = $1 AND user_id = $2 AND created_at > NOW() - INTERVAL '7 days'
+         ORDER BY created_at DESC, id DESC LIMIT $3`,
+        [req.params.id, targetUserId, limit]);
+      for (const r of contribRows.rows) {
+        events.push({
+          id: `c-${r.id}`, kind: 'contribution', text: r.note || '',
+          amount: Number(r.amount),
+          createdAt: r.created_at,
+        });
+      }
+    } catch (_) { /* 貢献記録が読めなくてもフィード分は返す */ }
+    events.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    const memberRow = await q(
+      'SELECT display_name FROM shared_goal_members WHERE goal_id = $1 AND user_id = $2',
+      [req.params.id, targetUserId]);
+    res.json({
+      events: events.slice(0, limit),
+      memberUserId: targetUserId,
+      displayName: (memberRow.rows[0] && memberRow.rows[0].display_name) || anonName(targetUserId),
+    });
   }));
 
   // 招待コードで参加（コードは大文字・英数字のみに正規化）
@@ -1537,6 +1643,19 @@ module.exports = { register, parseDay, daysBetween, plannedByToday, formatDay };
  *    - GET /api/shared-goals/public の各行に achievementStatus が付くこと
  *    - GET /api/version → { version: '7.5.0', features: {
  *      achievementRuleExecution: true, ... } }
+ * 13. メンバーごとの週間統計と最近の記録（V12.8・C班。バージョンは 7.6.0 に上がる）:
+ *    - GET /api/shared-goals/:id の members[] に weeklyStats
+ *      { pomodoro, memorized, tasksDone, weekStart } が付くこと
+ *      （今週の月曜始まり。sync-pace で統計を送ったメンバーの数が入る。
+ *      送っていないメンバーは 0）。weekStart は今週の月曜の日付。
+ *    - 週間統計が無くても GET /api/shared-goals/:id が 200 で返ること
+ *      （pace_scores が空でも 503 にならない）。
+ *    - GET /api/shared-goals/:id/members/:userId/activity（メンバー）→
+ *      { events: [{ id, kind, text, createdAt }] }。kind は
+ *      task/card/pomodoro/goal/contribution。直近7日・新しい順・既定10件。
+ *    - メンバーでない閲覧者 → 403。対象がメンバーでない → 404。
+ *    - GET /api/version → { version: '7.6.0', features: {
+ *      memberWeeklyStats: true, ... } }
  * 10. 503 が出たときの切り分け（v5）: Render → Logs で
  *    `[shared-goals] requestId=... POST /api/shared-goals user=... step=... error=...`
  *    を探す。step=loadGoalDetail なら集計の例外、step=ensure-schema なら
