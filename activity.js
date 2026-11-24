@@ -75,6 +75,28 @@ setInterval(() => {
 const clean = (v, max) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '');
 const anonName = (uid) => 'プレイヤー-' + crypto.createHash('sha256').update(String(uid)).digest('hex').slice(0, 4);
 
+// V12.18・D班: 日付のバリデーション（POST /api/activity の date 用）。
+// 日本時間の今日・昨日のみ受け付ける。形式不正・存在しない日付・
+// それ以外は null を返す（呼び出し側が 400 にする）。端末の時計は
+// 変えられるため、サーバー側（DB の now() ではなく Node の時計＋
+// Asia/Tokyo 固定）で今日・昨日を決める。
+function jstDateString(offsetDays) {
+  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit' });
+  const d = new Date(Date.now() + offsetDays * 86400000);
+  return fmt.format(d);
+}
+function parseBackfillDate(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const d = new Date(value + 'T00:00:00+09:00');
+  if (Number.isNaN(d.getTime())) return null;
+  // 存在しない日付（2026-02-30 等）はパースでずれるので弾く。
+  if (d.toISOString().slice(0, 10) !== value && new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d) !== value) return null;
+  const today = jstDateString(0);
+  const yesterday = jstDateString(-1);
+  if (value !== today && value !== yesterday) return null;
+  return value;
+}
+
 function register({ app, db, auth }) {
   let ready = null;
   function ensure() {
@@ -131,9 +153,13 @@ function register({ app, db, auth }) {
   });
 
   // ================= 投稿（タスク完了・暗記・集中・目標達成） =================
-  // body: { userId?, kind: 'task'|'card'|'pomodoro'|'goal', text, minutes? }
+  // body: { userId?, kind: 'task'|'card'|'pomodoro'|'goal', text, minutes?, date? }
   // text は「何をやったか」の短文（例：「単語テストを達成」「25分集中を完了」）。
   // minutes は集中の分数（V12.16・A班。pomodoro のときだけ送る。0〜1440分に丸める）。
+  // V12.18・D班: date は昨日の記録の修正用（YYYY-MM-DD・今日か昨日のみ。
+  //   渡された日付の正午（日本時間）で created_at を上書きする。フィード・
+  //   メンバー活動は created_at 順に読むため、実際の日付で返る。今日・昨日
+  //   以外は 400＋日英エラー）。
   // 連続投稿の暴走防止：1人10分に30件まで。公開オフの人は hidden で保存。
   app.post('/api/activity', wrap(async (req, res) => {
     const uid = resolveIdentity(req);
@@ -145,6 +171,13 @@ function register({ app, db, auth }) {
     const text = clean(req.body?.text, TEXT_MAX);
     if (!kind) return res.status(400).json({ error: 'kind を指定してください。', errorJa: 'kind を指定してください。', errorEn: 'Please specify a kind.' });
     if (!text) return res.status(400).json({ error: '内容を入力してください。', errorJa: '内容を入力してください。', errorEn: 'Please enter the content.' });
+    let backfillDate = null;
+    if (req.body?.date !== undefined && req.body.date !== null && req.body.date !== '') {
+      backfillDate = parseBackfillDate(req.body.date);
+      if (!backfillDate) {
+        return res.status(400).json({ error: '日付は今日か昨日（YYYY-MM-DD）で指定してください。', errorJa: '日付は今日か昨日（YYYY-MM-DD）で指定してください。', errorEn: 'Date must be today or yesterday (YYYY-MM-DD).', code: 'INVALID_DATE' });
+      }
+    }
     const rawMinutes = req.body?.minutes;
     const minutes = Number.isFinite(Number(rawMinutes)) ? Math.max(0, Math.min(1440, Math.floor(Number(rawMinutes)))) : 0;
     const s = screenText(text);
@@ -156,11 +189,16 @@ function register({ app, db, auth }) {
     } catch (_) { /* プロフィールが取れなくても投稿は受ける */ }
     const name = await authorNameFor(uid);
     const ins = await q(
-      `INSERT INTO activity_events (owner_user_id, author_name, kind, text, hidden, minutes)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
-      [uid, name, kind, text, hidden, minutes]
+      backfillDate
+        ? `INSERT INTO activity_events (owner_user_id, author_name, kind, text, hidden, minutes, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz) RETURNING id, created_at`
+        : `INSERT INTO activity_events (owner_user_id, author_name, kind, text, hidden, minutes)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
+      backfillDate
+        ? [uid, name, kind, text, hidden, minutes, `${backfillDate}T12:00:00+09:00`]
+        : [uid, name, kind, text, hidden, minutes]
     );
-    res.json({ ok: true, id: String(ins.rows[0].id), hidden, createdAt: ins.rows[0].created_at, minutes });
+    res.json({ ok: true, id: String(ins.rows[0].id), hidden, createdAt: ins.rows[0].created_at, minutes, ...(backfillDate ? { date: backfillDate } : {}) });
   }));
 
   // ================= フィード（直近7日・新しい順・ページング付き） =================
@@ -196,6 +234,84 @@ function register({ app, db, auth }) {
       nextOffset: offset + rows.length,
       limit,
       offset,
+    });
+  }));
+
+  // ================= 友達のアクティビティ（V12.18・D班） =================
+  // GET /api/activity/friends?limit=10（既定10・1〜50）。
+  // 友達＝既存の関係だけ（新規の友達システムは作らない）：
+  //   (a) 共有目標のメンバー（同じ shared_goal_members にいる人）、
+  //   (b) リーグの仲間（pace_scores の最新週にいる人・参加中のみ）。
+  // 自分のイベントは含まない。activityPublic をオフにしている人の
+  // イベントは出さない（投稿時の hidden に加え、現在のプロフィールでも
+  // 絞る。プロフィールが取れない人は hidden だけで判定する）。
+  // 返す形は feed と同じ { events: [{ id, authorName, kind, text, minutes, createdAt }] }
+  // に isOwnOnly: false・peerCount を付ける。仲間が0人のときも空配列を
+  // 返す（自分のイベントで埋めるフォールバックはしない＝正直な空状態）。
+  app.get('/api/activity/friends', wrap(async (req, res) => {
+    const uid = resolveIdentity(req);
+    if (!uid) return res.json({ events: [], isOwnOnly: false, peerCount: 0 });
+    const limit = Math.max(1, Math.min(50, Math.floor(Number(req.query.limit) || 10)));
+    let peerIds = [];
+    try {
+      const team = await q(
+        `SELECT DISTINCT user_id FROM shared_goal_members
+         WHERE goal_id IN (SELECT goal_id FROM shared_goal_members WHERE user_id = $1)
+           AND user_id <> $1`,
+        [uid]
+      );
+      peerIds.push(...team.rows.map((r) => String(r.user_id)));
+    } catch (_) { /* shared_goal_members が無い環境ではリーグ仲間だけ */ }
+    try {
+      const league = await q(
+        `SELECT user_id FROM pace_scores
+         WHERE week_date = (SELECT MAX(week_date) FROM pace_scores)
+           AND league_opt_in = TRUE AND user_id <> $1`,
+        [uid]
+      );
+      peerIds.push(...league.rows.map((r) => String(r.user_id)));
+    } catch (_) { /* pace_scores が無い環境では共有目標の仲間だけ */ }
+    peerIds = [...new Set(peerIds)].filter(Boolean);
+    if (!peerIds.length) return res.json({ events: [], isOwnOnly: false, peerCount: 0 });
+    let rows;
+    try {
+      const r = await q(
+        `SELECT e.id, e.author_name, e.kind, e.text, e.minutes, e.created_at
+         FROM activity_events e
+         LEFT JOIN online_profiles p ON p.user_id = e.owner_user_id
+         WHERE e.hidden = FALSE
+           AND (p.activity_public IS NULL OR p.activity_public = TRUE)
+           AND e.owner_user_id = ANY($1::text[])
+           AND e.created_at > NOW() - INTERVAL '7 days'
+         ORDER BY e.created_at DESC, e.id DESC
+         LIMIT $2`,
+        [peerIds, limit]
+      );
+      rows = r.rows;
+    } catch (_) {
+      // online_profiles が無い環境では hidden だけで絞る。
+      const r = await q(
+        `SELECT id, author_name, kind, text, minutes, created_at
+         FROM activity_events
+         WHERE hidden = FALSE AND owner_user_id = ANY($1::text[])
+           AND created_at > NOW() - INTERVAL '7 days'
+         ORDER BY created_at DESC, id DESC
+         LIMIT $2`,
+        [peerIds, limit]
+      );
+      rows = r.rows;
+    }
+    res.json({
+      events: rows.map((x) => ({
+        id: String(x.id),
+        authorName: x.author_name,
+        kind: x.kind,
+        text: x.text,
+        minutes: Number(x.minutes) || 0,
+        createdAt: x.created_at,
+      })),
+      isOwnOnly: false,
+      peerCount: peerIds.length,
     });
   }));
 
