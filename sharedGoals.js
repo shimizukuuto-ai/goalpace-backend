@@ -102,6 +102,13 @@ const { screenText } = require('./community');
 //     （shared_goal_contributions）を新しい順に混ぜて返す（既定10件・
 //     最大20件）。閲覧者・対象ともメンバー限定（非メンバーは 403、
 //     対象がメンバーでなければ 404）。
+// V12.15・B班: メンバーごとの累計の実績（チーム表示用）。
+//   - loadGoalDetail が members[] の各行に totalStats
+//     { pomodoro, memorized, tasksDone } を付ける。出所は weeklyStats と
+//     同じ pace_scores だが、週で絞らず全週の合計（SUM）にする。
+//     新規テーブル・列は作らない。weeklyStats は旧クライアント互換の
+//     ため残す（表示には使わない）。読み取り失敗時は 0 扱いにする。
+//   - バージョンは 7.9.0 に上がる（features.memberTotalStats）。
 // V12.2・A班: 共有目標の公開範囲（visibility: private/public。未指定・
 //   旧データは 'private'）とコメント（shared_goal_comments）。
 //   公開目標は GET /api/shared-goals/public で一覧でき、
@@ -650,6 +657,30 @@ function register({ app, db, auth }) {
       }
     } catch (_) { weeklyStatsByUser = {}; }
 
+    // V12.15・B班: メンバーごとの累計の実績（暗記したカード枚数・
+    // ポモドーロ回数・完了タスク数）。出所は weeklyStats と同じ
+    // pace_scores だが、週で絞らず全週の合計（SUM）にする。
+    // pace_scores が無い環境でも詳細が壊れないよう、読み取りに
+    // 失敗したら 0 扱いにする（ここで例外を投げない）。
+    let totalStatsByUser = {};
+    try {
+      if (members.rows.length > 0) {
+        const totalRows = await q(
+          `SELECT user_id, COALESCE(SUM(pomodoro), 0) AS pomodoro,
+                  COALESCE(SUM(memorized), 0) AS memorized,
+                  COALESCE(SUM(tasks_done), 0) AS tasks_done
+           FROM pace_scores WHERE user_id = ANY($1::text[]) GROUP BY user_id`,
+          [members.rows.map((m) => m.user_id)]);
+        for (const r of totalRows.rows) {
+          totalStatsByUser[r.user_id] = {
+            pomodoro: Math.max(0, Number(r.pomodoro) || 0),
+            memorized: Math.max(0, Number(r.memorized) || 0),
+            tasksDone: Math.max(0, Number(r.tasks_done) || 0),
+          };
+        }
+      }
+    } catch (_) { totalStatsByUser = {}; }
+
     const memberList = members.rows.map((m) => {
       const u = byUser[m.user_id] || { total: 0, today: 0, winDates: new Set() };
       const memberPlanned = memberCount > 0 ? planned / memberCount : 0;
@@ -699,6 +730,13 @@ function register({ app, db, auth }) {
           memorized: (weeklyStatsByUser[m.user_id] || {}).memorized || 0,
           tasksDone: (weeklyStatsByUser[m.user_id] || {}).tasksDone || 0,
           weekStart,
+        },
+        // V12.15・B班: 累計の実績（暗記枚数・ポモドーロ回数・完了タスク数。
+        // pace_scores の全週の合計。weeklyStats は旧クライアント互換のため残す）。
+        totalStats: {
+          pomodoro: (totalStatsByUser[m.user_id] || {}).pomodoro || 0,
+          memorized: (totalStatsByUser[m.user_id] || {}).memorized || 0,
+          tasksDone: (totalStatsByUser[m.user_id] || {}).tasksDone || 0,
         },
         // 共通タスク：そのメンバーが今日完了したタスク数（後で tasks から数えて入れる）
         tasksDoneToday: 0,
@@ -1114,13 +1152,14 @@ function register({ app, db, auth }) {
     const events = [];
     try {
       const feedRows = await q(
-        `SELECT id, kind, text, created_at FROM activity_events
+        `SELECT id, kind, text, minutes, created_at FROM activity_events
          WHERE owner_user_id = $1 AND hidden = FALSE AND created_at > NOW() - INTERVAL '7 days'
          ORDER BY created_at DESC, id DESC LIMIT $2`,
         [targetUserId, limit]);
       for (const r of feedRows.rows) {
         events.push({
           id: `a-${r.id}`, kind: r.kind, text: r.text || '',
+          minutes: Number(r.minutes) || 0,
           createdAt: r.created_at,
         });
       }
@@ -1827,6 +1866,17 @@ module.exports = { register, parseDay, daysBetween, plannedByToday, formatDay };
  *    - メンバーでない閲覧者 → 403。対象がメンバーでない → 404。
  *    - GET /api/version → { version: '7.6.0', features: {
  *      memberWeeklyStats: true, ... } }
+ * 14. メンバーごとの累計の実績（V12.15・B班。バージョンは 7.9.0 に上がる）:
+ *    - GET /api/shared-goals/:id の members[] に totalStats
+ *      { pomodoro, memorized, tasksDone } が付くこと
+ *      （pace_scores の全週の合計。週の区切りは無い。統計を送ったことが
+ *      あるメンバーの累計が入り、送っていないメンバーは 0）。
+ *    - weeklyStats { pomodoro, memorized, tasksDone, weekStart } は
+ *      旧クライアント互換のため残ること。
+ *    - 累計の集計が無くても GET /api/shared-goals/:id が 200 で返ること
+ *      （pace_scores が空でも 503 にならない）。
+ *    - GET /api/version → { version: '7.9.0', features: {
+ *      memberTotalStats: true, ... } }
  * 10. 503 が出たときの切り分け（v5）: Render → Logs で
  *    `[shared-goals] requestId=... POST /api/shared-goals user=... step=... error=...`
  *    を探す。step=loadGoalDetail なら集計の例外、step=ensure-schema なら

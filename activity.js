@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS activity_events (
 );
 CREATE INDEX IF NOT EXISTS idx_activity_events_feed ON activity_events (hidden, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_events_owner ON activity_events (owner_user_id, created_at DESC);
+-- V12.16・A班: minutes（集中の分数。pomodoro のときだけ送る。旧データは
+--   DEFAULT 0＝「分が分からない昔の記録は 0 分扱い」。community.js の
+--   like_count と同じ ADD COLUMN IF NOT EXISTS パターン）。
+ALTER TABLE activity_events ADD COLUMN IF NOT EXISTS minutes INTEGER NOT NULL DEFAULT 0;
 -- 通報は community_reports を流用する（community.js と同じ定義。
 -- community 側の ensure より先に通報が来ても動くよう、ここでも作る）。
 CREATE TABLE IF NOT EXISTS community_reports (
@@ -127,8 +131,9 @@ function register({ app, db, auth }) {
   });
 
   // ================= 投稿（タスク完了・暗記・集中・目標達成） =================
-  // body: { userId?, kind: 'task'|'card'|'pomodoro'|'goal', text }
+  // body: { userId?, kind: 'task'|'card'|'pomodoro'|'goal', text, minutes? }
   // text は「何をやったか」の短文（例：「単語テストを達成」「25分集中を完了」）。
+  // minutes は集中の分数（V12.16・A班。pomodoro のときだけ送る。0〜1440分に丸める）。
   // 連続投稿の暴走防止：1人10分に30件まで。公開オフの人は hidden で保存。
   app.post('/api/activity', wrap(async (req, res) => {
     const uid = resolveIdentity(req);
@@ -140,6 +145,8 @@ function register({ app, db, auth }) {
     const text = clean(req.body?.text, TEXT_MAX);
     if (!kind) return res.status(400).json({ error: 'kind を指定してください。', errorJa: 'kind を指定してください。', errorEn: 'Please specify a kind.' });
     if (!text) return res.status(400).json({ error: '内容を入力してください。', errorJa: '内容を入力してください。', errorEn: 'Please enter the content.' });
+    const rawMinutes = req.body?.minutes;
+    const minutes = Number.isFinite(Number(rawMinutes)) ? Math.max(0, Math.min(1440, Math.floor(Number(rawMinutes)))) : 0;
     const s = screenText(text);
     if (!s.ok) return res.status(422).json({ error: s.error, errorJa: s.error, errorEn: s.errorEn, code: s.code });
     let hidden = false;
@@ -149,11 +156,11 @@ function register({ app, db, auth }) {
     } catch (_) { /* プロフィールが取れなくても投稿は受ける */ }
     const name = await authorNameFor(uid);
     const ins = await q(
-      `INSERT INTO activity_events (owner_user_id, author_name, kind, text, hidden)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-      [uid, name, kind, text, hidden]
+      `INSERT INTO activity_events (owner_user_id, author_name, kind, text, hidden, minutes)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
+      [uid, name, kind, text, hidden, minutes]
     );
-    res.json({ ok: true, id: String(ins.rows[0].id), hidden, createdAt: ins.rows[0].created_at });
+    res.json({ ok: true, id: String(ins.rows[0].id), hidden, createdAt: ins.rows[0].created_at, minutes });
   }));
 
   // ================= フィード（直近7日・新しい順・ページング付き） =================
@@ -165,7 +172,7 @@ function register({ app, db, auth }) {
     const limit = Math.max(1, Math.min(50, Math.floor(Number(req.query.limit) || 20)));
     const offset = Math.max(0, Math.floor(Number(req.query.offset) || 0));
     const r = await q(
-      `SELECT id, author_name, kind, text, created_at,
+      `SELECT id, author_name, kind, text, minutes, created_at,
               (owner_user_id = $1) AS mine
        FROM activity_events
        WHERE hidden = FALSE AND created_at > NOW() - INTERVAL '7 days'
@@ -181,6 +188,7 @@ function register({ app, db, auth }) {
         authorName: x.author_name,
         kind: x.kind,
         text: x.text,
+        minutes: Number(x.minutes) || 0,
         createdAt: x.created_at,
         mine: !!x.mine,
       })),

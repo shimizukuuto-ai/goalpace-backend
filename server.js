@@ -478,10 +478,17 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.8.0',
+    version: '7.10.0',
     // V12.11・A班: groupActivityToasts — グループ活動トースト用の
     // 出来事ストア（shared_goal_events）と GET /api/shared-goals/updates。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true },
+    // V12.15・B班: memberTotalStats — 共有目標メンバーの累計の実績
+    // （members[] の totalStats { pomodoro, memorized, tasksDone }。
+    // pace_scores の全週の合計。weeklyStats は互換のため残る）。
+    // V12.16・A班: activityMinutes — 活動記録に集中の分数 minutes を付ける
+    // （POST /api/activity の任意パラメータ、activity_events.minutes 列、
+    // GET /api/activity/feed とメンバーの最近の記録の応答にも minutes を返す。
+    // 旧データは 0。minutes が無い旧サーバーでもクライアントは 0 扱いで動く）。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true },
   });
 });
 
