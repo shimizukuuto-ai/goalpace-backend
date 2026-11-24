@@ -478,7 +478,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.11.0',
+    version: '7.12.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -486,7 +486,11 @@ app.get('/api/version', (req, res) => {
     // （POST /api/activity の任意 date。今日・昨日のみ。created_at を
     // その日の正午（日本時間）で保存し、フィード・メンバー活動は
     // 実際の日付で返す）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true },
+    // V12.19・A班: sharedDeckAuthor — 公開デッキに作者名＋作者IDを返す
+    // （listSharedDecks / getSharedDeck。'匿名' のハードコードを廃止）。
+    // V12.19・A班: onboardingSurveys — オンボーディング survey の回答保存
+    // （POST /api/onboarding-survey）と集計（GET /api/admin/onboarding-surveys）。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true },
   });
 });
 
@@ -496,7 +500,7 @@ app.get('/', (req, res) => {
     status: 'running',
     aiProvider: IS_OPENROUTER ? 'OpenRouter' : (API_KEY ? 'Groq (Llama 3)' : 'unconfigured'),
     model: DEFAULT_MODEL,
-    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/shared-goals/suggest-structure', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/activity', '/api/activity/feed', '/api/activity/friends', '/api/shared-goals/public', '/api/shared-goals/:id/join-public', '/api/shared-goals/:id/kick', '/api/shared-goals/kicked', '/api/shared-goals/updates', '/api/shared-goals/:id/comments', '/api/shared-goals/:id/declare', '/api/shared-goals/:id/deadline-result', '/api/shared-goals/:id/members/:userId/activity', '/health']
+    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/shared-goals/suggest-structure', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/activity', '/api/activity/feed', '/api/activity/friends', '/api/shared-goals/public', '/api/shared-goals/:id/join-public', '/api/shared-goals/:id/kick', '/api/shared-goals/kicked', '/api/shared-goals/updates', '/api/shared-goals/:id/comments', '/api/shared-goals/:id/declare', '/api/shared-goals/:id/deadline-result', '/api/shared-goals/:id/members/:userId/activity', '/api/onboarding-survey', '/api/admin/onboarding-surveys', '/health']
   });
 });
 
@@ -1229,8 +1233,12 @@ app.post('/api/shared-decks', auth.requireAuth, async (req, res) => {
     if (await db.countOwnSharedDecks(String(req.userId)) >= 20) {
       return res.status(400).json({ error: '公開デッキは20個までです。', errorJa: '公開デッキは20個までです。', errorEn: 'You can publish up to 20 decks.' });
     }
-    // 公開者の名前は出さない（匿名）。ユーザーIDも公開しない
-    const deck = await db.createSharedDeck(String(req.userId), '匿名', { title, categoryName, description, cards });
+    // V12.19: 公開デッキの作者名を表示する（以前は '匿名' で固定していた）。
+    // サーバー側でオンラインプロフィールの表示名を解決して保存する。
+    // プロフィールが無い／名前が未設定のときだけ '匿名' にする。
+    const profile = await db.getOnlineProfile(String(req.userId)).catch(() => null);
+    const ownerName = profile?.displayName || '匿名';
+    const deck = await db.createSharedDeck(String(req.userId), ownerName, { title, categoryName, description, cards });
     res.json({ deck });
   } catch (err) {
     console.error('POST /api/shared-decks error:', err);
@@ -1300,8 +1308,9 @@ app.get('/api/shared-decks/:id', optionalAuth, async (req, res) => {
     if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const deck = await db.getSharedDeck(req.params.id);
     if (!deck) return res.status(404).json({ error: 'デッキが見つかりません。', errorJa: 'デッキが見つかりません。', errorEn: 'Deck not found.' });
-    const { owner_user_id, ...publicDeck } = deck; // 公開者の内部IDは返さない
-    res.json({ deck: publicDeck });
+    // V12.19: ownerId は公開デッキの作者を示す公開ID（getSharedDeck が返す別名）。
+    // 以前の owner_user_id（内部ID名）は返さない。
+    res.json({ deck });
   } catch (err) {
     console.error('GET /api/shared-decks/:id error:', err);
     res.status(503).json({ error: '公開デッキを読み込めませんでした。', errorJa: '公開デッキを読み込めませんでした。', errorEn: 'Could not load public decks.' });
@@ -1314,7 +1323,7 @@ app.post('/api/shared-decks/:id/import', auth.requireAuth, async (req, res) => {
     if (!isDeckId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const deck = await db.getSharedDeck(req.params.id);
     if (!deck) return res.status(404).json({ error: 'デッキが見つかりません。', errorJa: 'デッキが見つかりません。', errorEn: 'Deck not found.' });
-    if (deck.owner_user_id === String(req.userId)) {
+    if (deck.ownerId === String(req.userId)) {
       return res.status(400).json({ error: '自分のデッキは取り込めません。', errorJa: '自分のデッキは取り込めません。', errorEn: 'You cannot import your own deck.' });
     }
     await db.recordSharedDeckImport(req.params.id, String(req.userId));
@@ -1373,6 +1382,51 @@ app.post('/api/shared-decks/:id/report', auth.requireAuth, async (req, res) => {
   } catch (err) {
     console.error('POST /api/shared-decks/:id/report error:', err);
     res.status(503).json({ error: '通報を受け付けられませんでした。', errorJa: '通報を受け付けられませんでした。', errorEn: 'Could not accept the report.' });
+  }
+});
+
+// ==========================================================================
+// V12.19・A班: オンボーディング survey の回答
+//   POST /api/onboarding-survey — 初回 survey の回答を1件保存する。
+//   body: { category?: string|null, source?: string|null }
+//   認証は任意（optionalAuth。X-Device-Id ヘッダーだけでも受け付ける）。
+//   category は survey の選択肢 (study/work/health/hobby/other)、
+//   source は流入元 (app-store-search/sns/friend-family/ad/other)。
+//   allowlist 外の値は null にして保存する（400 にはしない）。
+//   DB が無効でも保存だけ諦めて { ok: true } を返す（best-effort）。
+//   GET /api/admin/onboarding-surveys — 集計を返す（TINKO がブラウザで開く）。
+//   device_id / user_id は返さない（PII を含まない）。
+// ==========================================================================
+const SURVEY_CATEGORIES = ['study', 'work', 'health', 'hobby', 'other'];
+const SURVEY_SOURCES = ['app-store-search', 'sns', 'friend-family', 'ad', 'other'];
+
+app.post('/api/onboarding-survey', optionalAuth, async (req, res) => {
+  try {
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    const category = SURVEY_CATEGORIES.includes(body.category) ? body.category : null;
+    const source = SURVEY_SOURCES.includes(body.source) ? body.source : null;
+    const deviceId = resolveDeviceId(req);
+    const userId = (req.userId && req.userId !== 'guest_user') ? String(req.userId) : null;
+    try {
+      await db.recordOnboardingSurveyAnswer(deviceId, userId, category, source);
+    } catch (err) {
+      // best-effort: DB が無効でも survey の送信自体は成功として返す
+      console.error('POST /api/onboarding-survey insert failed (best-effort, ignored):', err.message);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /api/onboarding-survey error:', err);
+    res.json({ ok: true });
+  }
+});
+
+app.get('/api/admin/onboarding-surveys', async (req, res) => {
+  try {
+    const stats = await db.getOnboardingSurveyStats();
+    res.json(stats);
+  } catch (err) {
+    console.error('GET /api/admin/onboarding-surveys error:', err);
+    res.status(503).json({ error: '集計を読み込めませんでした。', errorJa: '集計を読み込めませんでした。', errorEn: 'Could not load survey stats.' });
   }
 });
 

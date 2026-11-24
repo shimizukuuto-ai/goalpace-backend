@@ -195,6 +195,23 @@ async function initDb() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_pace_scores_week ON pace_scores (week_date, raw_pace DESC);`);
 
+  // ---- V12.19: オンボーディング survey の回答（集計用） ----
+  // category: 何をがんばりたい？ (study/work/health/hobby/other)
+  // source: どこで知った？ (app-store-search/sns/friend-family/ad/other)
+  // device_id / user_id は集計には使わず、重複・不正の調査用に残すのみ。
+  // 管理画面 (GET /api/admin/onboarding-surveys) は device_id / user_id を返さない。
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS onboarding_survey_answers (
+      id SERIAL PRIMARY KEY,
+      device_id TEXT,
+      user_id TEXT,
+      category TEXT,
+      source TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_onboarding_survey_answers_created ON onboarding_survey_answers (created_at DESC);`);
+
   console.log('DB initialized (users, usage_events, share_bonuses, leaderboard tables ready).');
 }
 
@@ -921,10 +938,12 @@ async function listSharedDecks({ categoryName, sort, query, limit, offset }) {
     : 'd.created_at DESC';
   const params = [categoryName || null, query ? `%${query}%` : null, limit, offset];
   const { rows } = await pool.query(
-    `SELECT d.id, d.title, d.category_name AS "categoryName", d.description, '匿名'::text AS "ownerName",
+    `SELECT d.id, d.title, d.category_name AS "categoryName", d.description,
+            COALESCE(NULLIF(d.owner_name, '匿名'), p.display_name, '匿名') AS "ownerName", d.owner_user_id AS "ownerId",
             d.card_count AS "cardCount", d.created_at AS "createdAt",
             (SELECT COUNT(*)::int FROM shared_deck_imports i WHERE i.deck_id = d.id) AS "importCount"
      FROM shared_decks d
+     LEFT JOIN online_profiles p ON p.user_id = d.owner_user_id
      WHERE d.hidden = FALSE
        AND ($1::text IS NULL OR d.category_name = $1)
        AND ($2::text IS NULL OR d.title ILIKE $2)
@@ -937,9 +956,12 @@ async function listSharedDecks({ categoryName, sort, query, limit, offset }) {
 
 async function getSharedDeck(deckId) {
   const { rows } = await pool.query(
-    `SELECT id, owner_user_id, title, category_name AS "categoryName", description, '匿名'::text AS "ownerName",
-            card_count AS "cardCount", cards, created_at AS "createdAt"
-     FROM shared_decks WHERE id = $1 AND hidden = FALSE`,
+    `SELECT d.id, d.title, d.category_name AS "categoryName", d.description,
+            COALESCE(NULLIF(d.owner_name, '匿名'), p.display_name, '匿名') AS "ownerName", d.owner_user_id AS "ownerId",
+            d.card_count AS "cardCount", d.cards, d.created_at AS "createdAt"
+     FROM shared_decks d
+     LEFT JOIN online_profiles p ON p.user_id = d.owner_user_id
+     WHERE d.id = $1 AND d.hidden = FALSE`,
     [deckId]
   );
   return rows[0] || null;
@@ -972,6 +994,38 @@ async function reportSharedDeck(deckId, reporterUserId, reason) {
      WHERE id = $1`,
     [deckId, SHARED_DECK_REPORT_THRESHOLD]
   );
+}
+
+// ---- オンボーディング survey の回答（V12.19） ----
+// category / source はサーバー側で allowlist 済みの値か null だけが入る想定。
+// device_id / user_id はどちらか一方が無くても保存する（調査用のみ）。
+async function recordOnboardingSurveyAnswer(deviceId, userId, category, source) {
+  await pool.query(
+    'INSERT INTO onboarding_survey_answers (device_id, user_id, category, source) VALUES ($1,$2,$3,$4)',
+    [deviceId, userId, category, source]
+  );
+}
+
+// 管理画面用：device_id / user_id を含まない集計だけを返す。
+async function getOnboardingSurveyStats() {
+  const { rows: byCategory } = await pool.query(
+    `SELECT category, COUNT(*)::int AS count FROM onboarding_survey_answers
+     WHERE category IS NOT NULL GROUP BY category ORDER BY count DESC`
+  );
+  const { rows: bySource } = await pool.query(
+    `SELECT source, COUNT(*)::int AS count FROM onboarding_survey_answers
+     WHERE source IS NOT NULL GROUP BY source ORDER BY count DESC`
+  );
+  const { rows: totalRows } = await pool.query('SELECT COUNT(*)::int AS n FROM onboarding_survey_answers');
+  const { rows: recent } = await pool.query(
+    `SELECT category, source, created_at AS "createdAt" FROM onboarding_survey_answers
+     ORDER BY created_at DESC LIMIT 50`
+  );
+  const countsByCategory = {};
+  for (const r of byCategory) countsByCategory[r.category] = r.count;
+  const countsBySource = {};
+  for (const r of bySource) countsBySource[r.source] = r.count;
+  return { countsByCategory, countsBySource, total: totalRows[0].n, recent };
 }
 
 module.exports = {
@@ -1022,5 +1076,7 @@ module.exports = {
   recordSharedDeckImport,
   deleteSharedDeck,
   reportSharedDeck,
+  recordOnboardingSurveyAnswer,
+  getOnboardingSurveyStats,
   LEADERBOARD_METRIC_COLUMNS,
 };
