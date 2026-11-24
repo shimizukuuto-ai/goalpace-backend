@@ -904,6 +904,41 @@ async function getWeeklyLeague(weekDate, requesterId, metric = 'pace') {
   };
 }
 
+/**
+ * V12.20・C班: 要求者本人の順位（LIMIT 50 の外でも付く）。
+ * getWeeklyLeague の行順位（row_number() OVER (ORDER BY <metric> DESC,
+ * achievement_percent DESC, display_name ASC)）と一致させるため、
+ * 単なる「<metric> が自分より大きい人数」ではなく、同値のときの
+ * タイブレーク（achievement_percent 降順・display_name 昇順）も
+ * 同じ条件で数える。行が無い（今週未同期）・参加オフなら null。
+ * 返す value はその指標の本人の値（クライアントの「あなたの順位」
+ * 別枠に表示する値）。metric は呼び出し側で正規化済みの値を渡すこと。
+ */
+async function getMyLeagueRank(weekDate, requesterId, metric = 'pace') {
+  const m = LEAGUE_METRIC_COLUMNS[metric] ? metric : 'pace';
+  const column = LEAGUE_METRIC_COLUMNS[m];
+  const mine = await pool.query(
+    `SELECT display_name, ${column} AS metric_value, achievement_percent
+     FROM pace_scores
+     WHERE week_date = $1 AND user_id = $2 AND league_opt_in = TRUE`,
+    [weekDate, String(requesterId)]
+  );
+  if (!mine.rows[0]) return null;
+  const myValue = Number(mine.rows[0].metric_value);
+  const myAchievement = Number(mine.rows[0].achievement_percent);
+  const myName = mine.rows[0].display_name;
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM pace_scores
+     WHERE week_date = $1 AND league_opt_in = TRUE AND (
+       ${column} > $2
+       OR (${column} = $2 AND achievement_percent > $3)
+       OR (${column} = $2 AND achievement_percent = $3 AND display_name < $4)
+     )`,
+    [weekDate, myValue, myAchievement, myName]
+  );
+  return { rank: rows[0].n + 1, value: myValue };
+}
+
 
 // ---- 公開デッキ ----
 const SHARED_DECK_REPORT_THRESHOLD = 3;
@@ -1063,6 +1098,7 @@ module.exports = {
   applyDisplayName,
   upsertPaceScore,
   getWeeklyLeague,
+  getMyLeagueRank,
   LEAGUE_METRIC_COLUMNS,
   LEAGUE_METRIC_UNITS,
   AVATAR_COLORS,

@@ -478,7 +478,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.12.0',
+    version: '7.13.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -490,7 +490,12 @@ app.get('/api/version', (req, res) => {
     // （listSharedDecks / getSharedDeck。'匿名' のハードコードを廃止）。
     // V12.19・A班: onboardingSurveys — オンボーディング survey の回答保存
     // （POST /api/onboarding-survey）と集計（GET /api/admin/onboarding-surveys）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true },
+    // V12.20・C班: myRank — 自分の順位を LIMIT 50 の外でも返す
+    // （GET /api/league/weekly の myRank / myValue。COUNT(*) 順位）。
+    // V12.20・C班: canonicalIdentity — 共有目標のメンバーIDを端末ID
+    // （pace_scores / activity_events と同じ）に揃える
+    // （sharedGoals.js の resolveMemberId）。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true },
   });
 });
 
@@ -1062,13 +1067,17 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
 // 切り替える（未指定・不正値は pace で従来通り）。各行に value（その指標の値）と
 // unit（'%'／'枚'／'回'）を付け、トップレベルに metric をエコーする。
 // 既存の行フィールド（progress・pacePercent 等）は変えない。
+// V12.20・C班: 自分の順位も返す（myRank・myValue）。上位 50 件の LIMIT に
+// 依存せず、COUNT(*) で数えた順位のため 51 位以下でも付く。参加オフ・
+// 今週未同期なら null。metric は要求された指標で計算する。
 app.get('/api/league/weekly', optionalAuth, async (req, res) => {
   try {
     const { weekDate } = await db.getWeekWindow();
     const requesterId = onlineIdentity(req) || null;
     const metric = db.LEAGUE_METRIC_COLUMNS[String(req.query.metric)] ? String(req.query.metric) : 'pace';
     const { optedOut, entries } = await db.getWeeklyLeague(weekDate, requesterId, metric);
-    res.json({ weekStart: weekDate, entries, optedOut, isPlaceholder: false, metric });
+    const mine = !optedOut && requesterId ? await db.getMyLeagueRank(weekDate, requesterId, metric) : null;
+    res.json({ weekStart: weekDate, entries, optedOut, isPlaceholder: false, metric, myRank: mine ? mine.rank : null, myValue: mine ? mine.value : null });
   } catch (err) {
     console.error('/api/league/weekly error:', err);
     res.status(503).json({ error: 'Leaderboard is unavailable', errorJa: 'ランキングは利用できません。', errorEn: 'Leaderboard is unavailable' });
