@@ -478,7 +478,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.14.0',
+    version: '7.15.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -500,7 +500,14 @@ app.get('/api/version', (req, res) => {
     // 直近7日分の日次行を消す（リーグの「あなた」重複の掃除）。
     // V12.22・A班: memorizedToday — pace_scores.memorized は今日学習した
     // カード数（従来は今週マスターした枚数）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true },
+    // V12.23・A班: memberIdentityMigration — sync-pace の previousUserIds
+    // で旧身元の共有目標まわりの行（メンバー・値・貢献・申告・コメント・
+    // タスク完了・キック・出来事・目標の所有者）を正規ID（デバイスID）へ
+    // 移行し、旧→新の対応表 identity_aliases に残す（db.js の
+    // migrateSharedGoalIdentity。共有目標のメンバー詳細に暗記・集中・
+    // タスクが反映されない不具合の修正）。共有目標の「今日」は日本時間
+    // （JST）で決める（sharedGoals.js。value タイプの「今日 0%」の修正）。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true },
   });
 });
 
@@ -1076,6 +1083,11 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
       })();
       await db.deleteOldIdentityRows(userId, previousUserIds, weekDate, sinceDate).catch((e) => {
         console.error('/api/leaderboard/sync-pace identity cleanup error:', e);
+      });
+      // V12.23・A班【1】：旧身元の共有目標まわりの行も正規IDへ移行する
+      // （メンバー・値・貢献など。失敗しても同期自体は成功させる）。
+      await db.migrateSharedGoalIdentity(userId, previousUserIds).catch((e) => {
+        console.error('/api/leaderboard/sync-pace identity migration error:', e);
       });
     }
     res.json({ ok: true, weekDate, pacePercent: Math.round(rawPace), achievementPercent: Math.round(achievement) });

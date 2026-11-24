@@ -202,6 +202,20 @@ CREATE TABLE IF NOT EXISTS shared_goal_members (
   joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (goal_id, user_id)
 );
+-- V12.23・A班【1】：旧ID→正規ID（デバイスID）の対応表。sync-pace の
+-- 移行（db.migrateSharedGoalIdentity）で書き、読み取り時フォールバックで
+-- 読む。'guest_user' は入れない＝移行しない（全員共通の壊れた行のため）。
+CREATE TABLE IF NOT EXISTS identity_aliases (
+  old_user_id TEXT PRIMARY KEY,
+  canonical_user_id TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- V12.23・A班【4】：日付の既定を JST にする。CURRENT_DATE は DB の
+-- セッションタイムゾーン（UTC）で決まるため、新規行の日付がユーザーの
+-- 今日とずれる。既存行の値は変えない（新規行だけ JST になる）。
+ALTER TABLE shared_goals ALTER COLUMN start_date SET DEFAULT ((now() AT TIME ZONE 'Asia/Tokyo')::date);
+ALTER TABLE shared_goal_contributions ALTER COLUMN contributed_date SET DEFAULT ((now() AT TIME ZONE 'Asia/Tokyo')::date);
+ALTER TABLE shared_goal_task_completions ALTER COLUMN completed_date SET DEFAULT ((now() AT TIME ZONE 'Asia/Tokyo')::date);
 CREATE TABLE IF NOT EXISTS shared_goal_contributions (
   id BIGSERIAL PRIMARY KEY,
   goal_id BIGINT NOT NULL REFERENCES shared_goals(id) ON DELETE CASCADE,
@@ -317,6 +331,16 @@ const clean = (v, max) => (typeof v === 'string' ? v.replace(/\r\n?/g, '\n').tri
 const oneLine = (v, max) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '');
 const isId = (v) => /^\d{1,18}$/.test(String(v));
 const anonName = (uid) => 'プレイヤー-' + crypto.createHash('sha256').update(String(uid)).digest('hex').slice(0, 4);
+
+// V12.23・A班【4】：共有目標の「今日」は日本時間（JST）で決める。
+// DB のセッションタイムゾーンは UTC（Render 既定）のため、CURRENT_DATE
+// や to_char(timestamp) はユーザーの今日と最大9〜11時間ずれる。
+// これが value タイプの「今日 0%」の原因：朝に記録した値は UTC では
+// 前日になり、goal.today（UTC の今日）と一致しなかった。
+// ペース・週の区切りは従来から JST（db.getWeekWindow 等）なので、
+// 共有目標の「今日」も JST に統一する。
+const JST_TODAY_SQL = `to_char(now() AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD')`;
+const jstDateSql = (col) => `to_char(${col} AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD')`;
 
 const INVITE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 紛らわしい文字(0/O, 1/I/L)を除外（db.js の招待コードと同じ）
 
@@ -483,9 +507,53 @@ function register({ app, db, auth }) {
     }
   };
 
+  // V12.23・A班【2】：メンバー判定は旧IDでも正規IDでも通す。
+  // 対応表（identity_aliases）に旧ID→正規IDがあれば、その正規IDの行も
+  // メンバーとみなす（移行前の行・同期していない端末のため）。逆向き
+  // （正規IDで問い合わせたとき旧IDの行）も同じく通す。対応表が無ければ
+  // （未デプロイ等）従来通りの直接一致だけを見る。
   async function isMember(goalId, userId) {
     const r = await q('SELECT 1 FROM shared_goal_members WHERE goal_id = $1 AND user_id = $2', [goalId, userId]);
-    return r.rowCount > 0;
+    if (r.rowCount > 0) return true;
+    try {
+      const aliases = await q(
+        `SELECT canonical_user_id FROM identity_aliases WHERE old_user_id = $1`,
+        [userId]);
+      for (const a of aliases.rows) {
+        const r2 = await q('SELECT 1 FROM shared_goal_members WHERE goal_id = $1 AND user_id = $2', [goalId, a.canonical_user_id]);
+        if (r2.rowCount > 0) return true;
+      }
+      const olds = await q(
+        `SELECT old_user_id FROM identity_aliases WHERE canonical_user_id = $1`,
+        [userId]);
+      for (const o of olds.rows) {
+        const r3 = await q('SELECT 1 FROM shared_goal_members WHERE goal_id = $1 AND user_id = $2', [goalId, o.old_user_id]);
+        if (r3.rowCount > 0) return true;
+      }
+    } catch (_) { /* 対応表が無ければ従来通りの判定だけ */ }
+    return false;
+  }
+
+  // V12.23・A班【2】：旧ID→正規IDの対応表を1回のクエリで読む。
+  // 返すのは { canon, olds }（canon: 旧→新、olds: 新→旧の配列）。
+  // 対応表が無ければ両方とも空（従来通りの動きになる）。
+  async function loadIdentityAliases(userIds) {
+    const canon = new Map();
+    const olds = new Map();
+    try {
+      const ids = [...new Set((userIds || []).map((v) => String(v || '')).filter(Boolean))];
+      if (ids.length === 0) return { canon, olds };
+      const rows = await q(
+        `SELECT old_user_id, canonical_user_id FROM identity_aliases
+         WHERE old_user_id = ANY($1::text[]) OR canonical_user_id = ANY($1::text[])`,
+        [ids]);
+      for (const r of rows.rows) {
+        canon.set(r.old_user_id, r.canonical_user_id);
+        if (!olds.has(r.canonical_user_id)) olds.set(r.canonical_user_id, []);
+        olds.get(r.canonical_user_id).push(r.old_user_id);
+      }
+    } catch (_) { /* 対応表が無ければ空のまま */ }
+    return { canon, olds };
   }
 
   // V11: メンバーの表示名は online_profiles の設定名を優先する
@@ -547,7 +615,9 @@ function register({ app, db, auth }) {
   }
 
   // 目標1件分の集計（メンバー・貢献・スタンプ・ペース%・共有ストリーク・共通タスク）。
-  // today はサーバー日付（CURRENT_DATE）。週のペースは月曜時点の目標で
+  // today は日本時間（JST）の今日（V12.23・A班【4】。以前は CURRENT_DATE＝
+  // DB の UTC だったため、朝の記録が前日扱いになり value タイプの
+  // 「今日 0%」が起きた）。週のペースは月曜時点の目標で
   // 計算するルールだが、target は不変のため当日分でそのまま満たされる。
   // viewerUserId（任意）：タスクの doneToday（閲覧者が今日完了したか）を
   // 付けるために使う。未指定なら全タスク doneToday=false。
@@ -570,7 +640,7 @@ function register({ app, db, auth }) {
               to_char(deadline, 'YYYY-MM-DD') AS deadline,
               to_char(start_date, 'YYYY-MM-DD') AS start_date,
               invite_code, created_at,
-              to_char(CURRENT_DATE, 'YYYY-MM-DD') AS today
+              ${JST_TODAY_SQL} AS today
        FROM shared_goals WHERE id = $1`,
       [goalId]);
     if (!g.rowCount) return null;
@@ -594,7 +664,7 @@ function register({ app, db, auth }) {
     // 全体の最新値・今日記録したかをここから導く）。
     const values = await q(
       `SELECT user_id, value, logged_at,
-              to_char(logged_at, 'YYYY-MM-DD') AS logged_date
+              ${jstDateSql('logged_at')} AS logged_date
        FROM shared_goal_values WHERE goal_id = $1 ORDER BY logged_at DESC, id DESC LIMIT 500`,
       [goalId]);
 
@@ -604,7 +674,18 @@ function register({ app, db, auth }) {
       `SELECT user_id, declared_at FROM shared_goal_declarations WHERE goal_id = $1`,
       [goalId]);
     const declaredAtByUser = {};
-    for (const d of declarations.rows) declaredAtByUser[d.user_id] = d.declared_at;
+    // V12.23・A班【2】：旧ID→正規IDの対応表をここで一度だけ読む。
+    // このあとのメンバー別集計はすべて正規IDに寄せて作る（移行前の行・
+    // 同期しないメンバーの行でも、活動・実績が正規IDで読めるようにする）。
+    // 対応表が無ければ canon は恒等写像＝従来通りの動きになる。
+    const { canon: aliasCanon } = await loadIdentityAliases([
+      ...members.rows.map((m) => m.user_id),
+      ...contribs.rows.map((c) => c.user_id),
+      ...values.rows.map((v) => v.user_id),
+      ...declarations.rows.map((d) => d.user_id),
+    ]);
+    const canon = (id) => aliasCanon.get(String(id)) || String(id);
+    for (const d of declarations.rows) declaredAtByUser[canon(d.user_id)] = d.declared_at;
 
     const memberCount = members.rows.length;
     const startDay = parseDay(goal.start_date);
@@ -622,17 +703,19 @@ function register({ app, db, auth }) {
     // メンバー別: 貢献合計・今日の貢献・ペース%
     const byUser = {};
     for (const c of contribs.rows) {
-      const uid = c.user_id;
+      const uid = canon(c.user_id);
       byUser[uid] = byUser[uid] || { total: 0, today: 0, winDates: new Set() };
       byUser[uid].total += Number(c.amount);
     }
-    // 日別・ユーザー別の合計（勝利判定用）
+    // 日別・ユーザー別の合計（勝利判定用）。日付は created_at の JST
+    // 日付で分ける（V12.23・A班【4】。contributed_date 列は UTC の
+    // CURRENT_DATE 既定で入るため、朝の記録が前日扱いになる）。
     const perDay = await q(
-      `SELECT user_id, to_char(contributed_date, 'YYYY-MM-DD') AS d, SUM(amount)::float AS amt
-       FROM shared_goal_contributions WHERE goal_id = $1 GROUP BY user_id, contributed_date`,
+      `SELECT user_id, ${jstDateSql('created_at')} AS d, SUM(amount)::float AS amt
+       FROM shared_goal_contributions WHERE goal_id = $1 GROUP BY user_id, ${jstDateSql('created_at')}`,
       [goalId]);
     for (const row of perDay.rows) {
-      const uid = row.user_id;
+      const uid = canon(row.user_id);
       byUser[uid] = byUser[uid] || { total: 0, today: 0, winDates: new Set() };
       if (row.d === goal.today) byUser[uid].today += row.amt;
       if (row.amt >= dailyTarget && dailyTarget > 0) byUser[uid].winDates.add(row.d);
@@ -648,24 +731,29 @@ function register({ app, db, auth }) {
        ) s GROUP BY user_id`,
       [goalId]);
     const lastActiveByUser = {};
-    for (const r of lastActiveRows.rows) lastActiveByUser[r.user_id] = r.last_active;
+    for (const r of lastActiveRows.rows) {
+      const key = canon(r.user_id);
+      // 旧ID行と正規ID行の両方があるときは新しい方を残す。
+      if (!lastActiveByUser[key] || new Date(r.last_active) > new Date(lastActiveByUser[key])) lastActiveByUser[key] = r.last_active;
+    }
     // 共有ストリーク: 全メンバーが勝利した日の累計（逃した日は 0 に戻さない）
     let sharedWinDates = [];
     if (memberCount > 0) {
       const all = new Set();
       Object.values(byUser).forEach((u) => u.winDates.forEach((d) => all.add(d)));
-      sharedWinDates = [...all].filter((d) => members.rows.every((m) => (byUser[m.user_id] || { winDates: new Set() }).winDates.has(d))).sort();
+      sharedWinDates = [...all].filter((d) => members.rows.every((m) => (byUser[canon(m.user_id)] || { winDates: new Set() }).winDates.has(d))).sort();
     }
 
     // V12.6・C班: 数値タイプの最新値（メンバーごと＋全体）。
     // values は logged_at DESC 順なので、最初に出てきた行がその人の最新値。
-    // logged_date は DB の当日（CURRENT_DATE と同じタイムゾーン）で見る
-    // ため、同じリクエストで入る contributions の当日と一致する。
+    // logged_date は JST の日付で見る（V12.23・A班【4】。以前は UTC の
+    // to_char だったため、朝に記録した値が「今日記録したか」に入らなかった）。
     const latestValueByUser = {};
     const valueLoggedTodayByUser = {};
     for (const v of values.rows) {
-      if (latestValueByUser[v.user_id] === undefined) latestValueByUser[v.user_id] = Number(v.value);
-      if (v.logged_date === goal.today) valueLoggedTodayByUser[v.user_id] = true;
+      const key = canon(v.user_id);
+      if (latestValueByUser[key] === undefined) latestValueByUser[key] = Number(v.value);
+      if (v.logged_date === goal.today) valueLoggedTodayByUser[key] = true;
     }
     const latestValueOverall = values.rows.length ? Number(values.rows[0].value) : null;
 
@@ -682,12 +770,17 @@ function register({ app, db, auth }) {
         `SELECT to_char(date_trunc('week', now() AT TIME ZONE 'Asia/Tokyo'), 'YYYY-MM-DD') AS week_start`);
       weekStart = (weekRow.rows[0] && weekRow.rows[0].week_start) || null;
       if (weekStart && members.rows.length > 0) {
+        // V12.23・A班【2】：旧IDと正規IDの両方で引く（移行前の行も読む）。
+        // 戻りは正規IDに寄せ、両方あるときは正規ID行を優先する。
+        const statIds = [...new Set([...members.rows.map((m) => m.user_id), ...members.rows.map((m) => canon(m.user_id))])];
         const statsRows = await q(
           `SELECT user_id, pomodoro, memorized, tasks_done FROM pace_scores
            WHERE user_id = ANY($1::text[]) AND week_date = $2::date`,
-          [members.rows.map((m) => m.user_id), weekStart]);
+          [statIds, weekStart]);
         for (const r of statsRows.rows) {
-          weeklyStatsByUser[r.user_id] = {
+          const key = canon(r.user_id);
+          if (weeklyStatsByUser[key] && r.user_id !== key) continue;
+          weeklyStatsByUser[key] = {
             pomodoro: Math.max(0, Number(r.pomodoro) || 0),
             memorized: Math.max(0, Number(r.memorized) || 0),
             tasksDone: Math.max(0, Number(r.tasks_done) || 0),
@@ -704,14 +797,19 @@ function register({ app, db, auth }) {
     let totalStatsByUser = {};
     try {
       if (members.rows.length > 0) {
+        // V12.23・A班【2】：旧IDと正規IDの両方で引く（移行前の行も読む）。
+        // 戻りは正規IDに寄せ、両方あるときは正規ID行を優先する。
+        const statIds = [...new Set([...members.rows.map((m) => m.user_id), ...members.rows.map((m) => canon(m.user_id))])];
         const totalRows = await q(
           `SELECT user_id, COALESCE(SUM(pomodoro), 0) AS pomodoro,
                   COALESCE(SUM(memorized), 0) AS memorized,
                   COALESCE(SUM(tasks_done), 0) AS tasks_done
            FROM pace_scores WHERE user_id = ANY($1::text[]) GROUP BY user_id`,
-          [members.rows.map((m) => m.user_id)]);
+          [statIds]);
         for (const r of totalRows.rows) {
-          totalStatsByUser[r.user_id] = {
+          const key = canon(r.user_id);
+          if (totalStatsByUser[key] && r.user_id !== key) continue;
+          totalStatsByUser[key] = {
             pomodoro: Math.max(0, Number(r.pomodoro) || 0),
             memorized: Math.max(0, Number(r.memorized) || 0),
             tasksDone: Math.max(0, Number(r.tasks_done) || 0),
@@ -721,7 +819,10 @@ function register({ app, db, auth }) {
     } catch (_) { totalStatsByUser = {}; }
 
     const memberList = members.rows.map((m) => {
-      const u = byUser[m.user_id] || { total: 0, today: 0, winDates: new Set() };
+      // V12.23・A班【2】：集計の照合は正規IDで行う（メンバー行が旧IDでも
+      // 活動・実績は正規IDで読めるようにする）。
+      const cid = canon(m.user_id);
+      const u = byUser[cid] || { total: 0, today: 0, winDates: new Set() };
       const memberPlanned = memberCount > 0 ? planned / memberCount : 0;
       // V12.4・A班: 今日のノルマ達成率（個数ベースではなくノルマ中心）。
       // todayQuota = その人の今日のノルマ量（count/time は
@@ -737,7 +838,7 @@ function register({ app, db, auth }) {
       const todayQuotaRate = isHabit
         ? (u.today > 0 ? 100 : 0)
         : isValue
-          ? (valueLoggedTodayByUser[m.user_id] ? 100 : 0)
+          ? (valueLoggedTodayByUser[cid] ? 100 : 0)
           : (todayQuota > 0
               ? Math.min(100, Math.round((u.today / todayQuota) * 100))
               : (u.today > 0 ? 100 : 0));
@@ -753,29 +854,29 @@ function register({ app, db, auth }) {
         todayQuotaRate,
         // V12.6・C班: 数値タイプのその人の最新値と今日記録したか
         // （count/time/habit では null/false のまま）。
-        currentValue: latestValueByUser[m.user_id] ?? null,
-        valueLoggedToday: Boolean(valueLoggedTodayByUser[m.user_id]),
+        currentValue: latestValueByUser[cid] ?? null,
+        valueLoggedToday: Boolean(valueLoggedTodayByUser[cid]),
         // V12.7・A班: 「達成した」の申告状態（declare ルール用。
         // 申告していない・旧データでは declared=false・declaredAt=null）。
-        declared: Boolean(declaredAtByUser[m.user_id]),
-        declaredAt: declaredAtByUser[m.user_id] || null,
+        declared: Boolean(declaredAtByUser[cid]),
+        declaredAt: declaredAtByUser[cid] || null,
         wonToday: u.winDates.has(goal.today),
         // V12.2・A班: 直近の活動日時（貢献・タスク完了の最新。無ければ参加日時）。
-        lastActiveAt: lastActiveByUser[m.user_id] || m.joined_at,
+        lastActiveAt: lastActiveByUser[cid] || m.joined_at,
         // V12.8・C班: 今週の統計（暗記枚数・ポモドーロ回数・完了タスク数。
         // sync-pace の pace_scores 由来。統計を送っていないメンバーは 0）。
         weeklyStats: {
-          pomodoro: (weeklyStatsByUser[m.user_id] || {}).pomodoro || 0,
-          memorized: (weeklyStatsByUser[m.user_id] || {}).memorized || 0,
-          tasksDone: (weeklyStatsByUser[m.user_id] || {}).tasksDone || 0,
+          pomodoro: (weeklyStatsByUser[cid] || {}).pomodoro || 0,
+          memorized: (weeklyStatsByUser[cid] || {}).memorized || 0,
+          tasksDone: (weeklyStatsByUser[cid] || {}).tasksDone || 0,
           weekStart,
         },
         // V12.15・B班: 累計の実績（暗記枚数・ポモドーロ回数・完了タスク数。
         // pace_scores の全週の合計。weeklyStats は旧クライアント互換のため残す）。
         totalStats: {
-          pomodoro: (totalStatsByUser[m.user_id] || {}).pomodoro || 0,
-          memorized: (totalStatsByUser[m.user_id] || {}).memorized || 0,
-          tasksDone: (totalStatsByUser[m.user_id] || {}).tasksDone || 0,
+          pomodoro: (totalStatsByUser[cid] || {}).pomodoro || 0,
+          memorized: (totalStatsByUser[cid] || {}).memorized || 0,
+          tasksDone: (totalStatsByUser[cid] || {}).tasksDone || 0,
         },
         // 共通タスク：そのメンバーが今日完了したタスク数（後で tasks から数えて入れる）
         tasksDoneToday: 0,
@@ -787,7 +888,9 @@ function register({ app, db, auth }) {
     memberList.sort((a, b) => b.pacePercent - a.pacePercent || b.contribution - a.contribution);
 
     // 共通タスク（Iteration 4）：一覧＋今日の完了者。完了は当日のみ有効
-    // （completed_date = CURRENT_DATE の行だけを数える）。
+    // （JST の今日に完了した行だけを数える。V12.23・A班【4】。以前は
+    // completed_date = CURRENT_DATE＝UTC だったため、朝の完了が前日扱い
+    // になることがあった）。
     const taskRows = await q(
       `SELECT id, title, created_by, created_at FROM shared_goal_tasks
        WHERE goal_id = $1 ORDER BY created_at ASC, id ASC LIMIT 30`,
@@ -795,12 +898,12 @@ function register({ app, db, auth }) {
     const doneRows = taskRows.rowCount
       ? await q(
           `SELECT task_id, user_id FROM shared_goal_task_completions
-           WHERE task_id = ANY($1::bigint[]) AND completed_date = CURRENT_DATE`,
+           WHERE task_id = ANY($1::bigint[]) AND ${jstDateSql('created_at')} = ${JST_TODAY_SQL}`,
           [taskRows.rows.map((t) => t.id)])
       : { rows: [] };
     const doneByTask = {};
     for (const r of doneRows.rows) {
-      (doneByTask[String(r.task_id)] = doneByTask[String(r.task_id)] || []).push(r.user_id);
+      (doneByTask[String(r.task_id)] = doneByTask[String(r.task_id)] || []).push(canon(r.user_id));
     }
     const tasks = taskRows.rows.map((t) => {
       const done = doneByTask[String(t.id)] || [];
@@ -811,22 +914,22 @@ function register({ app, db, auth }) {
         createdAt: t.created_at,
         completedByToday: done,
         doneTodayCount: done.length,
-        doneToday: viewerUserId ? done.includes(String(viewerUserId)) : false,
+        doneToday: viewerUserId ? done.includes(canon(String(viewerUserId))) : false,
       };
     });
     for (const m of memberList) {
-      m.tasksDoneToday = tasks.filter((t) => t.completedByToday.includes(m.userId)).length;
+      m.tasksDoneToday = tasks.filter((t) => t.completedByToday.includes(canon(m.userId))).length;
     }
 
     const totalContribution = memberList.reduce((s, m) => s + m.contribution, 0);
     // V12・D班: 閲覧者（自分）の今日の貢献量。習慣チェックの「今日やった」
     // 表示（済みならボタンを押せない）に使う。未指定なら 0。
     const myTodayContribution = viewerUserId
-      ? (byUser[String(viewerUserId)] || { today: 0 }).today
+      ? (byUser[canon(String(viewerUserId))] || { today: 0 }).today
       : 0;
     // V12.7・A班: 閲覧者（自分）が「達成した」を申告済みか
     // （declare ルール用。未指定なら false）。
-    const myDeclared = viewerUserId ? Boolean(declaredAtByUser[String(viewerUserId)]) : false;
+    const myDeclared = viewerUserId ? Boolean(declaredAtByUser[canon(String(viewerUserId))]) : false;
     return {
       id: String(goal.id),
       title: goal.title,
@@ -1053,7 +1156,7 @@ function register({ app, db, auth }) {
               to_char(g.deadline, 'YYYY-MM-DD') AS deadline,
               to_char(g.start_date, 'YYYY-MM-DD') AS start_date,
               g.created_at,
-              to_char(CURRENT_DATE, 'YYYY-MM-DD') AS today,
+              ${JST_TODAY_SQL} AS today,
               (SELECT display_name FROM shared_goal_members m
                 WHERE m.goal_id = g.id AND m.user_id = g.owner_user_id) AS owner_display_name,
               (SELECT COUNT(*)::int FROM shared_goal_members m WHERE m.goal_id = g.id) AS member_count,
@@ -1187,14 +1290,19 @@ function register({ app, db, auth }) {
     const uid = resolveMemberId(req);
     if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     if (!(await isMember(req.params.id, targetUserId))) return res.status(404).json({ error: 'メンバーが見つかりません。', errorJa: 'メンバーが見つかりません。', errorEn: 'Member not found.' });
+    // V12.23・A班【2】：対象メンバーの活動は、保存されているIDと
+    // 正規IDの両方で引く。活動（activity_events）はデバイスIDで記録
+    // されるが、メンバー行が旧IDのままだと片方だけでは空になる。
+    const { canon: aliasCanon } = await loadIdentityAliases([targetUserId]);
+    const targetIds = [...new Set([targetUserId, aliasCanon.get(targetUserId) || targetUserId])];
     const limit = Math.max(1, Math.min(20, Math.floor(Number(req.query.limit) || 10)));
     const events = [];
     try {
       const feedRows = await q(
         `SELECT id, kind, text, minutes, created_at FROM activity_events
-         WHERE owner_user_id = $1 AND hidden = FALSE AND created_at > NOW() - INTERVAL '7 days'
+         WHERE owner_user_id = ANY($1::text[]) AND hidden = FALSE AND created_at > NOW() - INTERVAL '7 days'
          ORDER BY created_at DESC, id DESC LIMIT $2`,
-        [targetUserId, limit]);
+        [targetIds, limit]);
       for (const r of feedRows.rows) {
         events.push({
           id: `a-${r.id}`, kind: r.kind, text: r.text || '',
@@ -1206,9 +1314,9 @@ function register({ app, db, auth }) {
     try {
       const contribRows = await q(
         `SELECT id, amount, note, created_at FROM shared_goal_contributions
-         WHERE goal_id = $1 AND user_id = $2 AND created_at > NOW() - INTERVAL '7 days'
-         ORDER BY created_at DESC, id DESC LIMIT $3`,
-        [req.params.id, targetUserId, limit]);
+         WHERE goal_id = $1 AND user_id = ANY($3::text[]) AND created_at > NOW() - INTERVAL '7 days'
+         ORDER BY created_at DESC, id DESC LIMIT $2`,
+        [req.params.id, limit, targetIds]);
       for (const r of contribRows.rows) {
         events.push({
           id: `c-${r.id}`, kind: 'contribution', text: r.note || '',
@@ -1477,7 +1585,7 @@ function register({ app, db, auth }) {
       if (!Number.isFinite(value) || Math.abs(value) > 100000000) return res.status(400).json({ error: '現在の値を入力してください。', errorJa: '現在の値を入力してください。', errorEn: 'Please enter the current value.' });
       const today = await q(
         `SELECT COUNT(*)::int AS n FROM shared_goal_contributions
-         WHERE goal_id = $1 AND user_id = $2 AND contributed_date = CURRENT_DATE`,
+         WHERE goal_id = $1 AND user_id = $2 AND ${jstDateSql('created_at')} = ${JST_TODAY_SQL}`,
         [req.params.id, uid]);
       await q(
         `INSERT INTO shared_goal_values (goal_id, user_id, value) VALUES ($1, $2, $3)`,
@@ -1504,7 +1612,7 @@ function register({ app, db, auth }) {
       if (amount !== 1) return res.status(400).json({ error: '習慣チェックは1日1回です。', errorJa: '習慣チェックは1日1回です。', errorEn: 'Habit check-ins are once a day.' });
       const today = await q(
         `SELECT COUNT(*)::int AS n FROM shared_goal_contributions
-         WHERE goal_id = $1 AND user_id = $2 AND contributed_date = CURRENT_DATE`,
+         WHERE goal_id = $1 AND user_id = $2 AND ${jstDateSql('created_at')} = ${JST_TODAY_SQL}`,
         [req.params.id, uid]);
       if (today.rows[0].n > 0) return res.status(400).json({ error: '今日はすでにチェック済みです。', errorJa: '今日はすでにチェック済みです。', errorEn: 'Already checked in today.' });
     }
@@ -1625,10 +1733,10 @@ function register({ app, db, auth }) {
     const t = await q('SELECT id, title FROM shared_goal_tasks WHERE id = $1 AND goal_id = $2', [req.params.taskId, req.params.id]);
     if (!t.rowCount) return res.status(404).json({ error: 'タスクが見つかりません。', errorJa: 'タスクが見つかりません。', errorEn: 'Task not found.' });
     const done = await q(
-      'SELECT 1 FROM shared_goal_task_completions WHERE task_id = $1 AND user_id = $2 AND completed_date = CURRENT_DATE',
+      `SELECT 1 FROM shared_goal_task_completions WHERE task_id = $1 AND user_id = $2 AND ${jstDateSql('created_at')} = ${JST_TODAY_SQL}`,
       [req.params.taskId, uid]);
     if (done.rowCount) {
-      await q('DELETE FROM shared_goal_task_completions WHERE task_id = $1 AND user_id = $2 AND completed_date = CURRENT_DATE',
+      await q(`DELETE FROM shared_goal_task_completions WHERE task_id = $1 AND user_id = $2 AND ${jstDateSql('created_at')} = ${JST_TODAY_SQL}`,
         [req.params.taskId, uid]);
     } else {
       await q('INSERT INTO shared_goal_task_completions (task_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',

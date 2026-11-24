@@ -864,6 +864,133 @@ async function deleteOldIdentityRows(newUserId, oldUserIds, weekDate, sinceDate)
 }
 
 /**
+ * V12.23・A班【1】：旧身元（ウィザード uid／Apple id）で書かれた
+ * 共有目標まわりの行を、新しい正規ID（デバイスID）へ移行する。
+ * deleteOldIdentityRows（pace_scores／daily_category_scores の掃除）と
+ * 同じタイミング（sync-pace の previousUserIds）で呼ぶ。
+ * 共有目標のメンバー行は v12.20 以前の ID のまま残り、活動・実績は
+ * デバイスIDで記録されるため、読み取りの JOIN が合わずメンバー詳細が
+ * 空になる（暗記・集中・タスクが反映されない）。この移行で直す。
+ * shared_goal_members は PRIMARY KEY (goal_id, user_id) のため、
+ * 移行先に既に (goal_id, 新ID) の行がある場合は旧行を DELETE する
+ * （UPDATE すると PK 違反になる）。同じ扱いが必要な PK 付きテーブル
+ * （declarations／kicks／task_completions）も同様にする。
+ * PK の無い履歴テーブル（values／contributions／comments／stamps／
+ * events）は単純 UPDATE。shared_goals.owner_user_id も移行する。
+ * 'guest_user' は全員共通の壊れた行のため移行しない（v12.20 の方針）。
+ * 対応表 identity_aliases に旧→新を残す（読み取り時フォールバック用）。
+ * 失敗しても同期自体は成功させるため、呼び出し側で catch する。
+ * 戻り値は移行した行数。
+ */
+async function migrateSharedGoalIdentity(newUserId, oldUserIds) {
+  const ids = (Array.isArray(oldUserIds) ? oldUserIds : [])
+    .map((v) => String(v || '').trim())
+    .filter((v) => v && v !== String(newUserId) && v !== 'guest_user');
+  const counts = { aliases: 0, members: 0, values: 0, contributions: 0, declarations: 0, comments: 0, stamps: 0, tasks: 0, kicks: 0, events: 0, goals: 0 };
+  if (ids.length === 0) return counts;
+  const nid = String(newUserId);
+  // 対応表（無ければ作る。sharedGoals.js の SCHEMA にも同じ定義がある）。
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS identity_aliases (
+       old_user_id TEXT PRIMARY KEY,
+       canonical_user_id TEXT NOT NULL,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+  );
+  for (const oldId of ids) {
+    const r = await pool.query(
+      `INSERT INTO identity_aliases (old_user_id, canonical_user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [oldId, nid],
+    );
+    counts.aliases += r.rowCount || 0;
+  }
+  // PK の無い履歴テーブルはまとめて UPDATE。
+  counts.values = (await pool.query(
+    `UPDATE shared_goal_values SET user_id = $2 WHERE user_id = ANY($1::text[])`,
+    [ids, nid],
+  )).rowCount || 0;
+  counts.contributions = (await pool.query(
+    `UPDATE shared_goal_contributions SET user_id = $2 WHERE user_id = ANY($1::text[])`,
+    [ids, nid],
+  )).rowCount || 0;
+  counts.comments = (await pool.query(
+    `UPDATE shared_goal_comments SET user_id = $2 WHERE user_id = ANY($1::text[])`,
+    [ids, nid],
+  )).rowCount || 0;
+  counts.events = (await pool.query(
+    `UPDATE shared_goal_events SET author_user_id = $2 WHERE author_user_id = ANY($1::text[])`,
+    [ids, nid],
+  )).rowCount || 0;
+  // スタンプ：送り手・宛先の両方を移行する。
+  counts.stamps += (await pool.query(
+    `UPDATE shared_goal_stamps SET user_id = $2 WHERE user_id = ANY($1::text[])`,
+    [ids, nid],
+  )).rowCount || 0;
+  counts.stamps += (await pool.query(
+    `UPDATE shared_goal_stamps SET target_user_id = $2 WHERE target_user_id = ANY($1::text[])`,
+    [ids, nid],
+  )).rowCount || 0;
+  // 目標の所有者も移行する（isOwner 判定が旧IDのままだと壊れる）。
+  counts.goals = (await pool.query(
+    `UPDATE shared_goals SET owner_user_id = $2 WHERE owner_user_id = ANY($1::text[])`,
+    [ids, nid],
+  )).rowCount || 0;
+  // PK 付きテーブル：移行先に同キーの行があれば旧行を消し、無ければ UPDATE。
+  const migratePkRows = async (rows, keyCols, table) => {
+    let n = 0;
+    for (const row of rows) {
+      const keys = keyCols.map((c) => row[c]);
+      const existsParams = [...keys, nid];
+      const existsWhere = keyCols.map((c, i) => `${c} = $${i + 1}`).join(' AND ') + ` AND user_id = $${keyCols.length + 1}`;
+      const exists = await pool.query(
+        `SELECT 1 FROM ${table} WHERE ${existsWhere}`,
+        existsParams,
+      );
+      if (exists.rowCount) {
+        const delParams = [...keys, ids];
+        const delWhere = keyCols.map((c, i) => `${c} = $${i + 1}`).join(' AND ') + ` AND user_id = ANY($${keyCols.length + 1}::text[])`;
+        n += (await pool.query(`DELETE FROM ${table} WHERE ${delWhere}`, delParams)).rowCount || 0;
+      } else {
+        const updParams = [...keys, nid, ids];
+        const updWhere = keyCols.map((c, i) => `${c} = $${i + 1}`).join(' AND ') + ` AND user_id = ANY($${keyCols.length + 2}::text[])`;
+        n += (await pool.query(
+          `UPDATE ${table} SET user_id = $${keyCols.length + 1} WHERE ${updWhere}`,
+          updParams,
+        )).rowCount || 0;
+      }
+    }
+    return n;
+  };
+  // members (goal_id, user_id)／declarations (goal_id, user_id)／
+  // kicks (goal_id, user_id)。kicked_by は別途まとめて UPDATE する。
+  const memberRows = await pool.query(
+    `SELECT goal_id FROM shared_goal_members WHERE user_id = ANY($1::text[])`,
+    [ids]);
+  counts.members = await migratePkRows(memberRows.rows, ['goal_id'], 'shared_goal_members');
+  const declarationRows = await pool.query(
+    `SELECT goal_id FROM shared_goal_declarations WHERE user_id = ANY($1::text[])`,
+    [ids]);
+  counts.declarations = await migratePkRows(declarationRows.rows, ['goal_id'], 'shared_goal_declarations');
+  const kickRows = await pool.query(
+    `SELECT goal_id FROM shared_goal_kicks WHERE user_id = ANY($1::text[])`,
+    [ids]);
+  counts.kicks = await migratePkRows(kickRows.rows, ['goal_id'], 'shared_goal_kicks');
+  counts.kicks += (await pool.query(
+    `UPDATE shared_goal_kicks SET kicked_by = $2 WHERE kicked_by = ANY($1::text[])`,
+    [ids, nid],
+  )).rowCount || 0;
+  // task_completions (task_id, user_id, completed_date)。
+  // completed_date は 'YYYY-MM-DD' 文字列で扱う（Date オブジェクトの
+  // まま渡すとタイムゾーンでずれるため）。
+  const taskRows = await pool.query(
+    `SELECT task_id, to_char(completed_date, 'YYYY-MM-DD') AS completed_date
+     FROM shared_goal_task_completions WHERE user_id = ANY($1::text[])`,
+    [ids]);
+  counts.tasks = await migratePkRows(taskRows.rows, ['task_id', 'completed_date'], 'shared_goal_task_completions');
+  return counts;
+}
+
+/**
  * 今週のペースリーグ：参加中の人だけを生のペース%（raw_pace）順に返す。
  * 表示名は保存時の名前（プロフィール更新時は次回同期で反映される）。
  * requesterId がリーグ不参加なら optedOut=true を返す（自分の行は出さない）。
@@ -1128,6 +1255,7 @@ module.exports = {
   applyDisplayName,
   upsertPaceScore,
   deleteOldIdentityRows,
+  migrateSharedGoalIdentity,
   getWeeklyLeague,
   getMyLeagueRank,
   LEAGUE_METRIC_COLUMNS,
