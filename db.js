@@ -166,6 +166,23 @@ async function initDb() {
       avatar_color TEXT,
       league_opt_in BOOLEAN NOT NULL DEFAULT TRUE,
       activity_public BOOLEAN NOT NULL DEFAULT TRUE,
+      routine_public BOOLEAN NOT NULL DEFAULT FALSE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // V12.28: 既存DBへの追記（新規作成時は CREATE TABLE で既に入っているので no-op）。
+  await pool.query(`ALTER TABLE online_profiles ADD COLUMN IF NOT EXISTS routine_public BOOLEAN NOT NULL DEFAULT FALSE;`);
+
+  // ---- V12.28: 公開ルーティン（自分のルーティンを他プレイヤーに公開する） ----
+  // 1行＝1人。charts はクライアントが送る routineCharts をそのまま JSONB で
+  // 保存する（サーバー側でブロック形状は検証しない）。公開フラグは
+  // online_profiles.routine_public が正本で、こちらは表示用データのみ。
+  // 行があっても routine_public が false/未設定なら非公開扱い。
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public_routines (
+      user_id TEXT PRIMARY KEY,
+      display_name TEXT,
+      charts JSONB NOT NULL DEFAULT '[]'::jsonb,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
@@ -735,7 +752,7 @@ function cleanAvatarColor(value) {
 
 async function getOnlineProfile(userId) {
   const { rows } = await pool.query(
-    'SELECT user_id, display_name, avatar_color, league_opt_in, activity_public FROM online_profiles WHERE user_id = $1',
+    'SELECT user_id, display_name, avatar_color, league_opt_in, activity_public, routine_public FROM online_profiles WHERE user_id = $1',
     [String(userId)]
   );
   if (!rows[0]) return null;
@@ -745,6 +762,7 @@ async function getOnlineProfile(userId) {
     avatarColor: rows[0].avatar_color || null,
     leagueOptIn: rows[0].league_opt_in !== false,
     activityPublic: rows[0].activity_public !== false,
+    routinePublic: rows[0].routine_public !== false,
   };
 }
 
@@ -807,6 +825,60 @@ async function applyDisplayName(userId, displayName) {
     'UPDATE rank_comments SET author_name = $2 WHERE owner_user_id = $1 AND week_start = $3',
     [id, name, monday.rows[0].d]
   ).catch(() => {});
+}
+
+/**
+ * V12.28: 公開ルーティンを保存する（1人×1行で上書き）。
+ * charts はクライアントが送る routineCharts をそのまま JSONB で保存する
+ * （サーバー側でブロック形状は検証しない）。
+ * 公開フラグの正本は online_profiles.routine_public で、ここで同時に
+ * 更新する（プロフィール行が無ければ作る。表示名など他の項目は触らない）。
+ */
+async function savePublicRoutine(userId, displayName, charts, isPublic) {
+  const id = String(userId);
+  const name = cleanDisplayName(displayName);
+  const flag = Boolean(isPublic);
+  await pool.query(
+    `INSERT INTO public_routines (user_id, display_name, charts, updated_at)
+     VALUES ($1, $2, $3::jsonb, now())
+     ON CONFLICT (user_id) DO UPDATE SET
+       display_name = COALESCE(EXCLUDED.display_name, public_routines.display_name),
+       charts = EXCLUDED.charts,
+       updated_at = now()`,
+    [id, name, JSON.stringify(Array.isArray(charts) ? charts : [])]
+  );
+  await pool.query(
+    `INSERT INTO online_profiles (user_id, routine_public)
+     VALUES ($1, $2)
+     ON CONFLICT (user_id) DO UPDATE SET
+       routine_public = EXCLUDED.routine_public,
+       updated_at = now()`,
+    [id, flag]
+  );
+}
+
+/**
+ * V12.28: 公開ルーティンを読む。行が無い、または
+ * online_profiles.routine_public が false／未設定（プロフィール行無し）
+ * なら null（非公開扱い。呼び出し側は 404 'not_public' を返す）。
+ */
+async function getPublicRoutine(userId) {
+  const { rows } = await pool.query(
+    `SELECT pr.user_id, pr.display_name, pr.charts, pr.updated_at,
+            op.routine_public
+     FROM public_routines pr
+     LEFT JOIN online_profiles op ON op.user_id = pr.user_id
+     WHERE pr.user_id = $1`,
+    [String(userId)]
+  );
+  if (!rows[0]) return null;
+  if (rows[0].routine_public !== true) return null;
+  return {
+    userId: rows[0].user_id,
+    displayName: rows[0].display_name || null,
+    charts: rows[0].charts || [],
+    updatedAt: rows[0].updated_at,
+  };
 }
 
 /** 期限ベースの真のペース%を今週分として保存する（1人×1週で上書き）。
@@ -1067,6 +1139,8 @@ async function getWeeklyLeague(weekDate, requesterId, metric = 'pace') {
     optedOut,
     metric: m,
     entries: rows.map((r) => ({
+      // V12.28: PlayerDetail が開く人の公開ルーティンを引くための ID。
+      userId: String(r.user_id),
       name: r.name,
       avatarColor: r.avatar_color || null,
       category: 'overall',
@@ -1287,6 +1361,8 @@ module.exports = {
   getOnlineProfile,
   upsertOnlineProfile,
   applyDisplayName,
+  savePublicRoutine,
+  getPublicRoutine,
   upsertPaceScore,
   deleteOldIdentityRows,
   migrateSharedGoalIdentity,

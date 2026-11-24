@@ -511,7 +511,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.17.0',
+    version: '7.18.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -552,7 +552,11 @@ app.get('/api/version', (req, res) => {
     // POST /api/shared-goals/suggest-structure の期限バリデーション）。
     // AI の達成可能日は期日超過でもクランプしない（ユーザー要望により取消。
     // クライアントが「予測達成可能日」として「期日を超過」付きで表示する）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true },
+    // V12.28: routinePublic — 公開ルーティンの共有
+    // （PUT /api/online/routine で自分の routineCharts＋公開フラグを保存し、
+    // GET /api/online/routine/:userId で公開中の人のルーティンを読む。
+    // GET /api/league/weekly の各行に userId が付く）。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true },
   });
 });
 
@@ -562,7 +566,7 @@ app.get('/', (req, res) => {
     status: 'running',
     aiProvider: IS_OPENROUTER ? 'OpenRouter' : (API_KEY ? 'Groq (Llama 3)' : 'unconfigured'),
     model: DEFAULT_MODEL,
-    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/shared-goals/suggest-structure', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/activity', '/api/activity/feed', '/api/activity/friends', '/api/shared-goals/public', '/api/shared-goals/:id/join-public', '/api/shared-goals/:id/kick', '/api/shared-goals/kicked', '/api/shared-goals/updates', '/api/shared-goals/:id/comments', '/api/shared-goals/:id/declare', '/api/shared-goals/:id/deadline-result', '/api/shared-goals/:id/members/:userId/activity', '/api/onboarding-survey', '/api/admin/onboarding-surveys', '/health']
+    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/shared-goals/suggest-structure', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/online/routine', '/api/activity', '/api/activity/feed', '/api/activity/friends', '/api/shared-goals/public', '/api/shared-goals/:id/join-public', '/api/shared-goals/:id/kick', '/api/shared-goals/kicked', '/api/shared-goals/updates', '/api/shared-goals/:id/comments', '/api/shared-goals/:id/declare', '/api/shared-goals/:id/deadline-result', '/api/shared-goals/:id/members/:userId/activity', '/api/onboarding-survey', '/api/admin/onboarding-surveys', '/health']
   });
 });
 
@@ -1236,6 +1240,59 @@ app.put('/api/online/profile', optionalAuth, async (req, res) => {
   } catch (err) {
     console.error('PUT /api/online/profile error:', err);
     res.status(503).json({ error: 'Profile is unavailable', errorJa: 'プロフィールは利用できません。', errorEn: 'Profile is unavailable' });
+  }
+});
+
+// V12.28: 公開ルーティンの保存。自分の routineCharts と公開フラグを保存する。
+// 身元は /api/online/profile と同じ onlineIdentity（body の userId→
+// クエリの userId→ X-Device-Id ヘッダーの順）。charts は配列であること
+// だけ検証し、中身（ブロック形状）は検証しない。公開フラグの正本は
+// online_profiles.routine_public（db.savePublicRoutine が同時に更新する）。
+app.put('/api/online/routine', optionalAuth, async (req, res) => {
+  try {
+    const userId = onlineIdentity(req);
+    if (!userId || userId.length > 80) {
+      return res.status(400).json({ error: 'invalid_user_id' });
+    }
+    const charts = req.body?.charts;
+    if (!Array.isArray(charts)) {
+      return res.status(400).json({ error: 'invalid_charts' });
+    }
+    if (typeof req.body?.public !== 'boolean') {
+      return res.status(400).json({ error: 'invalid_public' });
+    }
+    if (req.body?.displayName !== undefined) {
+      if (typeof req.body.displayName !== 'string' || req.body.displayName.trim().length > 20) {
+        return res.status(400).json({ error: 'invalid_display_name' });
+      }
+    }
+    await db.savePublicRoutine(
+      userId,
+      req.body?.displayName !== undefined ? req.body.displayName.trim() : undefined,
+      charts,
+      req.body.public
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('PUT /api/online/routine error:', err);
+    res.status(503).json({ error: 'routine_unavailable' });
+  }
+});
+
+// V12.28: 公開ルーティンの読み取り。行が無い、または
+// online_profiles.routine_public が false／未設定なら 404 'not_public'。
+app.get('/api/online/routine/:userId', optionalAuth, async (req, res) => {
+  try {
+    const userId = String(req.params.userId || '').trim();
+    if (!userId || userId.length > 80) {
+      return res.status(400).json({ error: 'invalid_user_id' });
+    }
+    const routine = await db.getPublicRoutine(userId);
+    if (!routine) return res.status(404).json({ error: 'not_public' });
+    res.json(routine);
+  } catch (err) {
+    console.error('GET /api/online/routine/:userId error:', err);
+    res.status(503).json({ error: 'routine_unavailable' });
   }
 });
 
