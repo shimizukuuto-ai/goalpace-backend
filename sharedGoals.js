@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS shared_goals (
   deadline DATE NOT NULL,
   start_date DATE NOT NULL DEFAULT CURRENT_DATE,
   invite_code TEXT NOT NULL UNIQUE,
+  mode TEXT NOT NULL DEFAULT 'coop',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 -- V12・D班: kind は既存テーブルにも後付けする（CREATE TABLE IF NOT EXISTS
@@ -172,6 +173,13 @@ ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'co
 --   'private'=招待コードのみ（既定・旧データもこれ）/ 'public'=一覧に出て
 --   コード無しで参加できる。旧データは ALTER の DEFAULT で 'private' になる。
 ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'private';
+-- V12.24・A班: mode は kind・visibility と同じ後付けパターン。
+--   'coop'=協力型（1つの共有目標。共通タスクのボーナスは最初の完了者
+--   だけがチームに加算）/ 'compete'=競争型（各自の目標でペースを競う。
+--   共通タスクの完了は自分の貢献にだけ加算）。作成時に選ぶ。
+--   作成後の変更は不可（更新エンドポイントは無い）。
+--   旧データは ALTER の DEFAULT で 'coop' になる。
+ALTER TABLE shared_goals ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'coop';
 -- V12.6・C班: 数値タイプの開始値（value のときだけ使う。NULL可。
 --   無い場合は target を開始値扱いにしない＝進捗は記録待ち）と
 --   達成の決め方（'auto'|'deadline'|'declare'。既定 'auto'）。
@@ -255,8 +263,14 @@ CREATE TABLE IF NOT EXISTS shared_goal_tasks (
   goal_id BIGINT NOT NULL REFERENCES shared_goals(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
   created_by TEXT NOT NULL,
+  value NUMERIC NOT NULL DEFAULT 1,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- V12.24・A班: value は共通タスク1件あたりのボーナス量（1〜100000。
+--   既定 1）。kind・visibility と同じ後付けパターン（既存行は 1）。
+--   完了時のボーナス計算に使うだけで、保存されるのはタスクの value
+--   のみ（ボーナス自体は保存しない。loadGoalDetailInner で都度計算）。
+ALTER TABLE shared_goal_tasks ADD COLUMN IF NOT EXISTS value NUMERIC NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS idx_shared_goal_tasks ON shared_goal_tasks (goal_id, created_at ASC);
 CREATE TABLE IF NOT EXISTS shared_goal_task_completions (
   task_id BIGINT NOT NULL REFERENCES shared_goal_tasks(id) ON DELETE CASCADE,
@@ -360,6 +374,9 @@ const normalizeAchievementRule = (v) => (SHARED_GOAL_ACHIEVEMENT_RULES.includes(
 // 未指定・不正値は 'private'（旧データも 'private' 扱い）。
 const SHARED_GOAL_VISIBILITIES = ['private', 'public'];
 const normalizeVisibility = (v) => (v === 'public' ? 'public' : 'private');
+// V12.24・A班: 共有目標のモード。'coop'=協力型 / 'compete'=競争型。
+// 'compete' のときだけ競争型、未指定・不正値・旧データは 'coop'。
+const normalizeMode = (v) => (v === 'compete' ? 'compete' : 'coop');
 // 種類ごとの単位（time は「分」固定、habit は単位なし、count・value は入力通り）。
 const unitForKind = (kind, unit) => {
   if (kind === 'time') return '分';
@@ -635,7 +652,7 @@ function register({ app, db, auth }) {
   async function loadGoalDetailInner(goalId, viewerUserId) {
     const g = await q(
       `SELECT id, owner_user_id, title, target, unit, kind, visibility,
-              start_value, achievement_rule,
+              mode, start_value, achievement_rule,
               achievement_status, achieved_at, deadline_result, deadline_result_at,
               to_char(deadline, 'YYYY-MM-DD') AS deadline,
               to_char(start_date, 'YYYY-MM-DD') AS start_date,
@@ -891,19 +908,33 @@ function register({ app, db, auth }) {
     // （JST の今日に完了した行だけを数える。V12.23・A班【4】。以前は
     // completed_date = CURRENT_DATE＝UTC だったため、朝の完了が前日扱い
     // になることがあった）。
+    // V12.24・A班: value（タスク1件あたりのボーナス量。既定 1）も読む。
     const taskRows = await q(
-      `SELECT id, title, created_by, created_at FROM shared_goal_tasks
+      `SELECT id, title, created_by, value, created_at FROM shared_goal_tasks
        WHERE goal_id = $1 ORDER BY created_at ASC, id ASC LIMIT 30`,
       [goalId]);
+    // created_at も読む：coop のボーナスは「今日最初に完了した人」だけ
+    // に付くため、最初の完了者を決めるのに使う（下の firstCompleterByTask）。
     const doneRows = taskRows.rowCount
       ? await q(
-          `SELECT task_id, user_id FROM shared_goal_task_completions
+          `SELECT task_id, user_id, created_at FROM shared_goal_task_completions
            WHERE task_id = ANY($1::bigint[]) AND ${jstDateSql('created_at')} = ${JST_TODAY_SQL}`,
           [taskRows.rows.map((t) => t.id)])
       : { rows: [] };
     const doneByTask = {};
+    // V12.24・A班: タスクごとの今日最初の完了者（coop のボーナス対象）。
+    // created_at が最も早い人。同じ時刻なら user_id の辞書順で決める
+    // （決定論的。created_at だけでは同値があり得るため）。
+    const firstCompleterByTask = {};
     for (const r of doneRows.rows) {
-      (doneByTask[String(r.task_id)] = doneByTask[String(r.task_id)] || []).push(canon(r.user_id));
+      const tid = String(r.task_id);
+      const uid = canon(r.user_id);
+      (doneByTask[tid] = doneByTask[tid] || []).push(uid);
+      const prev = firstCompleterByTask[tid];
+      if (!prev || new Date(r.created_at) < new Date(prev.createdAt)
+        || (new Date(r.created_at).getTime() === new Date(prev.createdAt).getTime() && uid < prev.userId)) {
+        firstCompleterByTask[tid] = { userId: uid, createdAt: r.created_at };
+      }
     }
     const tasks = taskRows.rows.map((t) => {
       const done = doneByTask[String(t.id)] || [];
@@ -911,15 +942,67 @@ function register({ app, db, auth }) {
         id: String(t.id),
         title: t.title,
         createdBy: t.created_by,
+        // V12.24・A班: タスク1件あたりのボーナス量（旧行・NULL は 1）。
+        value: t.value == null ? 1 : Number(t.value),
         createdAt: t.created_at,
         completedByToday: done,
         doneTodayCount: done.length,
         doneToday: viewerUserId ? done.includes(canon(String(viewerUserId))) : false,
+        // V12.24・A班: 今日チームに加算されたボーナス（下で決める。
+        // value タイプと compete モードでは常に 0）。
+        bonusToday: 0,
       };
     });
     for (const m of memberList) {
       m.tasksDoneToday = tasks.filter((t) => t.completedByToday.includes(canon(m.userId))).length;
     }
+
+    // V12.24・A班: 共通タスクのボーナス（computed — 保存しない。
+    // double-count guard：完了行を貢献に書き込まず、読み取り時に都度
+    // 計算するため、同じ完了が2回数えられることは無い）。
+    // 対象は count / time / habit のみ。value タイプは対象外
+    // （value は「現在値」を追う種類で、タスク完了を量に換算しない。
+    // bonusToday は 0 のまま・貢献にも加算しない）。
+    // coop（協力型）：タスクごとに今日最初に完了した人だけが
+    // task.value をチームに加算する。2人目以降の完了はチームには
+    // 加算しない（bonusToday＝そのタスクが今日チームに加えた量）。
+    // compete（競争型）：各メンバーが自分で完了したタスクの value が
+    // その人自身の貢献にだけ加算される（チーム合計には他人の分は
+    // 入らない）。タスクの bonusToday は 0（チーム単位の加算が無いため）。
+    const taskBonusByMember = {};
+    if (normalizeKind(goal.kind) !== 'value') {
+      const mode = normalizeMode(goal.mode);
+      for (const t of tasks) {
+        const v = Number(t.value) || 1;
+        if (mode === 'compete') {
+          for (const uid of new Set(t.completedByToday)) {
+            taskBonusByMember[uid] = (taskBonusByMember[uid] || 0) + v;
+          }
+          t.bonusToday = 0;
+        } else {
+          const first = firstCompleterByTask[t.id];
+          if (first) {
+            t.bonusToday = v;
+            taskBonusByMember[first.userId] = (taskBonusByMember[first.userId] || 0) + v;
+          }
+        }
+      }
+    }
+    // ボーナスをメンバーの貢献合計に入れる（全体の達成率も動く。
+    // totalContribution はこのあと memberList から合計するため、
+    // ここで contribution を足しておけば全体にも反映される）。
+    // pacePercent も同じ式で計算し直す（順位はペース%順のまま）。
+    for (const m of memberList) {
+      const bonus = taskBonusByMember[canon(m.userId)] || 0;
+      if (bonus > 0) {
+        m.contribution += bonus;
+        const memberPlanned = memberCount > 0 ? planned / memberCount : 0;
+        m.pacePercent = memberPlanned > 0 ? rawPace((m.contribution / memberPlanned) * 100) : (m.contribution > 0 ? 100 : 0);
+      }
+    }
+    // ボーナスで pacePercent が変わることがあるため、同じ並び順
+    // （ペース%降順・貢献降順）で並べ直す。
+    memberList.sort((a, b) => b.pacePercent - a.pacePercent || b.contribution - a.contribution);
 
     const totalContribution = memberList.reduce((s, m) => s + m.contribution, 0);
     // V12・D班: 閲覧者（自分）の今日の貢献量。習慣チェックの「今日やった」
@@ -939,6 +1022,9 @@ function register({ app, db, auth }) {
       kind: normalizeKind(goal.kind),
       // V12.2・A班: 公開範囲。旧データは 'private'（DB の DEFAULT と同じ）。
       visibility: normalizeVisibility(goal.visibility),
+      // V12.24・A班: モード。旧データは 'coop'（DB の DEFAULT と同じ）。
+      // 作成後の変更は不可（更新エンドポイントは無い）。
+      mode: normalizeMode(goal.mode),
       // V12.6・C班: 数値タイプの開始値と達成の決め方。旧データは
       // startValue=null・achievementRule='auto'（DB の DEFAULT と同じ）。
       // currentValue はメンバー全員の記録のうち最新の1件（無ければ
@@ -1038,6 +1124,9 @@ function register({ app, db, auth }) {
     const kind = normalizeKind(b.kind);
     // V12.2・A班: visibility（private/public。未指定・不正値は 'private'）。
     const visibility = normalizeVisibility(b.visibility);
+    // V12.24・A班: mode（coop/compete。'compete' のときだけ競争型、
+    // 未指定・不正値は 'coop'）。作成後の変更は不可（更新エンドポイントは無い）。
+    const mode = normalizeMode(b.mode);
     const unit = unitForKind(kind, oneLine(b.unit, 20));
     // V12.6・C班: startValue（valueタイプの開始値）と achievementRule
     // （'auto'|'deadline'|'declare'。未指定・不正値は 'auto'）。
@@ -1070,9 +1159,9 @@ function register({ app, db, auth }) {
       try {
         await client.query('BEGIN');
         const ins = await client.query(
-          `INSERT INTO shared_goals (owner_user_id, title, target, unit, kind, visibility, deadline, invite_code, start_value, achievement_rule)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
-          [uid, title, target, unit, kind, visibility, deadline, code, startValue, achievementRule]);
+          `INSERT INTO shared_goals (owner_user_id, title, target, unit, kind, visibility, mode, deadline, invite_code, start_value, achievement_rule)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+          [uid, title, target, unit, kind, visibility, mode, deadline, code, startValue, achievementRule]);
         goalId = ins.rows[0].id;
         await client.query('INSERT INTO shared_goal_members (goal_id, user_id, display_name) VALUES ($1, $2, $3)',
           [goalId, uid, creatorName]);
@@ -1152,7 +1241,7 @@ function register({ app, db, auth }) {
     const offset = Math.max(0, Math.floor(Number(req.query.offset) || 0));
     const rows = await q(
       `SELECT g.id, g.owner_user_id, g.title, g.target, g.unit, g.kind,
-              g.start_value, g.achievement_rule, g.achievement_status,
+              g.start_value, g.achievement_rule, g.achievement_status, g.mode,
               to_char(g.deadline, 'YYYY-MM-DD') AS deadline,
               to_char(g.start_date, 'YYYY-MM-DD') AS start_date,
               g.created_at,
@@ -1178,6 +1267,8 @@ function register({ app, db, auth }) {
         id: String(r.id),
         title: r.title,
         kind: normalizeKind(r.kind),
+        // V12.24・A班: モード（公開一覧でも見える。旧データは 'coop'）。
+        mode: normalizeMode(r.mode),
         // V12.6・C班: 数値タイプの開始値と達成の決め方（公開一覧でも見える）。
         startValue: r.start_value == null ? null : Number(r.start_value),
         achievementRule: normalizeAchievementRule(r.achievement_rule),
@@ -1714,10 +1805,14 @@ function register({ app, db, auth }) {
     if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const title = oneLine(req.body && req.body.title, 80);
     if (!title) return res.status(400).json({ error: 'タスクを入力してください。', errorJa: 'タスクを入力してください。', errorEn: 'Please enter a task.' });
+    // V12.24・A班: value（タスク1件あたりのボーナス量。1〜100000。
+    // 未指定・不正値は 1）。完了時のボーナス計算に使う。
+    const valueRaw = Number(req.body && req.body.value);
+    const value = Number.isFinite(valueRaw) ? Math.max(1, Math.min(100000, valueRaw)) : 1;
     const cnt = await q('SELECT COUNT(*)::int AS n FROM shared_goal_tasks WHERE goal_id = $1', [req.params.id]);
     if (cnt.rows[0].n >= 30) return res.status(400).json({ error: '共通タスクは30個までです。', errorJa: '共通タスクは30個までです。', errorEn: 'You can add up to 30 shared tasks.' });
-    await q('INSERT INTO shared_goal_tasks (goal_id, title, created_by) VALUES ($1, $2, $3)',
-      [req.params.id, title, uid]);
+    await q('INSERT INTO shared_goal_tasks (goal_id, title, created_by, value) VALUES ($1, $2, $3, $4)',
+      [req.params.id, title, uid, value]);
     const detail = await loadGoalDetail(req.params.id, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
     detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);

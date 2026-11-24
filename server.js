@@ -478,7 +478,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.15.0',
+    version: '7.16.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -507,7 +507,14 @@ app.get('/api/version', (req, res) => {
     // migrateSharedGoalIdentity。共有目標のメンバー詳細に暗記・集中・
     // タスクが反映されない不具合の修正）。共有目標の「今日」は日本時間
     // （JST）で決める（sharedGoals.js。value タイプの「今日 0%」の修正）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true },
+    // V12.24・A班: tasksTotalToday — pace_scores に今日のタスク達成率
+    // （tasks_done_today / tasks_total_today）を保存し、リーグの指標
+    // 'taskRate' で並べ替えできる（db.js の LEAGUE_METRIC_COLUMNS）。
+    // V12.24・A班: sharedGoalMode — 共有目標に mode（'coop'|'compete'）
+    // を持たせる（sharedGoals.js。作成時に選ぶ。作成後の変更は不可）。
+    // 共通タスクのボーナスは mode で計算が変わる（coop＝最初の完了者
+    // だけがチームに加算、compete＝自分の完了が自分の貢献に加算）。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true },
   });
 });
 
@@ -993,10 +1000,13 @@ const anonDisplayName = (userId) => 'プレイヤー-' + crypto.createHash('sha2
  * goals: [{ target, actual, deadline: 'YYYY-MM-DD', startDate?: 'YYYY-MM-DD' }]
  *   startDate が無い目標（v11 以前に作られた目標）は今週の月曜を起点にする
  *   （週間リーグの窓口に合わせる。pace.ts の fallbackPacePercent と同じ考え方）。
- * stats: { pomodoro, memorized, tasksDone }（pomodoro・tasksDone はその週の
- *   回数・件数、memorized は今日学習したカード数（V12.22・A班【3】。従来は
- *   今週マスターした枚数）。順位には使わない。プロフィールの4つの数字
- *   として表示する）。
+ * stats: { pomodoro, memorized, tasksDone, tasksDoneToday, tasksTotalToday }
+ *   （pomodoro・tasksDone はその週の回数・件数、memorized は今日学習した
+ *   カード数（V12.22・A班【3】。従来は今週マスターした枚数）。順位には
+ *   使わない。プロフィールの4つの数字として表示する）。
+ *   tasksDoneToday / tasksTotalToday は今日のタスクの完了数・総数
+ *   （V12.24・A班。リーグ指標 'taskRate'＝今日のタスク達成率の材料。
+ *   無ければ 0 として保存する）。
  * previousUserIds?: string[]（V12.22・A班【1】。旧身元＝ウィザード uid／
  *   Apple id。v12.20 以前の同期で書かれた旧 uid の今週行と直近7日分の
  *   日次行を消す。新しい userId 自身は消さない）。
@@ -1068,6 +1078,8 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
       pomodoro: count(stats.pomodoro),
       memorized: count(stats.memorized),
       tasksDone: count(stats.tasksDone),
+      tasksDoneToday: count(stats.tasksDoneToday),
+      tasksTotalToday: count(stats.tasksTotalToday),
       leagueOptIn: profile ? profile.leagueOptIn !== false : true,
     });
     // V12.22・A班【1】：旧身元の行を掃除する。v12.20 以前はウィザード uid／
@@ -1100,9 +1112,11 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
 // V11: 今週のペースリーグ（正式版）。期限ベースの真のペース%（生値）順。
 // 旧クライアント向けの GET /api/leaderboard（metric=rate＝7日間ペース%）は残す。
 // 参加をオフにしている人は一覧に出ない。?userId= で自分の行に isMe が付く。
-// V12.2・A班: ?metric=pace|achievement|memorized|pomodoro で並び替えの指標を
+// V12.2・A班: ?metric=pace|achievement|memorized|pomodoro|taskRate で並び替えの指標を
 // 切り替える（未指定・不正値は pace で従来通り）。各行に value（その指標の値）と
 // unit（'%'／'枚'／'回'）を付け、トップレベルに metric をエコーする。
+// V12.24・A班: taskRate＝今日のタスク達成率（tasks_done_today /
+// tasks_total_today。総数 0 の行は値 null・順位は最後。myValue も null）。
 // 既存の行フィールド（progress・pacePercent 等）は変えない。
 // V12.20・C班: 自分の順位も返す（myRank・myValue）。上位 50 件の LIMIT に
 // 依存せず、COUNT(*) で数えた順位のため 51 位以下でも付く。参加オフ・

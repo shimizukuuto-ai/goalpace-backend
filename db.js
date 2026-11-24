@@ -179,6 +179,9 @@ async function initDb() {
   // カード数（V12.22・A班【3】。従来は今週マスターした枚数だったが、
   // マスターまで約6回の正解が要るため当日は 0 のままだった）。
   // クライアントが端末データから集計して送る。順位には使わない。
+  // tasks_done_today / tasks_total_today は今日のタスクの完了数・総数
+  // （V12.24・A班。リーグ指標 'taskRate'＝今日のタスク達成率の材料。
+  // 総数が 0 の行は達成率 NULL＝順位は最後・値は null）。
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pace_scores (
       user_id TEXT NOT NULL,
@@ -190,12 +193,17 @@ async function initDb() {
       pomodoro INTEGER NOT NULL DEFAULT 0,
       memorized INTEGER NOT NULL DEFAULT 0,
       tasks_done INTEGER NOT NULL DEFAULT 0,
+      tasks_done_today INTEGER NOT NULL DEFAULT 0,
+      tasks_total_today INTEGER NOT NULL DEFAULT 0,
       league_opt_in BOOLEAN NOT NULL DEFAULT TRUE,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       PRIMARY KEY (user_id, week_date)
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_pace_scores_week ON pace_scores (week_date, raw_pace DESC);`);
+  // V12.24・A班: 既存DBへの追記（新規作成時は CREATE TABLE で既に入っているので no-op）。
+  await pool.query(`ALTER TABLE pace_scores ADD COLUMN IF NOT EXISTS tasks_done_today INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE pace_scores ADD COLUMN IF NOT EXISTS tasks_total_today INTEGER NOT NULL DEFAULT 0;`);
 
   // ---- V12.19: オンボーディング survey の回答（集計用） ----
   // category: 何をがんばりたい？ (study/work/health/hobby/other)
@@ -801,13 +809,16 @@ async function applyDisplayName(userId, displayName) {
   ).catch(() => {});
 }
 
-/** 期限ベースの真のペース%を今週分として保存する（1人×1週で上書き）。 */
+/** 期限ベースの真のペース%を今週分として保存する（1人×1週で上書き）。
+ * V12.24・A班: score.tasksDoneToday / score.tasksTotalToday（今日の
+ * タスク完了数・総数）も保存する。無ければ 0（旧クライアント互換）。
+ * 0 未満・小数は 0 以上の整数に丸める。 */
 async function upsertPaceScore(userId, weekDate, score) {
   const { rows } = await pool.query(
     `INSERT INTO pace_scores
        (user_id, week_date, display_name, avatar_color, raw_pace, achievement_percent,
-        pomodoro, memorized, tasks_done, league_opt_in)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        pomodoro, memorized, tasks_done, tasks_done_today, tasks_total_today, league_opt_in)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
      ON CONFLICT (user_id, week_date) DO UPDATE SET
        display_name = EXCLUDED.display_name,
        avatar_color = EXCLUDED.avatar_color,
@@ -816,6 +827,8 @@ async function upsertPaceScore(userId, weekDate, score) {
        pomodoro = EXCLUDED.pomodoro,
        memorized = EXCLUDED.memorized,
        tasks_done = EXCLUDED.tasks_done,
+       tasks_done_today = EXCLUDED.tasks_done_today,
+       tasks_total_today = EXCLUDED.tasks_total_today,
        league_opt_in = EXCLUDED.league_opt_in,
        updated_at = now()
      RETURNING *`,
@@ -829,6 +842,8 @@ async function upsertPaceScore(userId, weekDate, score) {
       Math.max(0, Math.floor(score.pomodoro || 0)),
       Math.max(0, Math.floor(score.memorized || 0)),
       Math.max(0, Math.floor(score.tasksDone || 0)),
+      Math.max(0, Math.floor(score.tasksDoneToday || 0)),
+      Math.max(0, Math.floor(score.tasksTotalToday || 0)),
       score.leagueOptIn !== false,
     ]
   );
@@ -999,24 +1014,34 @@ async function migrateSharedGoalIdentity(newUserId, oldUserIds) {
  * pace_scores の対応する列で降順ソートする。各行に value（その指標の値）と
  * unit（'%'／'枚'／'回'）を付ける。既存の行フィールド（progress・pacePercent 等）は
  * 変えない（旧クライアント互換）。metric は呼び出し側で正規化済みの値を渡すこと。
+ * V12.24・A班: taskRate＝今日のタスク達成率（tasks_done_today /
+ * tasks_total_today × 100。四捨五入して整数%）。総数が 0 の行（旧行・
+ * 今日タスク無し）は NULL になり、行の taskRate・value は null、
+ * 順位は NULLS LAST で最後になる。myValue も null（getMyLeagueRank）。
  */
+// V12.24・A班: 今日のタスク達成率の SQL 式。LEAGUE_METRIC_COLUMNS と
+// getWeeklyLeague の SELECT（task_rate 別名）で共用する。
+const TASK_RATE_SQL = `CASE WHEN tasks_total_today > 0 THEN ROUND(tasks_done_today::float / tasks_total_today * 100) ELSE NULL END`;
 const LEAGUE_METRIC_COLUMNS = {
   pace: 'raw_pace',
   achievement: 'achievement_percent',
   memorized: 'memorized',
   pomodoro: 'pomodoro',
+  taskRate: TASK_RATE_SQL,
 };
 const LEAGUE_METRIC_UNITS = {
   pace: '%',
   achievement: '%',
   memorized: '枚',
   pomodoro: '回',
+  taskRate: '%',
 };
 const LEAGUE_METRIC_VALUE_FIELDS = {
   pace: 'raw_pace',
   achievement: 'achievement_percent',
   memorized: 'memorized',
   pomodoro: 'pomodoro',
+  taskRate: 'task_rate',
 };
 async function getWeeklyLeague(weekDate, requesterId, metric = 'pace') {
   const m = LEAGUE_METRIC_COLUMNS[metric] ? metric : 'pace';
@@ -1030,7 +1055,8 @@ async function getWeeklyLeague(weekDate, requesterId, metric = 'pace') {
   const { rows } = await pool.query(
     `SELECT user_id, display_name AS name, avatar_color,
             raw_pace, achievement_percent, pomodoro, memorized, tasks_done,
-            row_number() OVER (ORDER BY ${column} DESC, achievement_percent DESC, display_name ASC) AS rank
+            ${TASK_RATE_SQL} AS task_rate,
+            row_number() OVER (ORDER BY ${column} DESC NULLS LAST, achievement_percent DESC, display_name ASC) AS rank
      FROM pace_scores
      WHERE week_date = $1 AND league_opt_in = TRUE
      ORDER BY rank
@@ -1054,7 +1080,11 @@ async function getWeeklyLeague(weekDate, requesterId, metric = 'pace') {
       completed: Number(r.tasks_done),
       target: 0,
       points: 0,
-      value: Number(r[valueField]),
+      // V12.24・A班: 今日のタスク達成率（総数 0・旧行は null）。
+      // value も同じ値（taskRate のとき task_rate、他は従来通り）。
+      // NULL のまま Number() すると 0 になってしまうため null を保つ。
+      taskRate: r.task_rate == null ? null : Number(r.task_rate),
+      value: r[valueField] == null ? null : Number(r[valueField]),
       unit: LEAGUE_METRIC_UNITS[m],
       isMe: requesterId ? String(r.user_id) === String(requesterId) : false,
     })),
@@ -1070,6 +1100,9 @@ async function getWeeklyLeague(weekDate, requesterId, metric = 'pace') {
  * 同じ条件で数える。行が無い（今週未同期）・参加オフなら null。
  * 返す value はその指標の本人の値（クライアントの「あなたの順位」
  * 別枠に表示する値）。metric は呼び出し側で正規化済みの値を渡すこと。
+ * V12.24・A班: taskRate で本人の総数が 0 のとき metric_value は NULL
+ * になり、value・rank ともに null を返す（順位は決められないため。
+ * Number(null) は 0 になってしまうので null チェックが必須）。
  */
 async function getMyLeagueRank(weekDate, requesterId, metric = 'pace') {
   const m = LEAGUE_METRIC_COLUMNS[metric] ? metric : 'pace';
@@ -1081,6 +1114,7 @@ async function getMyLeagueRank(weekDate, requesterId, metric = 'pace') {
     [weekDate, String(requesterId)]
   );
   if (!mine.rows[0]) return null;
+  if (mine.rows[0].metric_value == null) return { rank: null, value: null };
   const myValue = Number(mine.rows[0].metric_value);
   const myAchievement = Number(mine.rows[0].achievement_percent);
   const myName = mine.rows[0].display_name;
