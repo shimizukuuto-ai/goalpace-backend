@@ -202,19 +202,52 @@ function parseJson(text) {
   return JSON.parse(cleaned.slice(start, end + 1));
 }
 
+// V12.25: 日付の寛容パース — "2027-4-18" のような非ゼロ埋め M/D も受け付ける。
+// 従来の ^\d{4}-\d{2}-\d{2}$ はこれを弾き、sharedGoalDaysUntil は null を返し
+// （日数計算が30日フォールバックに劣化）、suggest-structure は 400 を返していた。
+// 月 1-12・その月の実在する日（うるう年含む）のみ有効。形式違い・存在しない日付は
+// 従来どおり null を返す（"2027-13-01" "2027-2-30" "2027/4/18" "18-4-2027" 等）。
+function parseTolerantDate(value) {
+  if (typeof value !== 'string') return null;
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(value.trim());
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+  const date = new Date(y, mo - 1, d);
+  date.setFullYear(y); // 0-99年が 19xx 年に化ける JS の仕様を打ち消す
+  if (date.getFullYear() !== y || date.getMonth() !== mo - 1 || date.getDate() !== d) return null;
+  return date;
+}
+
+// Date -> 'YYYY-MM-DD'（ゼロ埋め）。parseTolerantDate と対で使う。
+function formatTolerantDate(d) {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) return null;
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${mo}-${day}`;
+}
+
 // Iteration 4 (C5の根本対策): LLMが返す日付のバリデーション。形式不正・過去の日付は
 // 期日(fallback)に寄せる。TINKOの端末で「達成可能日 2025-06-15」が出たのは、
 // AI生成の自由テキスト日付が無検証で保存・表示されていたため。クライアント側にも
 // 表示ガードがあるが、発生源のサーバー側で止める。
+// V12.25・注: 期日を越えた AI 予測日はここではクランプしない（ユーザーの要望により
+// 取消）。予測日は期日超過でもそのまま返し、クライアントが「予測達成可能日」として
+// 「期日を超過」マーカー付きで表示する。V12.25 では検証だけ寛容パーサーに寄せた
+// （非ゼロ埋めも受け付け、返値はゼロ埋めに正規化）。過去の日付へのフォールバック
+// （期日を返す）だけは従来どおり。
 function sanitizeProjectedDate(value, fallback) {
-  const fb = typeof fallback === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(fallback) ? fallback : null;
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return fb;
-  const d = new Date(value + 'T00:00:00');
-  if (Number.isNaN(d.getTime())) return fb;
+  const fbDate = typeof fallback === 'string' ? parseTolerantDate(fallback) : null;
+  const fb = fbDate ? formatTolerantDate(fbDate) : null;
+  if (typeof value !== 'string') return fb;
+  const d = parseTolerantDate(value);
+  if (!d) return fb;
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   if (d < today) return fb;
-  return value;
+  return formatTolerantDate(d);
 }
 
 // ==========================================================================
@@ -478,7 +511,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.16.0',
+    version: '7.17.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -514,7 +547,12 @@ app.get('/api/version', (req, res) => {
     // を持たせる（sharedGoals.js。作成時に選ぶ。作成後の変更は不可）。
     // 共通タスクのボーナスは mode で計算が変わる（coop＝最初の完了者
     // だけがチームに加算、compete＝自分の完了が自分の貢献に加算）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true },
+    // V12.25・A班: tolerantDateParse — "2027-4-18" のような非ゼロ埋め M/D
+    // も日付として受け付ける（parseTolerantDate。sharedGoalDaysUntil と
+    // POST /api/shared-goals/suggest-structure の期限バリデーション）。
+    // AI の達成可能日は期日超過でもクランプしない（ユーザー要望により取消。
+    // クライアントが「予測達成可能日」として「期日を超過」付きで表示する）。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true },
   });
 });
 
@@ -762,9 +800,10 @@ const SHARED_GOAL_STRUCTURE_KINDS = ['count', 'time', 'habit', 'value'];
 const SHARED_GOAL_ACHIEVEMENT_RULES = ['auto', 'deadline', 'declare'];
 
 function sharedGoalDaysUntil(deadline) {
-  if (typeof deadline !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(deadline)) return null;
-  const d = new Date(deadline + 'T00:00:00');
-  if (Number.isNaN(d.getTime())) return null;
+  // V12.25: 寛容パース（"2027-4-18" も有効）。従来の厳密正規表現では
+  // 非ゼロ埋めを null にし、呼び出し側が30日フォールバックに劣化していた。
+  const d = parseTolerantDate(deadline);
+  if (!d) return null;
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   return Math.max(1, Math.ceil((d.getTime() - today.getTime()) / 86400000));
@@ -909,7 +948,9 @@ app.post('/api/shared-goals/suggest-structure', optionalAuth, quotaStd, async (r
     if (!goal || goal.length > 300) {
       return res.status(400).json({ error: 'Goal must contain 1–300 characters.', errorJa: '目標は1〜300文字で入力してください。', errorEn: 'Goal must contain 1–300 characters.' });
     }
-    if (deadline && !/^\d{4}-\d{2}-\d{2}$/.test(deadline)) {
+    // V12.25: 寛容パース（"2027-4-18" も有効）。parseTolerantDate が
+    // 月 1-12・実在する日のみ通すので、ゴミは従来どおり 400。
+    if (deadline && !parseTolerantDate(deadline)) {
       return res.status(400).json({ error: 'Deadline must be YYYY-MM-DD.', errorJa: '期限は YYYY-MM-DD で入力してください。', errorEn: 'Deadline must be YYYY-MM-DD.' });
     }
 
@@ -1038,13 +1079,18 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
       if (!Number.isFinite(actual) || actual < 0 || actual > 100000000) {
         return res.status(400).json({ error: 'Invalid goal actual', errorJa: '目標の実績値が正しくありません。', errorEn: 'Invalid goal actual' });
       }
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(deadline)) {
+      // V12.25: 非ゼロ埋めの期限も受け付け、plannedByToday（sharedGoals.js の
+      // strict な parseDay を使う）に渡す前にゼロ埋めへ正規化する。
+      const deadlineDate = parseTolerantDate(deadline);
+      if (!deadlineDate) {
         return res.status(400).json({ error: 'Invalid goal deadline', errorJa: '目標の期限が正しくありません。', errorEn: 'Invalid goal deadline' });
       }
-      const startDate = /^\d{4}-\d{2}-\d{2}$/.test(String(g?.startDate || '')) ? String(g.startDate) : weekDate;
+      const deadlineNorm = formatTolerantDate(deadlineDate);
+      const startDateParsed = parseTolerantDate(String(g?.startDate || ''));
+      const startDate = startDateParsed ? formatTolerantDate(startDateParsed) : weekDate;
       totalActual += actual;
       totalTarget += target;
-      totalPlanned += plannedByToday(target, startDate, deadline, today);
+      totalPlanned += plannedByToday(target, startDate, deadlineNorm, today);
     }
     const rawPace = totalPlanned > 0 ? (totalActual / totalPlanned) * 100 : (totalActual > 0 ? 100 : 0);
     const achievement = totalTarget > 0 ? Math.min(100, (totalActual / totalTarget) * 100) : 0;
@@ -1205,9 +1251,11 @@ app.post('/api/leaderboard/sync', optionalAuth, async (req, res) => {
     if (typeof displayName !== 'string' || !displayName.trim() || displayName.length > 40) {
       return res.status(400).json({ error: 'Invalid displayName', errorJa: '表示名が正しくありません。', errorEn: 'Invalid displayName' });
     }
-    if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    if (typeof date !== 'string' || !parseTolerantDate(date)) {
       return res.status(400).json({ error: 'Invalid date', errorJa: '日付が正しくありません。', errorEn: 'Invalid date' });
     }
+    // V12.25: 非ゼロ埋めの日付も受け付け、DB へ渡す前にゼロ埋めへ正規化する。
+    const normDate = formatTolerantDate(parseTolerantDate(date));
     if (!Array.isArray(categories) || categories.length > 30) {
       return res.status(400).json({ error: 'Invalid categories', errorJa: 'カテゴリーが正しくありません。', errorEn: 'Invalid categories' });
     }
@@ -1223,7 +1271,7 @@ app.post('/api/leaderboard/sync', optionalAuth, async (req, res) => {
     })).filter(item => item.name && (item.target + item.completed + item.pomodoro + item.minutes + item.memorized) > 0);
     // ランキングの名前は匿名（プレイヤー-＋IDから作る4文字）。端末から送られた名前は使わない
     const anonName = 'プレイヤー-' + crypto.createHash('sha256').update(userId).digest('hex').slice(0, 4);
-    await db.upsertDailyCategoryScores(userId, anonName, date, normalized);
+    await db.upsertDailyCategoryScores(userId, anonName, normDate, normalized);
     res.json({ ok: true });
   } catch (err) {
     console.error('/api/leaderboard/sync error:', err);
@@ -1254,14 +1302,17 @@ app.get('/api/leaderboard', optionalAuth, async (req, res) => {
     const echoMetric = LEADERBOARD_METRICS.includes(requestedMetric) || LEADERBOARD_METRIC_ALIASES[requestedMetric]
       ? requestedMetric
       : metric;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to) || !category) {
+    if (!parseTolerantDate(from) || !parseTolerantDate(to) || !category) {
       return res.status(400).json({ error: 'from, to and category are required', errorJa: 'from、to、categoryが必要です。', errorEn: 'from, to and category are required' });
     }
-    const days = (Date.parse(to) - Date.parse(from)) / 86400000;
+    // V12.25: 非ゼロ埋めも受け付け、DB へ渡す前にゼロ埋めへ正規化する。
+    const fromNorm = formatTolerantDate(parseTolerantDate(from));
+    const toNorm = formatTolerantDate(parseTolerantDate(to));
+    const days = (Date.parse(toNorm) - Date.parse(fromNorm)) / 86400000;
     if (!(days >= 0 && days <= 6)) {
       return res.status(400).json({ error: 'Range must be 1 to 7 days', errorJa: '期間は1〜7日で指定してください。', errorEn: 'Range must be 1 to 7 days' });
     }
-    const entries = await db.getCategoryLeaderboard(from, to, category, metric);
+    const entries = await db.getCategoryLeaderboard(fromNorm, toNorm, category, metric);
     // db が返す各行には value（その指標の値）が既に入っている。unit を付ける。
     res.json({ metric: echoMetric, entries: entries.map((e) => ({ ...e, unit: LEADERBOARD_METRIC_UNITS[echoMetric] || LEADERBOARD_METRIC_UNITS[metric] })) });
   } catch (err) {

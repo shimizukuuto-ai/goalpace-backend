@@ -393,17 +393,23 @@ function parseDay(s) {
   // node-postgres は DATE カラムを JS の Date オブジェクトとして返す。
   // そのまま String() すると 'Mon Nov 23 2026 ...' になり正規表現に
   // 一致せず null になるため、Date も受け取れるようにする（v5 修正）。
-  // 文字列は従来通り 'YYYY-MM-DD' の厳密な形式のみ受け付ける
-  // （クライアントからの deadline バリデーション用途を維持するため、
-  //  'YYYY-MM-DDTHH...' のような ISO 文字列はここでは通さない）。
+  // 文字列は 'YYYY-MM-DD' を基本とするが、V12.25 から非ゼロ埋めの M/D
+  // （例：'2027-4-18'）も受け付ける。'YYYY-MM-DDTHH...' のような ISO
+  // 文字列はここでは通さない。存在しない日付は null を返す。
   if (s instanceof Date) {
     if (Number.isNaN(s.getTime())) return null;
     return new Date(s.getFullYear(), s.getMonth(), s.getDate());
   }
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || ''));
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(s || '').trim());
   if (!m) return null;
-  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-  return Number.isNaN(d.getTime()) ? null : d;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const dd = Number(m[3]);
+  if (mo < 1 || mo > 12 || dd < 1 || dd > 31) return null;
+  const d = new Date(y, mo - 1, dd);
+  d.setFullYear(y); // 0-99年が 19xx 年に化ける JS の仕様を打ち消す
+  if (d.getFullYear() !== y || d.getMonth() !== mo - 1 || d.getDate() !== dd) return null;
+  return d;
 }
 // Date -> 'YYYY-MM-DD'（返却値用。クライアントの pace.ts の parseDay は
 // この形式しか読めないため、deadline / startDate に ISO 文字列は返さない）。

@@ -86,15 +86,23 @@ function jstDateString(offsetDays) {
   return fmt.format(d);
 }
 function parseBackfillDate(value) {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
-  const d = new Date(value + 'T00:00:00+09:00');
-  if (Number.isNaN(d.getTime())) return null;
-  // 存在しない日付（2026-02-30 等）はパースでずれるので弾く。
-  if (d.toISOString().slice(0, 10) !== value && new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d) !== value) return null;
+  // V12.25: 非ゼロ埋めの M/D（例：'2026-11-4'）も受け付け、ゼロ埋めへ正規化してから
+  // 今日・昨日と比較する。存在しない日付はコンポーネント照合で弾く。
+  if (typeof value !== 'string') return null;
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(value.trim());
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const dd = Number(m[3]);
+  if (mo < 1 || mo > 12 || dd < 1 || dd > 31) return null;
+  const d = new Date(y, mo - 1, dd);
+  d.setFullYear(y); // 0-99年が 19xx 年に化ける JS の仕様を打ち消す
+  if (d.getFullYear() !== y || d.getMonth() !== mo - 1 || d.getDate() !== dd) return null;
+  const norm = `${y}-${String(mo).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
   const today = jstDateString(0);
   const yesterday = jstDateString(-1);
-  if (value !== today && value !== yesterday) return null;
-  return value;
+  if (norm !== today && norm !== yesterday) return null;
+  return norm;
 }
 
 function register({ app, db, auth }) {
