@@ -478,7 +478,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.13.0',
+    version: '7.14.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -495,7 +495,12 @@ app.get('/api/version', (req, res) => {
     // V12.20・C班: canonicalIdentity — 共有目標のメンバーIDを端末ID
     // （pace_scores / activity_events と同じ）に揃える
     // （sharedGoals.js の resolveMemberId）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true },
+    // V12.22・A班: identityCleanup — POST /api/leaderboard/sync-pace の
+    // previousUserIds で旧身元（ウィザード uid／Apple id）の今週行と
+    // 直近7日分の日次行を消す（リーグの「あなた」重複の掃除）。
+    // V12.22・A班: memorizedToday — pace_scores.memorized は今日学習した
+    // カード数（従来は今週マスターした枚数）。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true },
   });
 });
 
@@ -981,8 +986,13 @@ const anonDisplayName = (userId) => 'プレイヤー-' + crypto.createHash('sha2
  * goals: [{ target, actual, deadline: 'YYYY-MM-DD', startDate?: 'YYYY-MM-DD' }]
  *   startDate が無い目標（v11 以前に作られた目標）は今週の月曜を起点にする
  *   （週間リーグの窓口に合わせる。pace.ts の fallbackPacePercent と同じ考え方）。
- * stats: { pomodoro, memorized, tasksDone }（その週の回数・枚数・件数。
- *   順位には使わない。プロフィールの4つの数字として表示する）。
+ * stats: { pomodoro, memorized, tasksDone }（pomodoro・tasksDone はその週の
+ *   回数・件数、memorized は今日学習したカード数（V12.22・A班【3】。従来は
+ *   今週マスターした枚数）。順位には使わない。プロフィールの4つの数字
+ *   として表示する）。
+ * previousUserIds?: string[]（V12.22・A班【1】。旧身元＝ウィザード uid／
+ *   Apple id。v12.20 以前の同期で書かれた旧 uid の今週行と直近7日分の
+ *   日次行を消す。新しい userId 自身は消さない）。
  * displayName を送るとプロフィールの表示名として保存する（スクリーニング付き）。
  * 未設定のままなら保存済みの表示名→匿名（プレイヤー-xxxx）の順で表示する。
  */
@@ -1053,6 +1063,21 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
       tasksDone: count(stats.tasksDone),
       leagueOptIn: profile ? profile.leagueOptIn !== false : true,
     });
+    // V12.22・A班【1】：旧身元の行を掃除する。v12.20 以前はウィザード uid／
+    // Apple id で同期していたため、旧 uid の今週行が残ってリーグに
+    // 「あなた」が2行出る。掃除に失敗しても同期自体は成功させる。
+    const previousUserIds = Array.isArray(req.body?.previousUserIds)
+      ? req.body.previousUserIds.filter((v) => typeof v === 'string' && v.trim() && v.trim().length <= 80).slice(0, 5)
+      : [];
+    if (previousUserIds.length > 0) {
+      const sinceDate = (() => {
+        const [y, m, d] = today.split('-').map(Number);
+        return new Date(Date.UTC(y, m - 1, d - 6)).toISOString().slice(0, 10);
+      })();
+      await db.deleteOldIdentityRows(userId, previousUserIds, weekDate, sinceDate).catch((e) => {
+        console.error('/api/leaderboard/sync-pace identity cleanup error:', e);
+      });
+    }
     res.json({ ok: true, weekDate, pacePercent: Math.round(rawPace), achievementPercent: Math.round(achievement) });
   } catch (err) {
     console.error('/api/leaderboard/sync-pace error:', err);

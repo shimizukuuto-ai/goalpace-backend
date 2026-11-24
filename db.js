@@ -175,8 +175,10 @@ async function initDb() {
   // （実績÷今日までの計画量×100）。表示はクライアントが 100% で
   // キャップし、先行分を別バッジで出す。順位は raw_pace で決める。
   // achievement_percent は目標達成度%（実績÷目標量×100、上限100）。
-  // pomodoro / memorized / tasks_done はその週の回数・枚数・件数
-  // （クライアントが端末データから集計して送る。順位には使わない）。
+  // pomodoro / tasks_done はその週の回数・件数、memorized は今日学習した
+  // カード数（V12.22・A班【3】。従来は今週マスターした枚数だったが、
+  // マスターまで約6回の正解が要るため当日は 0 のままだった）。
+  // クライアントが端末データから集計して送る。順位には使わない。
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pace_scores (
       user_id TEXT NOT NULL,
@@ -834,6 +836,34 @@ async function upsertPaceScore(userId, weekDate, score) {
 }
 
 /**
+ * V12.22・A班【1】：旧身元（ウィザード uid／Apple id）の行を消す。
+ * v12.20 で pace 同期の userId をデバイスIDに統一したが、旧 uid で
+ * 書かれた今週の pace_scores 行が残り、表示名が同じためリーグに
+ * 「あなた」が2行出る。sync-pace が previousUserIds を受け取ったら
+ * 呼ぶ（失敗しても同期自体は成功させるため、呼び出し側で catch する）。
+ * pace_scores は今週分だけ、daily_category_scores は直近7日分だけ消す。
+ * 新しい userId 自身の行は消さない（念のため SQL でも除外する）。
+ * 戻り値は消した行数（{ pace, daily }）。
+ */
+async function deleteOldIdentityRows(newUserId, oldUserIds, weekDate, sinceDate) {
+  const ids = (Array.isArray(oldUserIds) ? oldUserIds : [])
+    .map((v) => String(v || '').trim())
+    .filter((v) => v && v !== String(newUserId));
+  if (ids.length === 0) return { pace: 0, daily: 0 };
+  const pace = await pool.query(
+    `DELETE FROM pace_scores
+      WHERE user_id = ANY($1::text[]) AND week_date = $2 AND user_id <> $3`,
+    [ids, weekDate, String(newUserId)],
+  );
+  const daily = await pool.query(
+    `DELETE FROM daily_category_scores
+      WHERE client_user_id = ANY($1::text[]) AND score_date >= $2 AND client_user_id <> $3`,
+    [ids, sinceDate, String(newUserId)],
+  );
+  return { pace: pace.rowCount || 0, daily: daily.rowCount || 0 };
+}
+
+/**
  * 今週のペースリーグ：参加中の人だけを生のペース%（raw_pace）順に返す。
  * 表示名は保存時の名前（プロフィール更新時は次回同期で反映される）。
  * requesterId がリーグ不参加なら optedOut=true を返す（自分の行は出さない）。
@@ -1097,6 +1127,7 @@ module.exports = {
   upsertOnlineProfile,
   applyDisplayName,
   upsertPaceScore,
+  deleteOldIdentityRows,
   getWeeklyLeague,
   getMyLeagueRank,
   LEAGUE_METRIC_COLUMNS,
