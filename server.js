@@ -31,6 +31,15 @@ const DEFAULT_MODEL = IS_OPENROUTER
   ? (process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3.5-lightning:free')
   : (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile');
 
+// V12.33 — 画像対応モデル（写真からカロリー推定用）。既定の DEFAULT_MODEL
+// （Nemotron 3.5 Lightning）はテキスト専用のため、画像は別モデルで読む。
+// OpenRouter の無料の画像対応モデル（Llama 3.2 11B Vision Instruct）。
+// 環境変数 OPENROUTER_VISION_MODEL で上書き可能。同じ API キー・同じ
+// エンドポイントを使う（新しい秘密情報は不要）。
+const VISION_MODEL = IS_OPENROUTER
+  ? (process.env.OPENROUTER_VISION_MODEL || 'meta-llama/llama-3.2-11b-vision-instruct:free')
+  : (process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct');
+
 // 認証を必須にするかどうか（開発中や個人利用では false 推奨）
 const REQUIRE_AUTH = process.env.REQUIRE_AUTH === 'true';
 
@@ -174,6 +183,81 @@ async function callGroqLlama({ system, userText, locale, jsonMode = true, temper
     await new Promise((resolve) => setTimeout(resolve, waitMs));
   }
   throw lastError || new Error('AI call failed');
+}
+
+// V12.33 — 画像付きの AI 呼び出し（写真からカロリー推定用）。callGroqLlama と
+// 同じエンドポイント・同じキー・同じリトライ流儀で、画像対応モデルを使う。
+// userText はテキスト、image は { base64, mimeType }。JSON で返す。
+async function callVisionLlama({ system, userText, image, locale, temperature = 0.2 }) {
+  if (!API_KEY) {
+    if (MOCK_MODE) {
+      console.warn('[DEV] API_KEY未設定のためモックを返します');
+      return null;
+    }
+    throw new Error('API_KEY is not set. Please set OPENROUTER_API_KEY or GROQ_API_KEY in your .env or Render Environment Variables.');
+  }
+
+  const messages = [
+    { role: 'system', content: system },
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: userText },
+        { type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.base64}` } },
+      ],
+    },
+  ];
+
+  const body = {
+    model: VISION_MODEL,
+    messages,
+    temperature,
+    response_format: { type: 'json_object' },
+  };
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${API_KEY}`,
+  };
+  if (IS_OPENROUTER) {
+    headers['HTTP-Referer'] = 'https://github.com/shimizusorashou/ControlCenter';
+    headers['X-Title'] = 'ControlCenter';
+  }
+
+  const maxRetries = 2;
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let retryable = false;
+    try {
+      const res = await fetch(API_BASE, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(AI_TIMEOUT_MS),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const text = data.choices?.[0]?.message?.content;
+        if (!text) throw Object.assign(new Error('AI returned empty response'), { retryable: true });
+        return text;
+      }
+
+      const errText = await res.text();
+      console.error(`AI vision API ${res.status} body:`, errText);
+      retryable = res.status === 503 || res.status === 500 || res.status === 429;
+      lastError = new Error(`AI API error (${res.status})`);
+    } catch (e) {
+      lastError = e;
+      retryable = retryable || e.name === 'TimeoutError' || e.name === 'AbortError' || e.retryable === true || e.cause?.code === 'ECONNRESET' || e instanceof TypeError;
+    }
+    if (!retryable || attempt >= maxRetries) break;
+    const waitMs = 1500 * Math.pow(2, attempt);
+    console.log(`AI vision call failed (${lastError?.message}), retrying in ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})...`);
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+  throw lastError || new Error('AI vision call failed');
 }
 
 function parseJson(text) {
@@ -537,7 +621,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.20.0',
+    version: '7.21.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -591,7 +675,7 @@ app.get('/api/version', (req, res) => {
     // /api/plan は numericMeta＋extraNotes をプロンプトに反映し、
     // /api/checkin は todayEntry.numericValues と project.extraNotes を
     // 反映する（新規テーブル・カラムなし。プロンプトのみの変更）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true, numericGoals: true },
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true, numericGoals: true, photoCalories: true },
   });
 });
 
@@ -667,7 +751,7 @@ app.post('/api/plan', optionalAuth, quotaStd, async (req, res) => {
     const system = `あなたは目標達成・行動設計のエキスパートです。
 ユーザーの目標、期日、現状の回答をもとに、達成可能性（feasibility）を科学的・現実的に分析し、週ごとの具体的なタスクロードマップを作成してください。
 ${linkedTasks.length > 0 ? '【紐づけたタスクについて】\nユーザーがこの目標に紐づけた自分のタスクがあります。計画の一部として必ず考慮し、同じ内容のタスクを tasks に重複して入れないこと。紐づけたタスクを補う具体的なタスクを中心に組み立てること。\n' : ''}
-${numericMeta ? '【数値目標について】\nこの目標は数値で記録する目標です（numericMeta を参照）。requiredPace は必ずその単位で具体的な量で表すこと（例：「1日36ページ読む」）。tasks の各タスクにも具体的な量を入れること（例：「36ページ読む」）。numericDirection が "atMost"（以下）のときは、その量は上限であり、超えることを目標にしてはいけない（ノルマとして課さないこと）。numericKind が "record"（値を記録する。例：体重）のときは、1日の行動量ではなく記録する値の変化を基準にペースを考えること。\n' : ''}
+${numericMeta ? '【数値目標について】\nこの目標は数値で記録する目標です（numericMeta を参照）。requiredPace は必ずその単位で具体的な量で表すこと（例：「1日36ページ読む」）。numericDailyQuota があるときは requiredPace の1日量をその値に合わせること（例：numericDailyQuota が 3000 なら「1日3000kcal」）。tasks の各タスクにも具体的な量を入れること（例：「36ページ読む」）。numericDirection が "atMost"（以下）のときは、その量は上限であり、超えることを目標にしてはいけない（ノルマとして課さないこと）。numericKind が "record"（値を記録する。例：体重）のときは、1日の行動量ではなく記録する値の変化を基準にペースを考えること。\n' : ''}
 必ず以下のJSON形式のみで出力してください：
 {
   "feasibility": "現実的" または "やや厳しい" または "非現実的",
@@ -798,6 +882,47 @@ linkedTasks は、ユーザーがタスク一覧からこの目標に紐づけ�
   } catch (err) {
     console.error('/api/checkin error:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/calories/photo', optionalAuth, quotaStd, async (req, res) => {
+  try {
+    const locale = resolveLocale(req);
+    const imageBase64 = typeof req.body?.imageBase64 === 'string' ? req.body.imageBase64.trim() : '';
+    const mimeType = typeof req.body?.mimeType === 'string' ? req.body.mimeType.trim().toLowerCase() : 'image/jpeg';
+    // 上限 2,000,000 文字（約 1.5MB 分。express.json の limit '2mb' と
+    // 整合させる。クライアントは 1024px・quality 0.7 に縮小して送るため
+    // 通常は 100〜500KB 文字に収まる）。
+    if (!imageBase64 || imageBase64.length < 100 || imageBase64.length > 2000000 || !['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) {
+      return res.status(400).json({ error: 'Invalid image.', errorJa: '画像が正しくありません。もう一度写真を選び直してください。', errorEn: 'Invalid image. Please pick the photo again.' });
+    }
+
+    if (MOCK_MODE || !API_KEY) {
+      console.log('[MOCK] /api/calories/photo');
+      return res.json({ calories: 650, items: [{ name: '食事（モック）', calories: 650 }], mock: true });
+    }
+
+    const system = `You are a nutrition estimator. Look at the food photo and estimate the total calories of everything edible visible in it.
+Identify each visible food or drink item with its estimated calories. Be realistic, not generous; if unsure, give your best estimate.
+Return ONLY valid JSON in this exact shape: {"calories": 0, "items": [{"name": "...", "calories": 0}]}.
+If no food or drink is visible, return {"calories": 0, "items": []}.` + localeSuffix(locale);
+    const text = await callVisionLlama({
+      system,
+      userText: 'Estimate the total calories of the food in this photo. Reply with JSON only.',
+      image: { base64: imageBase64, mimeType },
+      locale,
+    });
+    const parsed = parseJson(text);
+    const calories = Math.round(Number(parsed?.calories) || 0);
+    if (!(calories >= 0) || calories > 20000) throw new Error('AI returned an implausible calorie value');
+    const items = (Array.isArray(parsed?.items) ? parsed.items : [])
+      .map((it) => ({ name: String(it?.name || '').trim().slice(0, 60), calories: Math.round(Number(it?.calories) || 0) }))
+      .filter((it) => it.name && it.calories > 0)
+      .slice(0, 10);
+    res.json({ calories, items });
+  } catch (err) {
+    console.error('/api/calories/photo error:', err);
+    res.status(500).json({ error: 'Could not estimate calories from this photo.', errorJa: 'この写真からカロリーを推定できませんでした。', errorEn: 'Could not estimate calories from this photo.' });
   }
 });
 
