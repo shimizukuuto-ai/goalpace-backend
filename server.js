@@ -621,7 +621,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.21.0',
+    version: '7.22.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -671,11 +671,14 @@ app.get('/api/version', (req, res) => {
     // 端末へのサブスク記録で表示・利用枠とも週300回、使い切り +100
     // （com.uuto.GoalPace.credits100）を device_profiles.purchased_credits
     // に加算。週リセットなし・期限なし。POST /api/iap/verify-consumable）。
+    // V12.35: aiInfersRecording — /api/plan が記録のしかた（binary /
+    // accumulate / record）＋単位＋1日量を目標文と診断回答から推定し、
+    // numericMeta として返す（クライアントの記録方法ピッカーは廃止）。
     // V12.32: numericGoals — 数値目標（量を記録する／値を記録する）。
     // /api/plan は numericMeta＋extraNotes をプロンプトに反映し、
     // /api/checkin は todayEntry.numericValues と project.extraNotes を
     // 反映する（新規テーブル・カラムなし。プロンプトのみの変更）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true, numericGoals: true, photoCalories: true },
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true, numericGoals: true, photoCalories: true, aiInfersRecording: true },
   });
 });
 
@@ -751,13 +754,14 @@ app.post('/api/plan', optionalAuth, quotaStd, async (req, res) => {
     const system = `あなたは目標達成・行動設計のエキスパートです。
 ユーザーの目標、期日、現状の回答をもとに、達成可能性（feasibility）を科学的・現実的に分析し、週ごとの具体的なタスクロードマップを作成してください。
 ${linkedTasks.length > 0 ? '【紐づけたタスクについて】\nユーザーがこの目標に紐づけた自分のタスクがあります。計画の一部として必ず考慮し、同じ内容のタスクを tasks に重複して入れないこと。紐づけたタスクを補う具体的なタスクを中心に組み立てること。\n' : ''}
-${numericMeta ? '【数値目標について】\nこの目標は数値で記録する目標です（numericMeta を参照）。requiredPace は必ずその単位で具体的な量で表すこと（例：「1日36ページ読む」）。numericDailyQuota があるときは requiredPace の1日量をその値に合わせること（例：numericDailyQuota が 3000 なら「1日3000kcal」）。tasks の各タスクにも具体的な量を入れること（例：「36ページ読む」）。numericDirection が "atMost"（以下）のときは、その量は上限であり、超えることを目標にしてはいけない（ノルマとして課さないこと）。numericKind が "record"（値を記録する。例：体重）のときは、1日の行動量ではなく記録する値の変化を基準にペースを考えること。\n' : ''}
+${numericMeta ? '【数値目標について】\nこの目標は数値で記録する目標です（numericMeta を参照）。requiredPace は必ずその単位で具体的な量で表すこと（例：「1日36ページ読む」）。numericDailyQuota があるときは requiredPace の1日量をその値に合わせること（例：numericDailyQuota が 3000 なら「1日3000kcal」）。tasks の各タスクにも具体的な量を入れること（例：「36ページ読む」）。numericDirection が "atMost"（以下）のときは、その量は上限であり、超えることを目標にしてはいけない（ノルマとして課さないこと）。numericKind が "record"（値を記録する。例：体重）のときは、1日の行動量ではなく記録する値の変化を基準にペースを考えること。\n' : '【記録のしかたの推定について】\nユーザーは記録のしかたを選んでいません。目標の内容と現状の回答から、最も自然な記録のしかたを決めてください。\n- 毎日やる／やらないだけの目標（例：毎日筋トレする、毎日英語を勉強する）→ numericKind は "binary"（numericMeta は返さない）。\n- 量を積み上げる目標（例：3000kcal食べる、36ページ読む、10000歩歩く）→ numericKind は "accumulate"（numericMeta を返す。numericUnit に単位、numericDailyQuota に1日あたりの量、numericTargetTotal に期日までの合計量）。\n- 値を記録する目標（例：体重を80kgにする、体脂肪率を下げる）→ numericKind は "record"（numericMeta を返す。numericUnit に単位、numericStartValue に今の値が分かれば入れる）。\n- 向きは常に "atLeast"（以上）。"atMost"（以下）は使わないこと。\n- 目標の量が読めないときは無理に推定せず、numericMeta を返さないこと（その場合は binary になる）。\n'}
 必ず以下のJSON形式のみで出力してください：
 {
   "feasibility": "現実的" または "やや厳しい" または "非現実的",
   "reasoning": "達成可能性の根拠・アドバイス（2〜3文）",
   "achievableDate": "現実的に達成可能な日付（YYYY-MM-DD形式。期日が妥当なら期日と同じ）",
   "requiredPace": "1日あたりにこなすべき目安（例: 毎日1時間の学習、平日2時間の開発など）",
+${numericMeta ? '' : '  \"numericMeta": {"numericKind": "accumulate" または "record", "numericUnit": "単位（例：kcal／ページ／kg）", "numericDirection": "atLeast", "numericDailyQuota": 1日あたりの量（数値。accumulate のとき）, "numericTargetTotal": 期日までの合計量（数値。accumulate のとき）, "numericStartValue": 今の値（数値。record のとき、分かれば）}（binary のとき、または量が読めないときはこの項目を出さない）, '}
   "tasks": [
     {
       "week": 1,
