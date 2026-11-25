@@ -49,6 +49,12 @@ const SHARE_BONUS_AMOUNT = parseInt(process.env.SHARE_BONUS_AMOUNT || '10', 10);
 const REFERRAL_FRIEND_BONUS = parseInt(process.env.REFERRAL_FRIEND_BONUS || '10', 10);
 const REFERRAL_OWNER_BONUS = parseInt(process.env.REFERRAL_OWNER_BONUS || '10', 10);
 const REFERRAL_OWNER_MAX = parseInt(process.env.REFERRAL_OWNER_MAX || '5', 10);
+// V12.30: 使い切り消耗品「AI利用回数 +100」。商品ID・付与回数・
+// 価格の目安（¥500）はここで1か所に集約する。購入分は週リセットなし・
+// 期限なし（device_profiles.purchased_credits）。返金の取り消しは
+// 今回は未実装（I12.30-5 参照）。
+const CREDITS100_PRODUCT_ID = process.env.CREDITS100_PRODUCT_ID || 'com.uuto.GoalPace.credits100';
+const CREDITS100_AMOUNT = parseInt(process.env.CREDITS100_AMOUNT || '100', 10);
 
 // 機能ごとの消費量。質問生成は「目標プラン作成」の前半なので0（プラン生成で1回分）
 const COST = { standard: 1, free: 0 };
@@ -298,6 +304,7 @@ async function buildUsage(user) {
     used,
     remainingWeekly,
     bonusCredits,
+    purchasedCredits: 0, // V12.30: 購入分はデバイス単位のみ。アカウント枠には無い。
     remaining: remainingWeekly + bonusCredits,
     resetsAt: window.nextReset,
     shareBonusAmount: SHARE_BONUS_AMOUNT,
@@ -317,6 +324,7 @@ function setUsageHeaders(res, usage) {
   res.setHeader('X-AI-Limit', String(usage.weeklyLimit));
   res.setHeader('X-AI-Used', String(usage.used));
   res.setHeader('X-AI-Bonus', String(usage.bonusCredits));
+  res.setHeader('X-AI-Purchased', String(usage.purchasedCredits || 0)); // V12.30: 購入分（使い切り）
   res.setHeader('X-AI-Remaining', String(usage.remaining));
   res.setHeader('X-AI-Resets-At', new Date(usage.resetsAt).toISOString());
 }
@@ -340,36 +348,54 @@ function resolveDeviceId(req) {
   return /^[A-Za-z0-9_-]{8,64}$/.test(id) ? id : null;
 }
 
-// デバイス用の利用状況（buildUsage のデバイス版）。アカウント側の特典
-// （シェア・招待）はアカウント紐づけのためデバイス枠には付かない。
+// デバイス用の利用状況（buildUsage のデバイス版）。
+// V12.30: シェア特典・招待・Premium・購入分もデバイス単位で付く。
+//  - シェア：今日分 +10 を週上限に加算（今日だけ。明日には戻る）。
+//  - Premium：device_profiles.subscription_expires_at が未来なら
+//    plan 'premium'・週300回（表示も aiQuota の強制も同じ値）。
+//  - 購入分：device_profiles.purchased_credits（使い切り・リセットなし・
+//    期限なし）。残りは remainingWeekly + bonus + purchased。
 // お試し期間は「その端末の初回利用から7日間」（first_seen が起点）。
 // 未使用の端末は inTrial=true・used=0・trialEndsAt=null を返す
 // （trialEndsAt は初回利用時に first_seen+7日で確定する）。
 async function buildDeviceUsage(deviceId) {
   const d = await db.getDeviceUsage(deviceId);
+  const shareBonus = await db.getDeviceShareBonusToday(deviceId);
+  const referralCount = await db.countDeviceReferrals(deviceId);
+  const subscriptionActive = Boolean(
+    d.subscriptionExpiresAt && new Date(d.subscriptionExpiresAt).getTime() > Date.now()
+  );
+  const paid = subscriptionActive;
   const firstSeenAt = d.firstSeen ? new Date(d.firstSeen).getTime() : null;
   const trialEndsAt = firstSeenAt ? new Date(firstSeenAt + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000) : null;
-  const inTrial = !trialEndsAt || trialEndsAt.getTime() > Date.now();
-  const baseLimit = inTrial ? Math.max(FREE_WEEKLY_LIMIT, FREE_TRIAL_WEEKLY_LIMIT) : FREE_WEEKLY_LIMIT;
-  const weeklyLimit = baseLimit; // デバイス枠にシェア特典は付かない
+  const inTrial = !paid && (!trialEndsAt || trialEndsAt.getTime() > Date.now());
+  const baseLimit = paid
+    ? PAID_WEEKLY_LIMIT
+    : (inTrial ? Math.max(FREE_WEEKLY_LIMIT, FREE_TRIAL_WEEKLY_LIMIT) : FREE_WEEKLY_LIMIT);
+  const weeklyLimit = baseLimit + shareBonus; // V12.30: 今日のシェア分だけ上乗せ（今日限り）
   const remainingWeekly = Math.max(0, weeklyLimit - d.used);
+  const bonusCredits = d.bonusCredits || 0;
+  const purchasedCredits = d.purchasedCredits || 0;
   return {
-    plan: 'free',
+    plan: paid ? 'premium' : 'free',
     inTrial,
     trialEndsAt: trialEndsAt ? trialEndsAt.toISOString() : null,
     weeklyLimit,
     baseLimit,
     used: d.used,
     remainingWeekly,
-    bonusCredits: d.bonusCredits,
-    remaining: remainingWeekly + d.bonusCredits,
+    bonusCredits,
+    purchasedCredits,
+    remaining: remainingWeekly + bonusCredits + purchasedCredits,
     resetsAt: d.nextReset,
     shareBonusAmount: SHARE_BONUS_AMOUNT,
-    shareClaimedToday: false,
-    shareClaimedThisWeek: false,
+    shareClaimedToday: shareBonus > 0,
+    shareClaimedThisWeek: shareBonus > 0,
     referralBonus: { friend: REFERRAL_FRIEND_BONUS, owner: REFERRAL_OWNER_BONUS, ownerMax: REFERRAL_OWNER_MAX },
-    referralCount: 0,
-    referredBy: false,
+    referralCount,
+    referredBy: Boolean(d.referredBy),
+    referralCode: d.referralCode || undefined,
+    subscriptionExpiresAt: d.subscriptionExpiresAt || null,
   };
 }
 
@@ -511,7 +537,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.18.0',
+    version: '7.19.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -556,7 +582,12 @@ app.get('/api/version', (req, res) => {
     // （PUT /api/online/routine で自分の routineCharts＋公開フラグを保存し、
     // GET /api/online/routine/:userId で公開中の人のルーティンを読む。
     // GET /api/league/weekly の各行に userId が付く）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true },
+    // V12.30: deviceBilling — デバイス単位の課金・特典の修正
+    // （シェア +10 をデバイス枠に反映、デバイス招待コード＋両方 +10、
+    // 端末へのサブスク記録で表示・利用枠とも週300回、使い切り +100
+    // （com.uuto.GoalPace.credits100）を device_profiles.purchased_credits
+    // に加算。週リセットなし・期限なし。POST /api/iap/verify-consumable）。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true },
   });
 });
 
@@ -566,7 +597,7 @@ app.get('/', (req, res) => {
     status: 'running',
     aiProvider: IS_OPENROUTER ? 'OpenRouter' : (API_KEY ? 'Groq (Llama 3)' : 'unconfigured'),
     model: DEFAULT_MODEL,
-    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/shared-goals/suggest-structure', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/online/routine', '/api/activity', '/api/activity/feed', '/api/activity/friends', '/api/shared-goals/public', '/api/shared-goals/:id/join-public', '/api/shared-goals/:id/kick', '/api/shared-goals/kicked', '/api/shared-goals/updates', '/api/shared-goals/:id/comments', '/api/shared-goals/:id/declare', '/api/shared-goals/:id/deadline-result', '/api/shared-goals/:id/members/:userId/activity', '/api/onboarding-survey', '/api/admin/onboarding-surveys', '/health']
+    endpoints: ['/api/questions', '/api/plan', '/api/checkin', '/api/flashcards', '/api/routine/suggest', '/api/shared-goals/suggest-structure', '/api/reflection/advice', '/api/discover/generate', '/api/usage', '/api/version', '/api/shared-decks', '/api/shared-decks/categories', '/api/shared-decks/mine', '/api/leaderboard', '/api/leaderboard/sync-pace', '/api/league/weekly', '/api/online/profile', '/api/online/routine', '/api/activity', '/api/activity/feed', '/api/activity/friends', '/api/shared-goals/public', '/api/shared-goals/:id/join-public', '/api/shared-goals/:id/kick', '/api/shared-goals/kicked', '/api/shared-goals/updates', '/api/shared-goals/:id/comments', '/api/shared-goals/:id/declare', '/api/shared-goals/:id/deadline-result', '/api/shared-goals/:id/members/:userId/activity', '/api/onboarding-survey', '/api/admin/onboarding-surveys', '/api/iap/verify-consumable', '/health']
   });
 });
 
@@ -1783,6 +1814,8 @@ app.get('/api/usage', async (req, res) => {
     const deviceId = resolveDeviceId(req);
     if (!deviceId) return res.status(400).json({ error: 'X-Device-Id header is required', errorJa: 'X-Device-Idヘッダーが必要です。', errorEn: 'X-Device-Id header is required' });
     const usage = await buildDeviceUsage(deviceId);
+    // V12.30: デバイスにも招待コードを返す（無ければここで発行する）。
+    usage.referralCode = await db.ensureDeviceReferralCode(deviceId);
     res.json({ usage });
   } catch (err) {
     console.error('/api/usage error:', err);
@@ -1793,12 +1826,26 @@ app.get('/api/usage', async (req, res) => {
 // シェア特典: 今日分(+SHARE_BONUS_AMOUNT)。1人・1日1回（V12・E班【10】で週1回から変更）。
 // 日付キーは JST・DBの時計（db.grantShareBonusToday）。アプリ側はシェア画面が
 // 実際に完了したときだけ呼ぶ。
-app.post('/api/share/claim', auth.requireAuth, async (req, res) => {
+// V12.30: 認証オフ時はデバイス単位で付与する（X-Device-Id。サインイン不要）。
+// 認証オン時は従来通りアカウント単位。REQUIRE_AUTH=false でも
+// auth.requireAuth 経由だと guest_user でアカウント検索に失敗するため、
+// ここではミドルウェアを使わず中で分岐する。
+app.post('/api/share/claim', async (req, res) => {
   try {
     if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable', errorJa: 'アカウントのサービスは利用できません。', errorEn: 'Account service is unavailable' });
-    const granted = await db.grantShareBonusToday(req.userId, SHARE_BONUS_AMOUNT);
-    const user = await db.getUserById(req.userId);
-    res.json({ granted, amount: granted ? SHARE_BONUS_AMOUNT : 0, usage: await buildUsage(user) });
+    if (!REQUIRE_AUTH) {
+      const deviceId = resolveDeviceId(req);
+      if (!deviceId) return res.status(400).json({ error: 'X-Device-Id header is required', errorJa: 'X-Device-Idヘッダーが必要です。', errorEn: 'X-Device-Id header is required' });
+      const granted = await db.grantDeviceShareBonusToday(deviceId, SHARE_BONUS_AMOUNT);
+      const usage = await buildDeviceUsage(deviceId);
+      usage.referralCode = await db.ensureDeviceReferralCode(deviceId);
+      return res.json({ granted, amount: granted ? SHARE_BONUS_AMOUNT : 0, usage });
+    }
+    return auth.requireAuth(req, res, async () => {
+      const granted = await db.grantShareBonusToday(req.userId, SHARE_BONUS_AMOUNT);
+      const user = await db.getUserById(req.userId);
+      res.json({ granted, amount: granted ? SHARE_BONUS_AMOUNT : 0, usage: await buildUsage(user) });
+    });
   } catch (err) {
     console.error('/api/share/claim error:', err);
     res.status(503).json({ error: 'Share bonus is unavailable', errorJa: 'シェア特典は利用できません。', errorEn: 'Share bonus is unavailable' });
@@ -1806,32 +1853,45 @@ app.post('/api/share/claim', auth.requireAuth, async (req, res) => {
 });
 
 // 招待コードの入力: 入力した本人に +REFERRAL_FRIEND_BONUS、コードの持ち主に +REFERRAL_OWNER_BONUS（持ち主は最大 REFERRAL_OWNER_MAX 人分）
-app.post('/api/referral/redeem', auth.requireAuth, async (req, res) => {
+// V12.30: 認証オフ時はデバイス単位で処理する（X-Device-Id。サインイン不要）。
+// 双方の +10 は device_profiles.bonus_credits に貯まり、週リセットなし・期限なし。
+app.post('/api/referral/redeem', async (req, res) => {
   try {
     if (!db.DB_ENABLED) return res.status(503).json({ error: 'Account service is unavailable', errorJa: 'アカウントのサービスは利用できません。', errorEn: 'Account service is unavailable' });
     const code = typeof req.body?.code === 'string' ? req.body.code.trim().toUpperCase().replace(/[^A-Z0-9]/g, '') : '';
     if (code.length !== 8) return res.status(400).json({ error: '招待コードは8文字です。', errorJa: '招待コードは8文字です。', errorEn: 'The invite code is 8 characters.', code: 'INVALID_CODE' });
-    const r = await db.redeemReferral(req.userId, code, REFERRAL_FRIEND_BONUS, REFERRAL_OWNER_BONUS, REFERRAL_OWNER_MAX);
-    if (!r.ok) {
-      // V12.10・B班: 招待コードの失敗理由も日英で返す（error は互換のため日本語のまま）。
-      const messages = {
-        already_redeemed: 'すでに招待コードを使用済みです。',
-        invalid_code: '招待コードが見つかりません。',
-        own_code: '自分の招待コードは使えません。',
-        not_found: 'アカウントが見つかりません。',
-      };
-      const messagesEn = {
-        already_redeemed: 'You have already used this invite code.',
-        invalid_code: 'Invite code not found.',
-        own_code: 'You cannot use your own invite code.',
-        not_found: 'Account not found.',
-      };
-      const msgJa = messages[r.reason] || '招待コードを使用できませんでした。';
-      const msgEn = messagesEn[r.reason] || 'Could not use the invite code.';
-      return res.status(400).json({ error: msgJa, errorJa: msgJa, errorEn: msgEn, code: r.reason.toUpperCase() });
+    const messages = {
+      already_redeemed: 'すでに招待コードを使用済みです。',
+      invalid_code: '招待コードが見つかりません。',
+      own_code: '自分の招待コードは使えません。',
+      not_found: 'アカウントが見つかりません。',
+    };
+    const messagesEn = {
+      already_redeemed: 'You have already used this invite code.',
+      invalid_code: 'Invite code not found.',
+      own_code: 'You cannot use your own invite code.',
+      not_found: 'Account not found.',
+    };
+    const fail = (reason) => {
+      const msgJa = messages[reason] || '招待コードを使用できませんでした。';
+      const msgEn = messagesEn[reason] || 'Could not use the invite code.';
+      return res.status(400).json({ error: msgJa, errorJa: msgJa, errorEn: msgEn, code: String(reason).toUpperCase() });
+    };
+    if (!REQUIRE_AUTH) {
+      const deviceId = resolveDeviceId(req);
+      if (!deviceId) return res.status(400).json({ error: 'X-Device-Id header is required', errorJa: 'X-Device-Idヘッダーが必要です。', errorEn: 'X-Device-Id header is required' });
+      const r = await db.redeemDeviceReferral(deviceId, code, REFERRAL_FRIEND_BONUS, REFERRAL_OWNER_BONUS, REFERRAL_OWNER_MAX);
+      if (!r.ok) return fail(r.reason);
+      const usage = await buildDeviceUsage(deviceId);
+      usage.referralCode = await db.ensureDeviceReferralCode(deviceId);
+      return res.json({ ok: true, bonus: REFERRAL_FRIEND_BONUS, usage });
     }
-    const user = await db.getUserById(req.userId);
-    res.json({ ok: true, bonus: REFERRAL_FRIEND_BONUS, usage: await buildUsage(user) });
+    return auth.requireAuth(req, res, async () => {
+      const r = await db.redeemReferral(req.userId, code, REFERRAL_FRIEND_BONUS, REFERRAL_OWNER_BONUS, REFERRAL_OWNER_MAX);
+      if (!r.ok) return fail(r.reason);
+      const user = await db.getUserById(req.userId);
+      res.json({ ok: true, bonus: REFERRAL_FRIEND_BONUS, usage: await buildUsage(user) });
+    });
   } catch (err) {
     console.error('/api/referral/redeem error:', err);
     res.status(503).json({ error: 'Referral is unavailable', errorJa: '招待は利用できません。', errorEn: 'Referral is unavailable' });
@@ -1966,9 +2026,65 @@ app.post('/api/iap/verify', auth.requireAuth, async (req, res) => {
       return res.status(409).json({ error: 'This purchase is linked to another account', errorJa: 'この購入は別のアカウントに紐づいています。', errorEn: 'This purchase is linked to another account' });
     }
     const entitlement = await iap.applyTransactionToUser(req.userId, transaction);
+    // V12.30: サブスク購入は端末にも記録する（表示・利用枠の両方を
+    // デバイス単位で上げるため）。購入ボタンはサインイン必須のまま
+    // （このエンドポイント自体は従来通り auth.requireAuth 経由）。
+    // 期限は entitlement / transaction のどちらかにある想定で複数形から拾う
+    // （iap.js の実際のフィールド名は Mac で確認すること。I12.30-5 参照）。
+    try {
+      const deviceId = resolveDeviceId(req);
+      const expiresAt =
+        entitlement?.expiresAt || entitlement?.subscriptionExpiresAt || entitlement?.expires_at ||
+        transaction?.expiresAt || transaction?.expiresDate || transaction?.subscriptionExpiresAt || null;
+      if (deviceId && expiresAt) await db.setDeviceSubscription(deviceId, expiresAt);
+    } catch (e) {
+      console.error('Device subscription record failed (account purchase still applied):', e);
+    }
     res.json(entitlement);
   } catch (err) {
     console.error('/api/iap/verify error:', err);
+    res.status(400).json({ error: 'Purchase could not be verified', errorJa: '購入を確認できませんでした。', errorEn: 'Purchase could not be verified' });
+  }
+});
+
+// ==========================================================================
+// V12.30: 使い切り消耗品「AI利用回数 +100」（サインイン不要・端末単位）
+// POST /api/iap/verify-consumable { signedTransactionInfo }
+//   - auth.requireAuth は使わない（X-Device-Id だけで検証する）。
+//   - 商品IDが CREDITS100_PRODUCT_ID の取引だけ受け付ける
+//     （サブスク商品はここでは受け付けない。/api/iap/verify を使うこと）。
+//   - originalTransactionId で二重付与を防ぐ（再送・再検証でも加算は1回）。
+//   - 購入分は device_profiles.purchased_credits に加算する
+//     （bonus_credits とは別列。週リセットなし・期限なし）。
+//   - 返金時の取り消しは今回は未実装（I12.30-5 参照）。
+// ==========================================================================
+app.post('/api/iap/verify-consumable', async (req, res) => {
+  try {
+    if (!db.DB_ENABLED) return res.status(503).json({ error: 'Purchase verification is unavailable', errorJa: '購入の確認は利用できません。', errorEn: 'Purchase verification is unavailable' });
+    const deviceId = resolveDeviceId(req);
+    if (!deviceId) return res.status(400).json({ error: 'X-Device-Id header is required', errorJa: 'X-Device-Idヘッダーが必要です。', errorEn: 'X-Device-Id header is required' });
+    const { signedTransactionInfo } = req.body || {};
+    if (typeof signedTransactionInfo !== 'string' || signedTransactionInfo.length > 30000) {
+      return res.status(400).json({ error: 'A valid signed transaction is required', errorJa: '有効な署名付きトランザクションが必要です。', errorEn: 'A valid signed transaction is required' });
+    }
+    const transaction = await iap.verifyTransaction(signedTransactionInfo);
+    if (transaction.bundleId !== process.env.APPLE_BUNDLE_ID) {
+      return res.status(400).json({ error: 'Transaction belongs to a different app', errorJa: 'この取引は別のアプリのものです。', errorEn: 'Transaction belongs to a different app' });
+    }
+    const productId = transaction.productId || transaction.product_id || '';
+    if (productId !== CREDITS100_PRODUCT_ID) {
+      return res.status(400).json({ error: 'This product is not the +100 consumable', errorJa: 'この商品は+100回の使い切り商品ではありません。', errorEn: 'This product is not the +100 consumable' });
+    }
+    if (!transaction.originalTransactionId) {
+      return res.status(400).json({ error: 'Transaction is missing its ID', errorJa: '取引IDが取得できませんでした。', errorEn: 'Transaction is missing its ID' });
+    }
+    const isNew = await db.recordDeviceConsumablePurchase(transaction.originalTransactionId, deviceId, productId, CREDITS100_AMOUNT);
+    if (isNew) await db.addDevicePurchasedCredits(deviceId, CREDITS100_AMOUNT);
+    const usage = await buildDeviceUsage(deviceId);
+    usage.referralCode = await db.ensureDeviceReferralCode(deviceId);
+    res.json({ ok: true, added: isNew ? CREDITS100_AMOUNT : 0, alreadyCredited: !isNew, usage });
+  } catch (err) {
+    console.error('/api/iap/verify-consumable error:', err);
     res.status(400).json({ error: 'Purchase could not be verified', errorJa: '購入を確認できませんでした。', errorEn: 'Purchase could not be verified' });
   }
 });

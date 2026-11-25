@@ -155,6 +155,52 @@ async function initDb() {
     );
   `);
 
+  // ---- V12.30: 端末プロフィール（デバイス単位の課金・招待・購入分） ----
+  // device_ai_usage は「1端末×1週」の行のため、週をまたいで残すべき値
+  // （招待ボーナス・購入分・サブスク期限・招待コード）を置く場所がない。
+  // 週リセットされない値はこの1行＝1端末のテーブルに置く。
+  // purchased_credits は bonus_credits とは別の列（返金時の区別のため混ぜない）。
+  // 購入分は使い切り：月曜リセットでも期限でも消えない。
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS device_profiles (
+      device_id TEXT PRIMARY KEY,
+      referral_code TEXT UNIQUE,
+      referred_by_device TEXT,
+      bonus_credits INTEGER NOT NULL DEFAULT 0 CHECK (bonus_credits >= 0),
+      purchased_credits INTEGER NOT NULL DEFAULT 0 CHECK (purchased_credits >= 0),
+      subscription_expires_at TIMESTAMPTZ,
+      first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`ALTER TABLE device_profiles ADD COLUMN IF NOT EXISTS bonus_credits INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE device_profiles ADD COLUMN IF NOT EXISTS purchased_credits INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE device_profiles ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE device_profiles ADD COLUMN IF NOT EXISTS referred_by_device TEXT;`);
+  // V12.30: デバイス単位のシェア特典（今日分）。share_bonuses は
+  // user_id INTEGER・users FK のため端末ID（文字列）を入れられない。
+  // 仕組みは同じ：(device_id, bonus_date) 主キーで1日1回をDBが保証する。
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS device_share_bonuses (
+      device_id TEXT NOT NULL,
+      bonus_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      amount INTEGER NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (device_id, bonus_date)
+    );
+  `);
+  // V12.30: 消耗品の二重付与防止。originalTransactionId を主キーにし、
+  // 同じ Apple 取引での再送・再検証では購入分を加算しない。
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS device_consumable_transactions (
+      original_transaction_id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      product_id TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
   // ---- V11: オンラインプロフィール（表示名・アイコンドット・リーグ参加・公開設定） ----
   // user_id は認証オン時は users.id（数値を文字列化）、認証オフ時は
   // クライアントが送る userId（匿名デバイスID由来）。1行＝1人。
@@ -399,6 +445,10 @@ async function refundUsage(eventId) {
 // ==========================================================================
 
 // 今週のデバイス利用状況。行が無ければ「未使用」（used=0, firstSeen=null）。
+// V12.30: 週をまたいで残る値は device_profiles から読む（購入分・
+// 招待ボーナス・招待コード・サブスク期限）。device_ai_usage の週行の
+// bonus_credits は旧来の列で、デバイス向け特典は常に 0 のままだったため
+// 正本は device_profiles.bonus_credits とする。
 async function getDeviceUsage(deviceId) {
   const { weekStart, nextReset, weekDate } = await getWeekWindow();
   const { rows } = await pool.query(
@@ -407,9 +457,18 @@ async function getDeviceUsage(deviceId) {
      FROM device_ai_usage WHERE device_id = $1 AND week_date = $2`,
     [deviceId, weekDate]
   );
+  const prof = await pool.query(
+    'SELECT referral_code, referred_by_device, bonus_credits, purchased_credits, subscription_expires_at FROM device_profiles WHERE device_id = $1',
+    [deviceId]
+  );
+  const p = prof.rows[0] || null;
   return {
     used: rows[0] ? rows[0].used : 0,
-    bonusCredits: rows[0] ? rows[0].bonus_credits : 0,
+    bonusCredits: p ? p.bonus_credits : 0,
+    purchasedCredits: p ? p.purchased_credits : 0,
+    referralCode: p ? p.referral_code || null : null,
+    referredBy: Boolean(p && p.referred_by_device),
+    subscriptionExpiresAt: p && p.subscription_expires_at ? new Date(p.subscription_expires_at).toISOString() : null,
     firstSeen: rows[0] && rows[0].first_seen ? new Date(rows[0].first_seen).toISOString() : null,
     weekStart,
     nextReset,
@@ -418,6 +477,8 @@ async function getDeviceUsage(deviceId) {
 }
 
 // デバイスの AI利用を cost 回分「予約」する。reserveUsage のデバイス版。
+// 消費順はアカウント版と同じ：週の枠 → ボーナス残高 → 購入分。
+// 購入分は週リセットされないため、週行ではなく device_profiles から引く。
 async function reserveDeviceUsage(deviceId, cost, weeklyLimit) {
   const { weekDate } = await getWeekWindow();
   if (cost === 0) return { weekDate, source: 'weekly' };
@@ -429,23 +490,31 @@ async function reserveDeviceUsage(deviceId, cost, weeklyLimit) {
       [deviceId, weekDate]
     );
     const used = cur.rows[0] ? cur.rows[0].used : 0;
-    const bonus = cur.rows[0] ? cur.rows[0].bonus_credits : 0;
+    // 購入分・ボーナス残高は device_profiles が正本（週行ではない）。
+    // 行が無ければ作る（初回利用時。INSERT は競合しても無害）。
+    await client.query(
+      'INSERT INTO device_profiles (device_id) VALUES ($1) ON CONFLICT (device_id) DO NOTHING',
+      [deviceId]
+    );
+    const prof = await client.query(
+      'SELECT bonus_credits, purchased_credits FROM device_profiles WHERE device_id = $1 FOR UPDATE',
+      [deviceId]
+    );
+    const bonus = prof.rows[0] ? prof.rows[0].bonus_credits : 0;
+    const purchased = prof.rows[0] ? prof.rows[0].purchased_credits : 0;
     let source = null;
     if (used + cost <= weeklyLimit) {
       source = 'weekly';
     } else if (bonus >= cost) {
       source = 'bonus';
+    } else if (purchased >= cost) {
+      source = 'purchased';
     }
     if (!source) { await client.query('ROLLBACK'); return null; }
     if (cur.rows[0]) {
       if (source === 'weekly') {
         await client.query(
           'UPDATE device_ai_usage SET used = used + $3, updated_at = now() WHERE device_id = $1 AND week_date = $2',
-          [deviceId, weekDate, cost]
-        );
-      } else {
-        await client.query(
-          'UPDATE device_ai_usage SET bonus_credits = bonus_credits - $3, updated_at = now() WHERE device_id = $1 AND week_date = $2',
           [deviceId, weekDate, cost]
         );
       }
@@ -455,11 +524,17 @@ async function reserveDeviceUsage(deviceId, cost, weeklyLimit) {
         'INSERT INTO device_ai_usage (device_id, week_date, used, bonus_credits) VALUES ($1, $2, $3, 0)',
         [deviceId, weekDate, source === 'weekly' ? cost : 0]
       );
-      if (source === 'bonus') {
-        // 行が無かったのに bonus 経由はあり得ない（bonus=0のため）が、念のため
-        await client.query('ROLLBACK');
-        return null;
-      }
+    }
+    if (source === 'bonus') {
+      await client.query(
+        'UPDATE device_profiles SET bonus_credits = bonus_credits - $2, updated_at = now() WHERE device_id = $1',
+        [deviceId, cost]
+      );
+    } else if (source === 'purchased') {
+      await client.query(
+        'UPDATE device_profiles SET purchased_credits = purchased_credits - $2, updated_at = now() WHERE device_id = $1',
+        [deviceId, cost]
+      );
     }
     await client.query('COMMIT');
     return { weekDate, source };
@@ -472,6 +547,8 @@ async function reserveDeviceUsage(deviceId, cost, weeklyLimit) {
 }
 
 // デバイスの予約分を返す（AI失敗時）。refundUsage のデバイス版。
+// source='purchased' の分は購入分へ、'bonus' の分はボーナス残高へ戻す
+// （どちらも週リセットされない device_profiles の値）。
 async function refundDeviceUsage(deviceId, weekDate, cost, source) {
   if (!cost) return;
   if (source === 'weekly') {
@@ -481,10 +558,139 @@ async function refundDeviceUsage(deviceId, weekDate, cost, source) {
     );
   } else if (source === 'bonus') {
     await pool.query(
-      'UPDATE device_ai_usage SET bonus_credits = bonus_credits + $3, updated_at = now() WHERE device_id = $1 AND week_date = $2',
-      [deviceId, weekDate, cost]
+      'UPDATE device_profiles SET bonus_credits = bonus_credits + $2, updated_at = now() WHERE device_id = $1',
+      [deviceId, cost]
+    );
+  } else if (source === 'purchased') {
+    await pool.query(
+      'UPDATE device_profiles SET purchased_credits = purchased_credits + $2, updated_at = now() WHERE device_id = $1',
+      [deviceId, cost]
     );
   }
+}
+
+// ---- V12.30: 端末プロフィール（招待コード・シェア・購入分・サブスク） ----
+
+// 端末の招待コードを返す（無ければ作る）。アカウント版 ensureReferralCode
+// と同じ作り方（8文字・紛らわしい文字なし・UNIQUE 競合時は再試行）。
+// 決定的な device_id 由来コードではなく保存したランダムコードを使う：
+// device_id をコードに埋め込むと端末IDが漏れ、衝突時の扱いも難しいため。
+async function ensureDeviceReferralCode(deviceId) {
+  const cur = await pool.query('SELECT referral_code FROM device_profiles WHERE device_id = $1', [deviceId]);
+  if (cur.rows[0] && cur.rows[0].referral_code) return cur.rows[0].referral_code;
+  await pool.query('INSERT INTO device_profiles (device_id) VALUES ($1) ON CONFLICT (device_id) DO NOTHING', [deviceId]);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = randomReferralCode();
+    try {
+      const { rows } = await pool.query(
+        `UPDATE device_profiles SET referral_code = $2, updated_at = now() WHERE device_id = $1 AND referral_code IS NULL RETURNING referral_code`,
+        [deviceId, code]
+      );
+      if (rows[0]) return rows[0].referral_code;
+      const again = await pool.query('SELECT referral_code FROM device_profiles WHERE device_id = $1', [deviceId]);
+      if (again.rows[0] && again.rows[0].referral_code) return again.rows[0].referral_code;
+    } catch (e) {
+      if (e.code !== '23505') throw e; // 重複したらもう一度
+    }
+  }
+  throw new Error('Could not generate referral code');
+}
+
+// 今日のデバイス向けシェア特典（付与済みならその量、未付与なら0）。
+async function getDeviceShareBonusToday(deviceId) {
+  const today = await getTodayDateJST();
+  const { rows } = await pool.query(
+    'SELECT amount FROM device_share_bonuses WHERE device_id = $1 AND bonus_date = $2',
+    [deviceId, today]
+  );
+  return rows[0] ? parseInt(rows[0].amount, 10) : 0;
+}
+
+// 今日分のデバイス向けシェア特典を付与する。主キーで1日1回をDBが保証する。
+async function grantDeviceShareBonusToday(deviceId, amount) {
+  const today = await getTodayDateJST();
+  const { rowCount } = await pool.query(
+    `INSERT INTO device_share_bonuses (device_id, bonus_date, amount)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (device_id, bonus_date) DO NOTHING`,
+    [deviceId, today, amount]
+  );
+  return rowCount > 0;
+}
+
+// 端末同士の招待コード利用。友達（redeemer）と持ち主の両方にボーナスを
+// device_profiles.bonus_credits へ加算する（週リセットなし・期限なし）。
+// 持ち主の上限は REFERRAL_OWNER_MAX 人分（アカウント版と同じ）。
+// 返り値: { ok: true } か { ok: false, reason }
+async function redeemDeviceReferral(redeemerDeviceId, code, redeemerBonus, referrerBonus, referrerMax) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('INSERT INTO device_profiles (device_id) VALUES ($1) ON CONFLICT (device_id) DO NOTHING', [redeemerDeviceId]);
+    const me = await client.query('SELECT device_id, referred_by_device FROM device_profiles WHERE device_id = $1 FOR UPDATE', [redeemerDeviceId]);
+    if (!me.rows[0]) { await client.query('ROLLBACK'); return { ok: false, reason: 'not_found' }; }
+    if (me.rows[0].referred_by_device) { await client.query('ROLLBACK'); return { ok: false, reason: 'already_redeemed' }; }
+    const ref = await client.query('SELECT device_id FROM device_profiles WHERE referral_code = $1 FOR UPDATE', [code]);
+    if (!ref.rows[0]) { await client.query('ROLLBACK'); return { ok: false, reason: 'invalid_code' }; }
+    if (String(ref.rows[0].device_id) === String(redeemerDeviceId)) { await client.query('ROLLBACK'); return { ok: false, reason: 'own_code' }; }
+    const cnt = await client.query('SELECT COUNT(*)::int AS n FROM device_profiles WHERE referred_by_device = $1', [ref.rows[0].device_id]);
+    await client.query(
+      'UPDATE device_profiles SET referred_by_device = $2, bonus_credits = bonus_credits + $3, updated_at = now() WHERE device_id = $1',
+      [redeemerDeviceId, ref.rows[0].device_id, redeemerBonus]
+    );
+    if (cnt.rows[0].n < referrerMax) {
+      await client.query(
+        'UPDATE device_profiles SET bonus_credits = bonus_credits + $2, updated_at = now() WHERE device_id = $1',
+        [ref.rows[0].device_id, referrerBonus]
+      );
+    }
+    await client.query('COMMIT');
+    return { ok: true };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function countDeviceReferrals(deviceId) {
+  const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM device_profiles WHERE referred_by_device = $1', [deviceId]);
+  return rows[0].n;
+}
+
+// 購入分（使い切り）を加算する。週リセットなし・期限なし。
+async function addDevicePurchasedCredits(deviceId, amount) {
+  await pool.query(
+    `INSERT INTO device_profiles (device_id, purchased_credits) VALUES ($1, $2)
+     ON CONFLICT (device_id) DO UPDATE SET purchased_credits = device_profiles.purchased_credits + EXCLUDED.purchased_credits, updated_at = now()`,
+    [deviceId, amount]
+  );
+}
+
+// 端末にサブスク期限を記録する（/api/iap/verify の副次記録）。
+// expiresAt が null・過去の場合は記録しない（期限切れの上書き防止）。
+async function setDeviceSubscription(deviceId, expiresAt) {
+  if (!expiresAt) return false;
+  const exp = new Date(expiresAt);
+  if (Number.isNaN(exp.getTime()) || exp.getTime() <= Date.now()) return false;
+  await pool.query(
+    `INSERT INTO device_profiles (device_id, subscription_expires_at) VALUES ($1, $2)
+     ON CONFLICT (device_id) DO UPDATE SET subscription_expires_at = CASE WHEN device_profiles.subscription_expires_at IS NULL OR EXCLUDED.subscription_expires_at > device_profiles.subscription_expires_at THEN EXCLUDED.subscription_expires_at ELSE device_profiles.subscription_expires_at END, updated_at = now()`,
+    [deviceId, exp.toISOString()]
+  );
+  return true;
+}
+
+// 消耗品の取引を記録する。同じ originalTransactionId が既にあれば false
+// （二重付与しない）。新規なら true。
+async function recordDeviceConsumablePurchase(originalTransactionId, deviceId, productId, amount) {
+  const { rowCount } = await pool.query(
+    `INSERT INTO device_consumable_transactions (original_transaction_id, device_id, product_id, amount)
+     VALUES ($1, $2, $3, $4) ON CONFLICT (original_transaction_id) DO NOTHING`,
+    [originalTransactionId, deviceId, productId, amount]
+  );
+  return rowCount > 0;
 }
 
 async function addBonusCredits(userId, amount) {
@@ -1339,6 +1545,14 @@ module.exports = {
   getDeviceUsage,
   reserveDeviceUsage,
   refundDeviceUsage,
+  ensureDeviceReferralCode,
+  getDeviceShareBonusToday,
+  grantDeviceShareBonusToday,
+  redeemDeviceReferral,
+  countDeviceReferrals,
+  addDevicePurchasedCredits,
+  setDeviceSubscription,
+  recordDeviceConsumablePurchase,
   addBonusCredits,
   ensureReferralCode,
   redeemReferral,
