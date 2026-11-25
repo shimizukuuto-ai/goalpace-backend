@@ -537,7 +537,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.19.0',
+    version: '7.20.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -587,7 +587,11 @@ app.get('/api/version', (req, res) => {
     // 端末へのサブスク記録で表示・利用枠とも週300回、使い切り +100
     // （com.uuto.GoalPace.credits100）を device_profiles.purchased_credits
     // に加算。週リセットなし・期限なし。POST /api/iap/verify-consumable）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true },
+    // V12.32: numericGoals — 数値目標（量を記録する／値を記録する）。
+    // /api/plan は numericMeta＋extraNotes をプロンプトに反映し、
+    // /api/checkin は todayEntry.numericValues と project.extraNotes を
+    // 反映する（新規テーブル・カラムなし。プロンプトのみの変更）。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true, numericGoals: true },
   });
 });
 
@@ -646,6 +650,14 @@ app.post('/api/plan', optionalAuth, quotaStd, async (req, res) => {
     const linkedTasks = Array.isArray(req.body?.linkedTasks)
       ? req.body.linkedTasks.filter((t) => t && typeof t.title === 'string' && t.title.trim()).slice(0, 30)
       : [];
+    // V12.32: 数値目標のメタ（種類・単位・目標量）と、質問ごとの「その他」
+    // 自由記述。構造は自由形式のためバリデーションはしない（未知の
+    // フィールドが来ても無視される従来の流儀のまま）。
+    const numericMeta = req.body?.numericMeta && typeof req.body.numericMeta === 'object' ? req.body.numericMeta : null;
+    const extraNotes = req.body?.extraNotes && typeof req.body.extraNotes === 'object' ? req.body.extraNotes : null;
+    const extraNotesText = extraNotes
+      ? Object.entries(extraNotes).filter(([, v]) => typeof v === 'string' && v.trim()).map(([k, v]) => `${k}: ${v}`).join('\n')
+      : '';
 
     if (MOCK_MODE || !API_KEY) {
       console.log('[MOCK] /api/plan');
@@ -655,6 +667,7 @@ app.post('/api/plan', optionalAuth, quotaStd, async (req, res) => {
     const system = `あなたは目標達成・行動設計のエキスパートです。
 ユーザーの目標、期日、現状の回答をもとに、達成可能性（feasibility）を科学的・現実的に分析し、週ごとの具体的なタスクロードマップを作成してください。
 ${linkedTasks.length > 0 ? '【紐づけたタスクについて】\nユーザーがこの目標に紐づけた自分のタスクがあります。計画の一部として必ず考慮し、同じ内容のタスクを tasks に重複して入れないこと。紐づけたタスクを補う具体的なタスクを中心に組み立てること。\n' : ''}
+${numericMeta ? '【数値目標について】\nこの目標は数値で記録する目標です（numericMeta を参照）。requiredPace は必ずその単位で具体的な量で表すこと（例：「1日36ページ読む」）。tasks の各タスクにも具体的な量を入れること（例：「36ページ読む」）。numericDirection が "atMost"（以下）のときは、その量は上限であり、超えることを目標にしてはいけない（ノルマとして課さないこと）。numericKind が "record"（値を記録する。例：体重）のときは、1日の行動量ではなく記録する値の変化を基準にペースを考えること。\n' : ''}
 必ず以下のJSON形式のみで出力してください：
 {
   "feasibility": "現実的" または "やや厳しい" または "非現実的",
@@ -674,7 +687,7 @@ ${linkedTasks.length > 0 ? '【紐づけたタスクについて】\nユーザ�
 }
 ※ tasksは最初の2〜4週分の具体的なアクションを出力してください。各タスクはControlCenterのToDoリストに登録しやすい具体的で実行可能な粒度にしてください。` + localeSuffix(locale);
 
-    const userText = `【目標】: ${goal}\n【達成期日】: ${targetDate}\n【現状の回答】: ${JSON.stringify(baselineAnswers)}${linkedTasks.length ? `\n【紐づけた自分のタスク（${linkedTasks.length}件）】: ${JSON.stringify(linkedTasks.map(t => ({ title: t.title, completed: Boolean(t.completed) })))}` : ''}`;
+    const userText = `【目標】: ${goal}\n【達成期日】: ${targetDate}\n【現状の回答】: ${JSON.stringify(baselineAnswers)}${linkedTasks.length ? `\n【紐づけた自分のタスク（${linkedTasks.length}件）】: ${JSON.stringify(linkedTasks.map(t => ({ title: t.title, completed: Boolean(t.completed) })))}` : ''}${numericMeta ? `\n【数値目標】: ${JSON.stringify(numericMeta)}` : ''}${extraNotesText ? `\n【その他・考慮してほしいこと】:\n${extraNotesText}` : ''}`;
     const text = await callGroqLlama({ system, userText, locale });
     const parsed = parseJson(text);
     if (parsed && typeof parsed === 'object') {
@@ -730,6 +743,12 @@ app.post('/api/checkin', optionalAuth, quotaStd, async (req, res) => {
 【紐づけたタスクについて】
 linkedTasks は、ユーザーがタスク一覧からこの目標に紐づけた自分のタスク（タイトル＋今日の完了状態）です。customTasks と同じ扱いで、計画の一部として必ず考慮し、重複するタスクを updatedTasks に入れないこと。完了済みは達成済み、未完了は未着手としてペースの評価に反映すること。
 
+【数値目標について】
+- todayEntry に numericValues があるときは、今日の進捗をタスクの件数ではなく量・値で評価すること。goalValue が dailyQuota を下回れば不足分を、超えれば余剰分を具体的な数値で message に入れること（例：「今日はノルマ36ページに対して20ページで、16ページ不足しています」）。
+- direction が "atMost"（以下）のときは、その量は上限であり、超えた日は未達成として評価すること（多くやったことを褒めないこと）。
+- 1日だけの量ではなく、過去数日の量の並び（週のパターン）も見て、曜日や波がある場合は message で指摘すること。
+- project.extraNotes があるときは、その内容を計画・評価に反映すること。
+
 必ず以下のJSON形式のみで出力してください：
 {
   "onTrack": true または false,
@@ -745,10 +764,20 @@ linkedTasks は、ユーザーがタスク一覧からこの目標に紐づけ�
     const linkedTaskList = Array.isArray(req.body?.linkedTasks)
       ? req.body.linkedTasks.filter((t) => t && typeof t.title === 'string' && t.title.trim()).slice(0, 30)
       : [];
+    // V12.32: プロジェクト作成時に残した「その他・考慮してほしいこと」と、
+    // 今日の数値（todayEntry.numericValues）。無ければ「なし」。
+    const extraNotesText = project && project.extraNotes && typeof project.extraNotes === 'object'
+      ? Object.entries(project.extraNotes).filter(([, v]) => typeof v === 'string' && v.trim()).map(([k, v]) => `${k}: ${v}`).join('\n')
+      : '';
+    const numericValuesText = todayEntry && todayEntry.numericValues && typeof todayEntry.numericValues === 'object'
+      ? JSON.stringify(todayEntry.numericValues)
+      : '';
     const userText = `【プロジェクト情報】: ${JSON.stringify(project)}
 【ユーザー自作のタスク（${customTaskList.length}件）】: ${customTaskList.length ? JSON.stringify(customTaskList) : 'なし'}
 【紐づけたタスク（${linkedTaskList.length}件）】: ${linkedTaskList.length ? JSON.stringify(linkedTaskList.map(t => ({ title: t.title, completed: Boolean(t.completed) }))) : 'なし'}
 【本日のチェックイン】: ${JSON.stringify(todayEntry)}
+【今日の数値】: ${numericValuesText || 'なし'}
+【その他・考慮してほしいこと】: ${extraNotesText || 'なし'}
 【経過日数の割合目安】: ${scheduleElapsedPercent === null ? '不明' : scheduleElapsedPercent + '%'}
 【前回のAI進捗率】: ${previousCurrentPacePercent === null ? '初回' : previousCurrentPacePercent + '%'}`;
 
