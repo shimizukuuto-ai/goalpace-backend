@@ -319,6 +319,41 @@ function formatTolerantDate(d) {
   return `${d.getFullYear()}-${mo}-${day}`;
 }
 
+// V12.36: 今日の日付（日本時間）と期日までの残り日数。Render は UTC で
+// 動くため、サーバーのローカル日付では 9 時間ずれる。AI プロンプトに
+// 「今日」と「残り日数」を毎回入れることで、モデルが知識カットオフから
+// 「今日」を推測して「65 週間」「約 2 年」のような誤った期間を出すのを防ぐ。
+// クライアントから today / daysLeft が送られてきても、サーバーは自前で
+// 計算した値を正とする（端末の時計・タイムゾーンに依存しないため）。
+function jstTodayDate() {
+  const shifted = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const d = new Date(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
+  d.setFullYear(shifted.getUTCFullYear()); // 0-99年の 19xx 年化を打ち消す
+  return d;
+}
+
+function daysLeftTo(targetDate) {
+  const end = typeof targetDate === 'string' ? parseTolerantDate(targetDate) : null;
+  if (!end) return null;
+  return Math.round((end.getTime() - jstTodayDate().getTime()) / 86400000);
+}
+
+// AI プロンプトに入れる日付の行。locale に合わせて日英を切り替える。
+function dateContextLine(targetDate, locale) {
+  const today = jstTodayDate();
+  const iso = formatTolerantDate(today);
+  const daysLeft = daysLeftTo(targetDate);
+  if (locale === 'en') {
+    if (daysLeft === null) return `Today is ${iso} (Japan time). Do not guess today's date; calculate all periods from this date.`;
+    if (daysLeft < 0) return `Today is ${iso} (Japan time). The deadline (${targetDate}) passed ${-daysLeft} ${-daysLeft === 1 ? 'day' : 'days'} ago. Calculate all periods from these two dates; do not guess.`;
+    return `Today is ${iso} (Japan time). There are ${daysLeft} days left until the deadline (${targetDate}). Calculate all periods from these two dates; do not guess.`;
+  }
+  const jp = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日`;
+  if (daysLeft === null) return `今日は${jp}（${iso}、日本時間）です。今日の日付を推測しないこと。期間はこの日付から計算すること。`;
+  if (daysLeft < 0) return `今日は${jp}（${iso}、日本時間）です。期日（${targetDate}）を${-daysLeft}日過ぎています。期間はこの2つから計算し、推測しないこと。`;
+  return `今日は${jp}（${iso}、日本時間）です。期日（${targetDate}）まで残り${daysLeft}日です。期間はこの2つから計算し、推測しないこと。`;
+}
+
 // Iteration 4 (C5の根本対策): LLMが返す日付のバリデーション。形式不正・過去の日付は
 // 期日(fallback)に寄せる。TINKOの端末で「達成可能日 2025-06-15」が出たのは、
 // AI生成の自由テキスト日付が無検証で保存・表示されていたため。クライアント側にも
@@ -621,7 +656,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.22.0',
+    version: '7.23.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -678,7 +713,11 @@ app.get('/api/version', (req, res) => {
     // /api/plan は numericMeta＋extraNotes をプロンプトに反映し、
     // /api/checkin は todayEntry.numericValues と project.extraNotes を
     // 反映する（新規テーブル・カラムなし。プロンプトのみの変更）。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true, numericGoals: true, photoCalories: true, aiInfersRecording: true },
+    // V12.36: dateContext — /api/questions・/api/plan・/api/checkin の
+    // システムプロンプトにサーバー計算の今日（日本時間）と期日までの残り日数
+    // を入れ、AI が「今日」を推測して期間を誤るのを防ぐ。/api/plan は数値目標を
+    // 1日あたりの量で表し、向き（atLeast / atMost）を目標内容から推定する。
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true, numericGoals: true, photoCalories: true, aiInfersRecording: true, dateContext: true },
   });
 });
 
@@ -705,6 +744,9 @@ app.post('/api/questions', optionalAuth, quotaFree, async (req, res) => {
 
     const system = `あなたはプロフェッショナルな目標達成・計画立案コーチです。
 ユーザーから提示された「目標」と「達成期日」を分析し、現実的な計画を作成するために必要な現状把握の質問を3〜5問作成してください。
+
+【今日の日付】
+${dateContextLine(targetDate, locale)}
 
 必ず以下のJSON形式のみで出力してください（他の文章は出力しないでください）：
 {
@@ -753,15 +795,18 @@ app.post('/api/plan', optionalAuth, quotaStd, async (req, res) => {
 
     const system = `あなたは目標達成・行動設計のエキスパートです。
 ユーザーの目標、期日、現状の回答をもとに、達成可能性（feasibility）を科学的・現実的に分析し、週ごとの具体的なタスクロードマップを作成してください。
+
+【今日の日付】
+${dateContextLine(targetDate, locale)}
 ${linkedTasks.length > 0 ? '【紐づけたタスクについて】\nユーザーがこの目標に紐づけた自分のタスクがあります。計画の一部として必ず考慮し、同じ内容のタスクを tasks に重複して入れないこと。紐づけたタスクを補う具体的なタスクを中心に組み立てること。\n' : ''}
-${numericMeta ? '【数値目標について】\nこの目標は数値で記録する目標です（numericMeta を参照）。requiredPace は必ずその単位で具体的な量で表すこと（例：「1日36ページ読む」）。numericDailyQuota があるときは requiredPace の1日量をその値に合わせること（例：numericDailyQuota が 3000 なら「1日3000kcal」）。tasks の各タスクにも具体的な量を入れること（例：「36ページ読む」）。numericDirection が "atMost"（以下）のときは、その量は上限であり、超えることを目標にしてはいけない（ノルマとして課さないこと）。numericKind が "record"（値を記録する。例：体重）のときは、1日の行動量ではなく記録する値の変化を基準にペースを考えること。\n' : '【記録のしかたの推定について】\nユーザーは記録のしかたを選んでいません。目標の内容と現状の回答から、最も自然な記録のしかたを決めてください。\n- 毎日やる／やらないだけの目標（例：毎日筋トレする、毎日英語を勉強する）→ numericKind は "binary"（numericMeta は返さない）。\n- 量を積み上げる目標（例：3000kcal食べる、36ページ読む、10000歩歩く）→ numericKind は "accumulate"（numericMeta を返す。numericUnit に単位、numericDailyQuota に1日あたりの量、numericTargetTotal に期日までの合計量）。\n- 値を記録する目標（例：体重を80kgにする、体脂肪率を下げる）→ numericKind は "record"（numericMeta を返す。numericUnit に単位、numericStartValue に今の値が分かれば入れる）。\n- 向きは常に "atLeast"（以上）。"atMost"（以下）は使わないこと。\n- 目標の量が読めないときは無理に推定せず、numericMeta を返さないこと（その場合は binary になる）。\n'}
+${numericMeta ? '【数値目標について】\nこの目標は数値で記録する目標です（numericMeta を参照）。数値目標は1日あたりの量（単位＋1日量。例：「1日3000kcal」「1日36ページ」）を基準に表すこと。期日までの合計量は 1日量×残り日数で導く参考値にすぎず、requiredPace・reasoning・tasks では合計量を目標として提示しないこと。requiredPace は必ずその単位で具体的な量で表すこと（例：「1日36ページ読む」）。numericDailyQuota があるときは requiredPace の1日量をその値に合わせること（例：numericDailyQuota が 3000 なら「1日3000kcal」）。tasks の各タスクにも具体的な量を入れること（例：「36ページ読む」）。numericDirection が "atMost" のときは、その量を超えることを目標にしてはいけない（ノルマとして課さないこと）。numericKind が "record"（値を記録する。例：体重）のときは、1日の行動量ではなく記録する値の変化を基準にペースを考えること。\n' : '【記録のしかたの推定について】\nユーザーは記録のしかたを選んでいません。目標の内容と現状の回答から、最も自然な記録のしかたを決めてください。\n- 毎日やる／やらないだけの目標（例：毎日筋トレする、毎日英語を勉強する）→ numericKind は "binary"（numericMeta は返さない）。\n- 量を積み上げる目標（例：3000kcal食べる、36ページ読む、10000歩歩く）→ numericKind は "accumulate"（numericMeta を返す。numericUnit に単位、numericDailyQuota に1日あたりの量、numericTargetTotal に期日までの合計量）。数値目標は1日あたりの量を基準に表すこと。期日までの合計量は 1日量×残り日数で導く参考値にすぎず、requiredPace・reasoning・tasks では合計量を目標として提示しないこと。\n- 値を記録する目標（例：体重を80kgにする、体脂肪率を下げる）→ numericKind は "record"（numericMeta を返す。numericUnit に単位、numericStartValue に今の値が分かれば入れる）。\n- 向き（numericDirection）は目標の内容から推定すること。増やす・積み上げる目標（例：食べる量を増やす、本を読む、歩く）→ "atLeast"。減らす・控える・やめる目標（例：SNSをやめる、間食を減らす、飲酒を控える）→ "atMost"（numericDailyQuota は1日あたりの量。例：SNSは「1日30分まで」）。\n- 目標の量が読めないときは無理に推定せず、numericMeta を返さないこと（その場合は binary になる）。\n'}
 必ず以下のJSON形式のみで出力してください：
 {
   "feasibility": "現実的" または "やや厳しい" または "非現実的",
   "reasoning": "達成可能性の根拠・アドバイス（2〜3文）",
   "achievableDate": "現実的に達成可能な日付（YYYY-MM-DD形式。期日が妥当なら期日と同じ）",
   "requiredPace": "1日あたりにこなすべき目安（例: 毎日1時間の学習、平日2時間の開発など）",
-${numericMeta ? '' : '  \"numericMeta": {"numericKind": "accumulate" または "record", "numericUnit": "単位（例：kcal／ページ／kg）", "numericDirection": "atLeast", "numericDailyQuota": 1日あたりの量（数値。accumulate のとき）, "numericTargetTotal": 期日までの合計量（数値。accumulate のとき）, "numericStartValue": 今の値（数値。record のとき、分かれば）}（binary のとき、または量が読めないときはこの項目を出さない）, '}
+${numericMeta ? '' : '  \"numericMeta": {"numericKind": "accumulate" または "record", "numericUnit": "単位（例：kcal／ページ／kg）", "numericDirection": "atLeast" または "atMost", "numericDailyQuota": 1日あたりの量（数値。accumulate のとき）, "numericTargetTotal": 期日までの合計量（数値。accumulate のとき）, "numericStartValue": 今の値（数値。record のとき、分かれば）}（binary のとき、または量が読めないときはこの項目を出さない）, '}
   "tasks": [
     {
       "week": 1,
@@ -821,6 +866,9 @@ app.post('/api/checkin', optionalAuth, quotaStd, async (req, res) => {
 プロジェクト全体の進捗履歴、今日の進捗ログ（気分・完了タスク・メモ）を分析し、
 達成確率・着地予想日・軌道修正プランを算出してフィードバックしてください。
 
+【今日の日付】
+${dateContextLine(project && project.targetDate, locale)}
+
 【ユーザー自作のタスクについて】
 プロジェクト情報の customTasks は、ユーザーが自分で決めた「この目標のためにやるタスク」です。
 - 必ず計画の一部として考慮し、すでに customTasks にある内容と重複するタスクを updatedTasks に入れないこと
@@ -833,7 +881,7 @@ linkedTasks は、ユーザーがタスク一覧からこの目標に紐づけ�
 
 【数値目標について】
 - todayEntry に numericValues があるときは、今日の進捗をタスクの件数ではなく量・値で評価すること。goalValue が dailyQuota を下回れば不足分を、超えれば余剰分を具体的な数値で message に入れること（例：「今日はノルマ36ページに対して20ページで、16ページ不足しています」）。
-- direction が "atMost"（以下）のときは、その量は上限であり、超えた日は未達成として評価すること（多くやったことを褒めないこと）。
+- direction が "atMost"（以下）のときは、その量を超えないことが目標であり、超えた日は未達成として評価すること（多くやったことを褒めないこと）。
 - 1日だけの量ではなく、過去数日の量の並び（週のパターン）も見て、曜日や波がある場合は message で指摘すること。
 - project.extraNotes があるときは、その内容を計画・評価に反映すること。
 
