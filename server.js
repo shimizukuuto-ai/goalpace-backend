@@ -656,7 +656,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.23.0',
+    version: '7.24.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -717,7 +717,7 @@ app.get('/api/version', (req, res) => {
     // システムプロンプトにサーバー計算の今日（日本時間）と期日までの残り日数
     // を入れ、AI が「今日」を推測して期間を誤るのを防ぐ。/api/plan は数値目標を
     // 1日あたりの量で表し、向き（atLeast / atMost）を目標内容から推定する。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true, numericGoals: true, photoCalories: true, aiInfersRecording: true, dateContext: true },
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true, numericGoals: true, photoCalories: true, aiInfersRecording: true, dateContext: true, dayBasedPlan: true },
   });
 });
 
@@ -878,6 +878,12 @@ ${dateContextLine(project && project.targetDate, locale)}
 
 【紐づけたタスクについて】
 linkedTasks は、ユーザーがタスク一覧からこの目標に紐づけた自分のタスク（タイトル＋今日の完了状態）です。customTasks と同じ扱いで、計画の一部として必ず考慮し、重複するタスクを updatedTasks に入れないこと。完了済みは達成済み、未完了は未着手としてペースの評価に反映すること。
+
+【明日のタスク（updatedTasks）について】
+updatedTasks は「明日取り組むべきタスク」だけを入れること。今日のタスクや今週の振り返りは入れないこと。
+- まず今週の計画（プロジェクト情報の tasks のうち今週分）の dailyTasks の中から、今日の完了タスク（todayEntry.completedTasks）に含まれない未完了のタスクを優先して持ち越すこと。プロジェクト情報には全週分の tasks が含まれているので、どのタスクが今日終わったか・終わっていないかを確認して判断すること。
+- 今日の作業がすべて終わっている場合に限り、次の一歩として次の小さなステップを1〜2件だけ追加すること。今日のタスクが一部でも未完了の場合は、次週レベルの内容や新しい大きなステップには進まず、未完了タスクの持ち越しに留めること。
+- customTasks・linkedTasks と重複する内容は入れないこと（上記の重複禁止ルールをそのまま守ること）。
 
 【数値目標について】
 - todayEntry に numericValues があるときは、今日の進捗をタスクの件数ではなく量・値で評価すること。goalValue が dailyQuota を下回れば不足分を、超えれば余剰分を具体的な数値で message に入れること（例：「今日はノルマ36ページに対して20ページで、16ページ不足しています」）。
