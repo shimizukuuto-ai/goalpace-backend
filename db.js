@@ -1087,6 +1087,47 @@ async function getPublicRoutine(userId) {
   };
 }
 
+/**
+ * V12.39: リーグ・公開ルーティン用の公開ID。端末IDそのものは他人に見せない
+ * （端末IDは AI 枠・Premium・共有目標の「鍵」になっているため）。
+ * server.js の publicPlayerId と同じ式（'p_' + sha256('gp-public:' + id) の先頭24桁）。
+ */
+const PUBLIC_ID_SQL = (col) => `'p_' || left(encode(sha256(('gp-public:' || ${col})::bytea), 'hex'), 24)`;
+async function getPublicRoutineByPublicId(publicId) {
+  const { rows } = await pool.query(
+    `SELECT pr.user_id FROM public_routines pr WHERE ${PUBLIC_ID_SQL('pr.user_id')} = $1 LIMIT 1`,
+    [String(publicId)]
+  );
+  if (!rows[0]) return null;
+  return getPublicRoutine(rows[0].user_id);
+}
+
+/**
+ * V12.39: sync-pace の previousUserIds から、他人の身元になりうるIDを外す。
+ * 以前は任意のIDを送れば、その人のリーグ行が消え、共有目標（オーナー権を
+ * 含む）が送った側へ移っていた。旧身元はウィザードの uid（数字）か Apple の id
+ * なので、次のどれかに当たるIDは移行しない：
+ *  - 端末IDの形（8桁16進-英数字-16桁16進）
+ *  - device_profiles にある（＝どこかの端末が使っている端末ID）
+ *  - identity_aliases で既に別の正規IDに紐づいている
+ */
+const DEVICE_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-z]{4,16}-[0-9a-f]{16}$/i;
+async function filterPreviousUserIds(newUserId, oldUserIds) {
+  const nid = String(newUserId);
+  const ids = [...new Set((Array.isArray(oldUserIds) ? oldUserIds : [])
+    .map((v) => String(v || '').trim())
+    .filter((v) => v && v !== nid && v !== 'guest_user' && !DEVICE_ID_SHAPE.test(v)))];
+  if (ids.length === 0) return [];
+  const devices = await pool.query('SELECT device_id FROM device_profiles WHERE device_id = ANY($1::text[])', [ids]);
+  const deviceSet = new Set(devices.rows.map((r) => String(r.device_id)));
+  let aliased = new Map();
+  try {
+    const a = await pool.query('SELECT old_user_id, canonical_user_id FROM identity_aliases WHERE old_user_id = ANY($1::text[])', [ids]);
+    aliased = new Map(a.rows.map((r) => [String(r.old_user_id), String(r.canonical_user_id)]));
+  } catch (_) { /* 表がまだ無ければ誰も紐づいていない */ }
+  return ids.filter((v) => !deviceSet.has(v) && (!aliased.has(v) || aliased.get(v) === nid));
+}
+
 /** 期限ベースの真のペース%を今週分として保存する（1人×1週で上書き）。
  * V12.24・A班: score.tasksDoneToday / score.tasksTotalToday（今日の
  * タスク完了数・総数）も保存する。無ければ 0（旧クライアント互換）。
@@ -1299,14 +1340,27 @@ async function migrateSharedGoalIdentity(newUserId, oldUserIds) {
  */
 // V12.24・A班: 今日のタスク達成率の SQL 式。LEAGUE_METRIC_COLUMNS と
 // getWeeklyLeague の SELECT（task_rate 別名）で共用する。
-const TASK_RATE_SQL = `CASE WHEN tasks_total_today > 0 THEN ROUND(tasks_done_today::float / tasks_total_today * 100) ELSE NULL END`;
+// V12.39: 「今日」の値は、その行が今日（JST）同期されたときだけ有効にする。
+// 以前は日付を見ておらず、月曜に 3/3 で止まった人が日曜まで「今日100%」のままだった。
+// updated_at は sync-pace のたびに更新されるので、それを「その数字の日付」とみなす。
+const STATS_TODAY_SQL = `((updated_at AT TIME ZONE 'Asia/Tokyo')::date = (now() AT TIME ZONE 'Asia/Tokyo')::date)`;
+const TASK_RATE_SQL = `CASE WHEN ${STATS_TODAY_SQL} AND tasks_total_today > 0 THEN ROUND(tasks_done_today::float / tasks_total_today * 100) ELSE NULL END`;
+// 今日覚えた枚数・今日の完了数（今日の同期でなければ 0）。
+const MEMORIZED_TODAY_SQL = `CASE WHEN ${STATS_TODAY_SQL} THEN memorized ELSE 0 END`;
+const TASKS_DONE_TODAY_SQL = `CASE WHEN ${STATS_TODAY_SQL} THEN tasks_done_today ELSE 0 END`;
 const LEAGUE_METRIC_COLUMNS = {
   pace: 'raw_pace',
   achievement: 'achievement_percent',
-  memorized: 'memorized',
+  memorized: MEMORIZED_TODAY_SQL,
   pomodoro: 'pomodoro',
   taskRate: TASK_RATE_SQL,
 };
+// V12.39: 同じ値のときの並び。以前は「目標達成度→表示名の昇順」で、
+// タスク1件だけ作って完了すれば100%になり、同率なら名前が「A」「0」で
+// 始まる人が上に来ていた。今は「今日の完了数が多い→先に同期した人」の順。
+function leagueOrderSql(column) {
+  return `${column} DESC NULLS LAST, ${TASKS_DONE_TODAY_SQL} DESC, achievement_percent DESC, updated_at ASC, user_id ASC`;
+}
 const LEAGUE_METRIC_UNITS = {
   pace: '%',
   achievement: '%',
@@ -1332,9 +1386,9 @@ async function getWeeklyLeague(weekDate, requesterId, metric = 'pace') {
   }
   const { rows } = await pool.query(
     `SELECT user_id, display_name AS name, avatar_color,
-            raw_pace, achievement_percent, pomodoro, memorized, tasks_done,
+            raw_pace, achievement_percent, pomodoro, ${MEMORIZED_TODAY_SQL} AS memorized, tasks_done,
             ${TASK_RATE_SQL} AS task_rate,
-            row_number() OVER (ORDER BY ${column} DESC NULLS LAST, achievement_percent DESC, display_name ASC) AS rank
+            row_number() OVER (ORDER BY ${leagueOrderSql(column)}) AS rank
      FROM pace_scores
      WHERE week_date = $1 AND league_opt_in = TRUE
      ORDER BY rank
@@ -1387,27 +1441,20 @@ async function getWeeklyLeague(weekDate, requesterId, metric = 'pace') {
 async function getMyLeagueRank(weekDate, requesterId, metric = 'pace') {
   const m = LEAGUE_METRIC_COLUMNS[metric] ? metric : 'pace';
   const column = LEAGUE_METRIC_COLUMNS[m];
-  const mine = await pool.query(
-    `SELECT display_name, ${column} AS metric_value, achievement_percent
-     FROM pace_scores
-     WHERE week_date = $1 AND user_id = $2 AND league_opt_in = TRUE`,
+  // V12.39: getWeeklyLeague と同じ並び（leagueOrderSql）で全員に番号を振り、
+  // 自分の行を取り出す。並びの条件を2か所に書き分けないため。
+  const { rows } = await pool.query(
+    `SELECT rank, metric_value FROM (
+       SELECT user_id, ${column} AS metric_value,
+              row_number() OVER (ORDER BY ${leagueOrderSql(column)}) AS rank
+       FROM pace_scores
+       WHERE week_date = $1 AND league_opt_in = TRUE
+     ) t WHERE user_id = $2`,
     [weekDate, String(requesterId)]
   );
-  if (!mine.rows[0]) return null;
-  if (mine.rows[0].metric_value == null) return { rank: null, value: null };
-  const myValue = Number(mine.rows[0].metric_value);
-  const myAchievement = Number(mine.rows[0].achievement_percent);
-  const myName = mine.rows[0].display_name;
-  const { rows } = await pool.query(
-    `SELECT COUNT(*)::int AS n FROM pace_scores
-     WHERE week_date = $1 AND league_opt_in = TRUE AND (
-       ${column} > $2
-       OR (${column} = $2 AND achievement_percent > $3)
-       OR (${column} = $2 AND achievement_percent = $3 AND display_name < $4)
-     )`,
-    [weekDate, myValue, myAchievement, myName]
-  );
-  return { rank: rows[0].n + 1, value: myValue };
+  if (!rows[0]) return null;
+  if (rows[0].metric_value == null) return { rank: null, value: null };
+  return { rank: Number(rows[0].rank), value: Number(rows[0].metric_value) };
 }
 
 
@@ -1582,6 +1629,8 @@ module.exports = {
   migrateSharedGoalIdentity,
   getWeeklyLeague,
   getMyLeagueRank,
+  getPublicRoutineByPublicId,
+  filterPreviousUserIds,
   LEAGUE_METRIC_COLUMNS,
   LEAGUE_METRIC_UNITS,
   AVATAR_COLORS,

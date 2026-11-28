@@ -656,7 +656,7 @@ app.get('/health', (req, res) => {
 // /health とは別物（ヘルスは Render の死活監視用で、機能の有無は分からない）。
 app.get('/api/version', (req, res) => {
   res.status(200).json({
-    version: '7.24.0',
+    version: '7.25.0',
     // V12.18・D班: friendsActivity — 友達のアクティビティ
     // （GET /api/activity/friends。共有目標メンバー＋リーグ仲間の
     // イベント。公開オフの人は出さない）。
@@ -717,7 +717,7 @@ app.get('/api/version', (req, res) => {
     // システムプロンプトにサーバー計算の今日（日本時間）と期日までの残り日数
     // を入れ、AI が「今日」を推測して期間を誤るのを防ぐ。/api/plan は数値目標を
     // 1日あたりの量で表し、向き（atLeast / atMost）を目標内容から推定する。
-    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true, numericGoals: true, photoCalories: true, aiInfersRecording: true, dateContext: true, dayBasedPlan: true },
+    features: { sharedGoals: true, deviceQuota: true, sharedGoalTasks: true, sharedDecks: true, sharedDeckCategories: true, mySharedDecks: true, truePaceLeague: true, activityFeed: true, onlineProfile: true, activityFeedPaging: true, sharedGoalKinds: true, sharedGoalVisibility: true, sharedGoalComments: true, leaderboardMetrics: true, publicSharedGoals: true, sharedGoalKick: true, dailyQuotaRate: true, sharedGoalFinder: true, aiSharedGoalCreation: true, achievementRuleExecution: true, memberWeeklyStats: true, bilingualErrors: true, groupActivityToasts: true, memberTotalStats: true, activityMinutes: true, friendsActivity: true, activityDateBackfill: true, sharedDeckAuthor: true, onboardingSurveys: true, myRank: true, canonicalIdentity: true, identityCleanup: true, memorizedToday: true, memberIdentityMigration: true, tasksTotalToday: true, sharedGoalMode: true, tolerantDateParse: true, routinePublic: true, deviceBilling: true, numericGoals: true, photoCalories: true, aiInfersRecording: true, dateContext: true, dayBasedPlan: true, publicPlayerIds: true, fairLeagueRanking: true },
   });
 });
 
@@ -1277,6 +1277,9 @@ function todayJst() {
   return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 }
 const anonDisplayName = (userId) => 'プレイヤー-' + crypto.createHash('sha256').update(String(userId)).digest('hex').slice(0, 4);
+// V12.39: 他人に見せる公開ID。端末IDは AI 枠・Premium・共有目標の「鍵」なので、
+// リーグの一覧などには出さない（db.js の PUBLIC_ID_SQL と同じ式）。
+const publicPlayerId = (userId) => 'p_' + crypto.createHash('sha256').update('gp-public:' + String(userId)).digest('hex').slice(0, 24);
 
 /**
  * V11: 期限ベースの真のペース%を同期する（POST /api/leaderboard/sync-pace）。
@@ -1342,7 +1345,11 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
     const rawPace = totalPlanned > 0 ? (totalActual / totalPlanned) * 100 : (totalActual > 0 ? 100 : 0);
     const achievement = totalTarget > 0 ? Math.min(100, (totalActual / totalTarget) * 100) : 0;
     const stats = req.body?.stats || {};
-    const count = (v) => Math.max(0, Math.min(100000, Math.floor(Number(v) || 0)));
+    // V12.39: 1日・1週で現実的にありえない値は上限で止める（以前は10万まで通り、
+    // 入力を弄れば1位が取れた）。memorized・tasks*Today は今日の値、他は今週の値。
+    const count = (v, max = 100000) => Math.max(0, Math.min(max, Math.floor(Number(v) || 0)));
+    const tasksTotalToday = count(stats.tasksTotalToday, 200);
+    const tasksDoneToday = Math.min(tasksTotalToday, count(stats.tasksDoneToday, 200));
 
     // 表示名・アイコンドット・参加設定：送られてきた項目だけ保存する。
     const patch = {};
@@ -1368,18 +1375,23 @@ app.post('/api/leaderboard/sync-pace', optionalAuth, async (req, res) => {
       avatarColor: profile?.avatarColor || null,
       rawPace,
       achievementPercent: achievement,
-      pomodoro: count(stats.pomodoro),
-      memorized: count(stats.memorized),
-      tasksDone: count(stats.tasksDone),
-      tasksDoneToday: count(stats.tasksDoneToday),
-      tasksTotalToday: count(stats.tasksTotalToday),
+      pomodoro: count(stats.pomodoro, 300),
+      memorized: count(stats.memorized, 1000),
+      tasksDone: count(stats.tasksDone, 2000),
+      tasksDoneToday,
+      tasksTotalToday,
       leagueOptIn: profile ? profile.leagueOptIn !== false : true,
     });
     // V12.22・A班【1】：旧身元の行を掃除する。v12.20 以前はウィザード uid／
     // Apple id で同期していたため、旧 uid の今週行が残ってリーグに
     // 「あなた」が2行出る。掃除に失敗しても同期自体は成功させる。
-    const previousUserIds = Array.isArray(req.body?.previousUserIds)
+    // V12.39: 他人の端末ID・別の人に紐づいた旧IDは外す（db.filterPreviousUserIds）。
+    // 以前はリーグに出ていた他人のIDを送るだけで、その人の行が消え、共有目標が移っていた。
+    const requestedPrevious = Array.isArray(req.body?.previousUserIds)
       ? req.body.previousUserIds.filter((v) => typeof v === 'string' && v.trim() && v.trim().length <= 80).slice(0, 5)
+      : [];
+    const previousUserIds = requestedPrevious.length > 0
+      ? await db.filterPreviousUserIds(userId, requestedPrevious).catch(() => [])
       : [];
     if (previousUserIds.length > 0) {
       const sinceDate = (() => {
@@ -1421,7 +1433,10 @@ app.get('/api/league/weekly', optionalAuth, async (req, res) => {
     const metric = db.LEAGUE_METRIC_COLUMNS[String(req.query.metric)] ? String(req.query.metric) : 'pace';
     const { optedOut, entries } = await db.getWeeklyLeague(weekDate, requesterId, metric);
     const mine = !optedOut && requesterId ? await db.getMyLeagueRank(weekDate, requesterId, metric) : null;
-    res.json({ weekStart: weekDate, entries, optedOut, isPlaceholder: false, metric, myRank: mine ? mine.rank : null, myValue: mine ? mine.value : null });
+    // V12.39: userId は公開IDにして返す（端末IDを一覧に出さない）。
+    // アプリはこの値を GET /api/online/routine/:userId に渡すだけなので、そのまま動く。
+    const publicEntries = entries.map((e) => ({ ...e, userId: publicPlayerId(e.userId) }));
+    res.json({ weekStart: weekDate, entries: publicEntries, optedOut, isPlaceholder: false, metric, myRank: mine ? mine.rank : null, myValue: mine ? mine.value : null });
   } catch (err) {
     console.error('/api/league/weekly error:', err);
     res.status(503).json({ error: 'Leaderboard is unavailable', errorJa: 'ランキングは利用できません。', errorEn: 'Leaderboard is unavailable' });
@@ -1530,9 +1545,13 @@ app.get('/api/online/routine/:userId', optionalAuth, async (req, res) => {
     if (!userId || userId.length > 80) {
       return res.status(400).json({ error: 'invalid_user_id' });
     }
-    const routine = await db.getPublicRoutine(userId);
+    // V12.39: リーグの一覧は公開ID（p_…）を返すので、それで引けるようにする。
+    // 応答の userId も公開IDにする（端末IDを返さない）。
+    const routine = userId.startsWith('p_')
+      ? await db.getPublicRoutineByPublicId(userId)
+      : await db.getPublicRoutine(userId);
     if (!routine) return res.status(404).json({ error: 'not_public' });
-    res.json(routine);
+    res.json({ ...routine, userId: publicPlayerId(routine.userId) });
   } catch (err) {
     console.error('GET /api/online/routine/:userId error:', err);
     res.status(503).json({ error: 'routine_unavailable' });
