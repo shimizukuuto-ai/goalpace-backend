@@ -345,6 +345,30 @@ const clean = (v, max) => (typeof v === 'string' ? v.replace(/\r\n?/g, '\n').tri
 const oneLine = (v, max) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '');
 const isId = (v) => /^\d{1,18}$/.test(String(v));
 const anonName = (uid) => 'プレイヤー-' + crypto.createHash('sha256').update(String(uid)).digest('hex').slice(0, 4);
+// V12.40: 他のメンバーに見せる公開ID。端末IDは AI 枠・Premium・共有目標の「鍵」に
+// なっているため、メンバー一覧・貢献・スタンプ・タスク・出来事には出さない。
+// server.js の publicPlayerId（リーグ・公開ルーティン）と同じ式にしてあるので、
+// アプリがこの値で GET /api/online/routine/:userId を呼んでもそのまま引ける。
+const publicMemberId = (uid) => (uid ? 'p_' + crypto.createHash('sha256').update('gp-public:' + String(uid)).digest('hex').slice(0, 24) : uid);
+const PUBLIC_ID_RE = /^p_[0-9a-f]{24}$/;
+/** 目標の詳細（loadGoalDetail の結果）に入っている端末IDを公開IDに置き換える。 */
+function publicizeGoalDetail(detail, viewerUserId) {
+  if (!detail || typeof detail !== 'object') return detail;
+  const pid = (v) => (v == null || v === '' ? v : publicMemberId(v));
+  return {
+    ...detail,
+    // 新しいアプリが「自分の行」を見分けるための自分の公開ID。
+    myMemberId: viewerUserId ? publicMemberId(viewerUserId) : null,
+    members: (detail.members || []).map((m) => ({ ...m, userId: pid(m.userId) })),
+    contributions: (detail.contributions || []).map((c) => ({ ...c, userId: pid(c.userId) })),
+    stamps: (detail.stamps || []).map((st) => ({ ...st, userId: pid(st.userId), targetUserId: st.targetUserId ? pid(st.targetUserId) : null })),
+    tasks: (detail.tasks || []).map((t) => ({
+      ...t,
+      createdBy: pid(t.createdBy),
+      completedByToday: (t.completedByToday || []).map(pid),
+    })),
+  };
+}
 
 // V12.23・A班【4】：共有目標の「今日」は日本時間（JST）で決める。
 // DB のセッションタイムゾーンは UTC（Render 既定）のため、CURRENT_DATE
@@ -494,6 +518,14 @@ function register({ app, db, auth }) {
     return '';
   }
 
+  // V12.40: 操作する本人のID（body.userId を見ない版）。kick の body.userId は
+  // 「外す相手」なので、resolveMemberId だと認証オフ時に相手を本人と取り違えて
+  // オーナーでもキックできなかった。アプリは本人を X-Device-Id ヘッダーで送っている。
+  function resolveActorId(req) {
+    if (REQUIRE_AUTH) return req.userId ? String(req.userId) : '';
+    return resolveMemberId({ body: {}, query: req.query || {}, headers: req.headers || {}, userId: req.userId });
+  }
+
   // リクエストID: 503 の原因追及用。レスポンスに含め、ログにも出す。
   // crypto.randomUUID() は Node 14.17+ で利用可。
   function newRequestId() {
@@ -535,6 +567,17 @@ function register({ app, db, auth }) {
   // メンバーとみなす（移行前の行・同期していない端末のため）。逆向き
   // （正規IDで問い合わせたとき旧IDの行）も同じく通す。対応表が無ければ
   // （未デプロイ等）従来通りの直接一致だけを見る。
+  // V12.40: クライアントから来たメンバーの指定（公開ID p_… または旧アプリが送る生のID）を、
+  // その目標のメンバーの実IDに戻す。見つからなければ ''。
+  async function resolveMemberRef(goalId, ref) {
+    const v = String(ref || '').trim();
+    if (!v) return '';
+    if (!PUBLIC_ID_RE.test(v)) return v;
+    const r = await q('SELECT user_id FROM shared_goal_members WHERE goal_id = $1', [goalId]);
+    const hit = r.rows.find((row) => publicMemberId(row.user_id) === v);
+    return hit ? String(hit.user_id) : '';
+  }
+
   async function isMember(goalId, userId) {
     const r = await q('SELECT 1 FROM shared_goal_members WHERE goal_id = $1 AND user_id = $2', [goalId, userId]);
     if (r.rowCount > 0) return true;
@@ -648,7 +691,9 @@ function register({ app, db, auth }) {
   // step を付けて投げ直す（v5 修正）。
   async function loadGoalDetail(goalId, viewerUserId) {
     try {
-      return await loadGoalDetailInner(goalId, viewerUserId);
+      // V12.40: 返す前に端末IDを公開IDへ置き換える（呼び出し側の isOwner 判定は
+      // publicMemberId(uid) と比べる）。
+      return publicizeGoalDetail(await loadGoalDetailInner(goalId, viewerUserId), viewerUserId);
     } catch (e) {
       e.step = e.step || 'loadGoalDetail';
       throw e;
@@ -1220,7 +1265,7 @@ function register({ app, db, auth }) {
     for (const row of ids.rows) {
       const detail = await loadGoalDetail(row.goal_id, uid);
       if (detail) {
-        detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+        detail.isOwner = detail.members.some((m) => m.userId === publicMemberId(uid) && m.isOwner);
         // 一覧では貢献履歴・スタンプ履歴は返さない（軽量化）
         delete detail.contributions;
         delete detail.stamps;
@@ -1344,6 +1389,9 @@ function register({ app, db, auth }) {
        JOIN shared_goal_members m ON m.goal_id = g.id AND m.user_id = $1
        WHERE e.created_at > NOW() - INTERVAL '24 hours'
          AND e.kind IN ('comment', 'achieved', 'taskDone')
+         -- V12.40: 自分の出来事は返さない（以前はアプリが authorUserId と自分のIDを
+         -- 比べて除いていた。authorUserId を公開IDにしたので、サーバー側で除く）。
+         AND e.author_user_id <> $1
        ORDER BY e.created_at DESC, e.id DESC
        LIMIT $2`,
       [uid, limit]);
@@ -1353,7 +1401,7 @@ function register({ app, db, auth }) {
         goalId: String(r.goal_id),
         goalTitle: r.goal_title,
         kind: r.kind,
-        authorUserId: r.author_user_id,
+        authorUserId: publicMemberId(r.author_user_id),
         authorName: r.author_name,
         avatarColor: r.avatar_color || null,
         text: r.text,
@@ -1368,7 +1416,7 @@ function register({ app, db, auth }) {
     if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
     const detail = await loadGoalDetail(req.params.id, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
-    detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+    detail.isOwner = detail.members.some((m) => m.userId === publicMemberId(uid) && m.isOwner);
     res.json({ goal: detail });
   }));
 
@@ -1382,11 +1430,13 @@ function register({ app, db, auth }) {
   //   どちらかのテーブルが無い環境でも空の一覧を返す（503 にしない）。
   app.get('/api/shared-goals/:id/members/:userId/activity', auth.requireAuth, wrap(async (req, res) => {
     if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
-    const targetUserId = String(req.params.userId || '');
-    if (!targetUserId || targetUserId.length > 80) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
+    const targetRef = String(req.params.userId || '');
+    if (!targetRef || targetRef.length > 80) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
     const uid = resolveMemberId(req);
     if (!(await isMember(req.params.id, uid))) return res.status(403).json({ error: 'この共有目標のメンバーではありません。', errorJa: 'この共有目標のメンバーではありません。', errorEn: 'You are not a member of this shared goal.' });
-    if (!(await isMember(req.params.id, targetUserId))) return res.status(404).json({ error: 'メンバーが見つかりません。', errorJa: 'メンバーが見つかりません。', errorEn: 'Member not found.' });
+    // V12.40: 公開ID（p_…）でも指定できる。
+    const targetUserId = await resolveMemberRef(req.params.id, targetRef);
+    if (!targetUserId || !(await isMember(req.params.id, targetUserId))) return res.status(404).json({ error: 'メンバーが見つかりません。', errorJa: 'メンバーが見つかりません。', errorEn: 'Member not found.' });
     // V12.23・A班【2】：対象メンバーの活動は、保存されているIDと
     // 正規IDの両方で引く。活動（activity_events）はデバイスIDで記録
     // されるが、メンバー行が旧IDのままだと片方だけでは空になる。
@@ -1428,7 +1478,7 @@ function register({ app, db, auth }) {
       [req.params.id, targetUserId]);
     res.json({
       events: events.slice(0, limit),
-      memberUserId: targetUserId,
+      memberUserId: publicMemberId(targetUserId),
       displayName: (memberRow.rows[0] && memberRow.rows[0].display_name) || anonName(targetUserId),
     });
   }));
@@ -1444,7 +1494,7 @@ function register({ app, db, auth }) {
     if (await isMember(goalId, uid)) {
       const detail = await loadGoalDetail(goalId, uid);
       if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
-      detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+      detail.isOwner = detail.members.some((m) => m.userId === publicMemberId(uid) && m.isOwner);
       return res.json({ goal: detail, alreadyMember: true });
     }
     const cnt = await q('SELECT COUNT(*)::int AS n FROM shared_goal_members WHERE goal_id = $1', [goalId]);
@@ -1480,7 +1530,7 @@ function register({ app, db, auth }) {
     if (await isMember(goalId, uid)) {
       const detail = await loadGoalDetail(goalId, uid);
       if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
-      detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+      detail.isOwner = detail.members.some((m) => m.userId === publicMemberId(uid) && m.isOwner);
       return res.json({ goal: detail, alreadyMember: true });
     }
     const cnt = await q('SELECT COUNT(*)::int AS n FROM shared_goal_members WHERE goal_id = $1', [goalId]);
@@ -1700,7 +1750,7 @@ function register({ app, db, auth }) {
       }
       const detail = await loadGoalDetail(req.params.id, uid);
       if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
-      detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+      detail.isOwner = detail.members.some((m) => m.userId === publicMemberId(uid) && m.isOwner);
       return res.json({ goal: detail });
     }
     const amount = Number(req.body && req.body.amount);
@@ -1724,7 +1774,7 @@ function register({ app, db, auth }) {
     }
     const detail = await loadGoalDetail(req.params.id, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
-    detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+    detail.isOwner = detail.members.some((m) => m.userId === publicMemberId(uid) && m.isOwner);
     res.json({ goal: detail });
   }));
 
@@ -1753,7 +1803,7 @@ function register({ app, db, auth }) {
     await refreshDeclareStatus(req.params.id);
     const detail = await loadGoalDetail(req.params.id, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
-    detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+    detail.isOwner = detail.members.some((m) => m.userId === publicMemberId(uid) && m.isOwner);
     res.json({ goal: detail });
   }));
 
@@ -1821,7 +1871,7 @@ function register({ app, db, auth }) {
       [req.params.id, title, uid, value]);
     const detail = await loadGoalDetail(req.params.id, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
-    detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+    detail.isOwner = detail.members.some((m) => m.userId === publicMemberId(uid) && m.isOwner);
     res.json({ goal: detail });
   }));
 
@@ -1855,7 +1905,7 @@ function register({ app, db, auth }) {
     }
     const detail = await loadGoalDetail(req.params.id, uid);
     if (!detail) return res.status(404).json({ error: '共有目標が見つかりません。', errorJa: '共有目標が見つかりません。', errorEn: 'Shared goal not found.' });
-    detail.isOwner = detail.members.some((m) => m.userId === uid && m.isOwner);
+    detail.isOwner = detail.members.some((m) => m.userId === publicMemberId(uid) && m.isOwner);
     res.json({ goal: detail });
   }));
 
@@ -1922,9 +1972,11 @@ function register({ app, db, auth }) {
   //   - 返すのは更新後の目標全体（クライアントは差し替えるだけ）。
   app.post('/api/shared-goals/:id/kick', auth.requireAuth, wrap(async (req, res) => {
     if (!isId(req.params.id)) return res.status(400).json({ error: '不正なIDです。', errorJa: '不正なIDです。', errorEn: 'Invalid ID.' });
-    const uid = resolveMemberId(req);
+    const uid = resolveActorId(req); // V12.40: body.userId は外す相手
     if (limited('sg:kick:' + uid, 20, 10 * 60 * 1000)) return res.status(429).json({ error: '操作が多すぎます。少し時間をおいてください。', errorJa: '操作が多すぎます。少し時間をおいてください。', errorEn: 'Too many actions. Please wait a while.' });
-    const targetUserId = String((req.body && req.body.userId) || '').trim();
+    // V12.40: 公開ID（p_…）でも指定できる（見つからないときは下の isMember で 404）。
+    const targetRef = String((req.body && req.body.userId) || '').trim();
+    const targetUserId = targetRef ? ((await resolveMemberRef(req.params.id, targetRef)) || targetRef) : '';
     if (!targetUserId) return res.status(400).json({ error: '外すメンバーを指定してください。', errorJa: '外すメンバーを指定してください。', errorEn: 'Please choose a member to remove.' });
     if (targetUserId === uid) return res.status(400).json({ error: '自分自身を外すことはできません。オーナーが抜けるときは「抜ける」を使ってください。', errorJa: '自分自身を外すことはできません。オーナーが抜けるときは「抜ける」を使ってください。', errorEn: 'You cannot remove yourself. If the owner wants to leave, use "Leave".' });
     const g = await q('SELECT id, owner_user_id, title FROM shared_goals WHERE id = $1', [req.params.id]);
